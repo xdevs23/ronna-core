@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/agent-ledger"]
+
+# Version, edition and license live here so every member inherits one answer.
+# A member that needs a different one is a member that belongs in its own
+# repository.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+authors = ["Simão Gomes Viana <devel@superboring.dev>"]
+
+# Lints are declared once and inherited with `[lints] workspace = true`.
+# `missing_docs` is a warning rather than a convention: every public item in a
+# library carries a doc comment, and the compiler is the only reviewer that
+# never forgets to check.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

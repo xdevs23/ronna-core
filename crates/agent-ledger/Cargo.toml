@@ -1,0 +1,30 @@
+[package]
+name = "agent-ledger"
+description = "An append-only block ledger and orchestration runtime for LLM agents."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "agent_ledger"
+
+[lints]
+workspace = true
+
+# The dependency set is deliberately small and stays that way: a library that
+# drags a consumer's toolchain into every dependent tree is the coupling this
+# crate exists to remove. Serialization, an async runtime for the reactive
+# primitives and the bus, and structured logging — nothing else yet.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+strum = { version = "0.28.0", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "sync"] }
+tracing = "0.1"
+
+# Test-only. Cargo unifies features across a dependency graph, so a runtime
+# flavour or a timer wheel declared above would be inherited by every
+# dependent whether it wanted them or not.
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
