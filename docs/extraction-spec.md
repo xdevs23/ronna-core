@@ -8,7 +8,7 @@ had assumed the source application would be modified. Status: draft.
 
 A working application ("the source application") contains a complete event-sourced agent
 runtime: a block ledger on SQLite, a cursor-and-frontier orchestrator, a provider layer, tool
-admission with an approval chain, and 368 tests. A second project needs the same runtime.
+admission with an approval chain, and 359 tests. A second project needs the same runtime.
 Copying it forks it; depending on the whole application drags in source-control integration, a
 language-server client, a sandbox, a proxy and a web surface that nothing here wants.
 
@@ -93,9 +93,9 @@ net. **Superseded 2026-08-20:** the source application is a separate project and
 modified. It is read, never written.
 
 The reason revision 2 gave for going there first does not survive the correction. The tests
-live in the same files as the code they cover, so all 368 travel with the extraction. The
-safety net comes along, and the seam work can happen here with the moved tests holding it
-honest.
+live in the same files as the code they cover, so the 275 covering the moving set travel with
+the extraction. The safety net comes along, and the seam work can happen here with those tests
+holding it honest.
 
 Two consequences, both accepted:
 
