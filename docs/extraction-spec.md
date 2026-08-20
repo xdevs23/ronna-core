@@ -1,190 +1,228 @@
 # Spec: extracting the ledger runtime into this library
 
-Date: 2026-08-20. Status: draft, awaiting review.
+Date: 2026-08-20. Revision 2, rewritten after an unbriefed review probed revision 1 against
+the source tree and returned three blockers. Status: draft.
 
 ## Context
 
 A working application ("the source application") contains a complete event-sourced agent
 runtime: a block ledger on SQLite, a cursor-and-frontier orchestrator, a provider layer, tool
-admission with an approval chain, and roughly 354 tests. A second project now needs the same
-runtime. Copying it would fork it; depending on the whole application would drag in
-source-control integration, a language-server client, a sandbox, a proxy and a web surface
-that the second project has no use for.
+admission with an approval chain, and 368 tests. A second project needs the same runtime.
+Copying it forks it; depending on the whole application drags in source-control integration, a
+language-server client, a sandbox, a proxy and a web surface that nothing here wants.
 
-This library is the extraction. The source application becomes its first consumer; the second
-project becomes its second.
+**Revision 1 called this a move. It is not.** The runtime as written is closed to out-of-crate
+extension in three places, and each has to be opened before anything can be extracted. That is
+the real work; the file moves are the easy part afterwards.
 
-**Why extract before either consumer needs a change**: two independent implementations of this
-architecture already exist, and their intersection *is* the boundary. That is better evidence
-than one consumer could give, and it arrived before any new code was written. Five improvements
-to the runtime are already identified; making them once in a shared library beats making them
-twice.
+## Disposition 2026-08-20: what the review found, and what changed
 
-## The boundary rule
+Recorded here instead of in a changelog because these are the facts the plan now rests on.
 
-A module belongs here if it would be identical in an agent that knew nothing about the source
-application's domain. A module stays behind if it names, or exists because of, something the
-product does.
+1. **A consumer cannot add a block kind.** The typed layer is a closed enum documented
+   "in-crate consumers only"; an unregistered type parses to an inert `Unknown` variant,
+   silently. Revision 1's Stage 3 and its conformance kit both assumed a registry that does
+   not exist.
+2. **Persistence is not kind-blind.** The block query is one hardcoded statement joining every
+   content table by name, and the change hook that wakes the scheduler is a hardcoded table
+   allowlist. A consumer's block can neither be loaded nor wake a tick.
+3. **The closure API cannot do what revision 1 claimed.** It is synchronous inside the
+   closure while every ledger write is an async method dispatched to the same actor thread, so
+   a consumer cannot append a block inside its own closure. Revision 1's shared-transaction
+   decision named a capability that does not exist — and justified rejecting an alternative by
+   an atomicity property the fork and approval paths do not currently implement either.
+4. **Licensing.** The source is GPL-3.0-or-later. Revision 1 declared MPL-2.0 without a
+   relicensing step. **Decided: the library stays GPL-3.0-or-later.** The maintainer's stated
+   need is their own projects, so the adoption argument for weaker copyleft does not apply, and
+   keeping the original terms removes the relicensing step and its consent record entirely.
+5. **Four modules were unclassified** and one whole sibling crate was unnamed. Nine
+   dependencies point from the "moves" list into the "stays" list. Two entries were
+   misclassified outright.
+6. **The conformance kit's checks had no referent.** Three of the four named checks come from
+   the *other* implementation's vocabulary and do not exist in this source at all.
 
-Applied to the source tree, that gives three lists. Sizes are the source's line counts, for
-scale only.
+## The extension design
 
-### Moves here
+One mechanism, used identically by the library and by every consumer. There is no privileged
+set of kinds.
 
-| Module | Lines | What it is |
+The typed layer already implements the behavior trait **by delegating to its variants** through
+a hand-written dispatch macro. So it is not "the enum" — it is *a type that implements the
+trait by delegating*. The runtime becomes generic over that trait, and the library's own enum
+stops being special: it is one implementor among others.
+
+A consumer composes:
+
+```rust
+enum AssistantKind {
+    Core(agent_ledger::CoreKind),
+    ChatMessage(ChatMessage),
+}
+```
+
+and derives the trait. The derive generates exactly the delegation the source maintains by
+hand today.
+
+**Rejected — a trait-object registry with an extension variant.** It creates two classes of
+kind: the library's, statically dispatched and compiler-checked, and the consumer's, boxed and
+unchecked. Two kinds of the same thing is the shape this architecture exists to avoid. It also
+costs native `async fn` in the trait — a trait with async methods is not object-safe, so every
+hook would return a boxed future, which the source deliberately avoided.
+
+**What the generic form keeps:** native `async fn` with no boxing; compiler-enforced
+completeness, now for a consumer's kinds as well as the library's; and static dispatch.
+
+**What it costs, stated plainly:** a type parameter travels through the runtime API, and the
+source application's own code is updated to name it. Both are mechanical.
+
+Two associated items carry the parts that are not behavior:
+
+- **Parsing** — a stored row becomes a typed kind. A composing enum tries its own variants and
+  delegates anything unrecognised down to the inner implementor, so the library's kinds resolve
+  through the library and only a genuinely unknown type reaches the inert fallback.
+- **Content-table descriptors** — a static list contributed by the same type, from which the
+  store builds its load query and its change-hook allowlist. This is what makes persistence
+  kind-blind, and it closes finding 2 with the same static mechanism, not a second
+  dynamic one.
+
+## Sequencing: open the seams before moving anything
+
+The seam work happens **in the source repository first**, where 368 passing tests hold it
+honest, and the extraction follows as a genuine move.
+
+| Stage | What happens | Needs |
 |---|---|---|
-| `agency/` | 2500 | The block behavior model: the trait, the cursor walk, the frontier decision, the redispatch walk, per-kind behavior, the projection seam, and their tests |
-| `chat.rs` | 166 | The block and role types |
-| `turns.rs` | 1208 | The session actor, the scheduler tick, the latch, provider binding |
-| `ingestion.rs` | 1231 | Stream events to blocks: per-channel tracks, streaming tails, finalization into immutable twins |
-| `reactivity.rs` | 559 | The signal primitives the scheduler ticks on |
-| `tools/` | 1769 | The tool registry, the runner, admission and the approval flow, and their tests |
-| `llm/` | 11497 | The provider layer and the concrete provider modules |
+| **0** | Nothing moves. In the source repository: make the runtime generic over the behavior trait, add the derive, make persistence descriptor-driven, and add a public synchronous ledger-append path usable inside the closure API. Its full suite passes unchanged throughout. | Write access to the source repository |
+| **1** | The equivalence baseline is captured from the source at its Stage-0 state. | Stage 0 |
+| **2** | The modules move here. The library builds standing alone, the moved tests pass, and the baseline is reproduced byte-for-byte. | Stage 1 |
+| **3** | The source application depends on this library and deletes its copy; its full suite passes unchanged. | Stage 2 |
+| **4** | The second project builds on the library: an authored chat-message kind, its adapters, the agreed access model. | Stage 2 |
+
+**Stage 0 is blocked on repository access and cannot start without it.** Revision 1 placed that
+dependency at the wrong stage.
+
+The identified runtime improvements land after Stage 3, so the equivalence baseline still means
+something while the move is being proven.
+
+## Inventory
+
+Line counts verified against the source tree.
+
+### Moves, cleanly
+
+| Module | Lines | Note |
+|---|---|---|
+| `agency/` | 2500 | Minus three domain kinds — see splits |
+| `turns.rs` | 1208 | Minus hardwired search construction |
+| `ingestion.rs` | 1231 | |
+| `reactivity.rs` | 559 | |
 | `metadata.rs`, `metadata/` | 1008 | The second ledger, proving the machinery is ledger-blind |
-| `file_store.rs` | 509 | Attachment and artifact storage |
-| store subset | ~3900 | See below |
+| `file_store.rs` | 509 | Carries `store/attachments.rs` (247) with it |
+| store subset | 4833 | Named below, including the migration mechanism |
 
-From the store: the connection, its write-ahead mode and the closure API; block persistence;
-conversation rows and the cursor; the approval tables; call records; the fork cloner; the date
-marker; the metadata tables; drafts; the migration *mechanism*; and provider and model config.
+Store files that move: the connection and its closure API; block persistence (note
+`store/messages.rs` persists **blocks**, not messages — the architecture has no message row);
+block content; conversation rows and the cursor; approvals; call records; the fork cloner; the
+date marker; metadata tables; drafts; attachments; provider and model config; and the migration
+mechanism.
 
-One name misleads and must not be trusted: `store/messages.rs` persists **blocks**, not
-messages. The architecture has no message row. It moves.
+`store/agent_kv.rs` (87) has no caller outside the store and is **dropped, not moved**, unless a
+consumer claims it.
 
 ### Stays with the source application
 
 `api.rs`, `http.rs`, `server/`, `bin/`, `bootstrap.rs`; `runtime/` (language server, tool
-protocol, proxy, web); source-control integration, project handling, skills, the sandbox,
-search, actions, session handling, ambient context, the agent layer, the internal message
-bus for its own subsystems, platform glue; and the store tables for projects, activities and
-code executions.
+protocol, proxy, sparse files, web); source-control integration, project handling, skills, the
+sandbox, search, actions, session handling, ambient context, the agent layer, its internal
+subsystem bus, platform glue; and the store tables for projects, sessions, activities and code
+executions.
 
-### Splits, and each split is a design question
+### Splits and repairs — each is work, not a move
 
-| Thing | The question |
-|---|---|
-| The `Store` struct | It is one struct with methods for every table. The library needs its own; the consumer needs to add tables. See "the store seam" below. |
-| Migrations | The mechanism moves; the source application's own migrations stay. Two version counters, by scope. |
-| The composition root | The library must not own it. It exposes constructors; each consumer wires them. |
-| Provider selection | Reading which model a conversation uses is the library's; deciding *which* providers are configured is the consumer's. |
+| Item | What is wrong | Resolution |
+|---|---|---|
+| `chat.rs` (166) | Contains the product's system prompt string, a `Conversation` with a search-provider field, and a re-export from the frontend wire crate | Types move; the prompt moves to **its own file in the consuming project** (prompts are data, editable without a recompile); the search field and the re-export are severed |
+| `tools/` (1769) | 715 lines are two concrete product tools depending on the sandbox, proxy and language-server client — the exact bloat this extraction exists to avoid — and 13 of its 29 tests are theirs | Registry, runner and admission move; the two tools and their tests stay |
+| `agency/` | Carries three search-specific kinds, and its tests assert on their type literals | Those kinds and their assertions move to the source application as consumer kinds — the first proof the extension mechanism works |
+| `app_context.rs` (126) | A service locator threaded through every moved module, bundling library handles with stay-behind ones | Split: the library defines a context of only what it owns; each consumer keeps its own and passes the library's part down. A second seam as large as the store's |
+| The sibling wire crate | The moved core re-exports its event and input types, and the ask-state enum lives there | Those types move here. The frontend-binding generation stays with the source application, re-exporting from here |
+| `llm/` (11497) | Five provider modules import the application's HTTP helpers; the provider trait returns a search-provider handle in its public signature; the subprocess provider needs a tool-protocol server | HTTP helpers move; the search handle becomes a consumer-supplied capability the trait does not name; the subprocess provider **stays with the source application** as a consumer-registered provider |
+| `store/migrations.rs` (902) | One flat array under one pragma counter, whose individual steps create framework and product tables in single indivisible statements | Cannot be split by partitioning. Rewrite as a library-owned sequence plus a consumer-owned one, with a stated upgrade path for an existing installed database |
+| `store/mod.rs` | The constructor runs a product-specific import on open | The library constructor takes a database path and nothing else |
 
-## The store seam
+### Not classified, deliberately
 
-The single hardest question in the extraction, and the one most likely to be got wrong.
+`deferred.rs` (74) and `lattice/` (262) were unclassified in revision 1. They are read and
+dispositioned before Stage 2, not assumed.
 
-The library owns the connection, the write-ahead mode, the single-writer discipline and its
-own schema. A consumer needs tables of its own **in the same database and the same
-transaction**, or a write spanning both is not atomic.
+## Proving the move changed nothing
 
-**Decision:** the library exposes a closure-scoped connection API. A consumer runs its own
-statements inside the same scope, so a consumer write and a ledger append share one
-transaction. The library never learns what those tables are.
+An **equivalence baseline** captured at Stage 1: representative ledgers run through the
+source's projection path, recorded as canonical bytes, and reproduced byte-for-byte by the
+library afterwards. Canonical bytes are chosen so any value or type difference fails.
 
-**Schema versions are two counters by scope**: a linear one the library owns and steps
-forward, and a per-consumer one each consumer owns. A single counter would force a library
-version bump every time a consumer changed its own storage, coupling projects that must stay
-independent.
+Scope correction from revision 1: the baseline covers the **projection**, which moves. It does
+not cover the serving path, which stays — a library with no serving surface cannot reproduce
+serving bytes.
 
-**Rejected — a repository trait the consumer implements.** It inverts the dependency for no
-gain: the library would then have to define an interface wide enough for every access pattern
-it has, which is the whole store. The consumer would implement it once, identically, forever.
-
-**Rejected — separate databases per consumer.** It gives up cross-table atomicity, which the
-approval chain and the fork path both need.
-
-## What changes during the move
-
-Nothing about behavior. The changes are the ones a move forces:
-
-1. **Domain imports are severed.** Three shared test fixtures import the source application's
-   own tools and workflow types. Each becomes a **test double the consuming project
-   registers**, never a library import.
-2. **Concrete providers are feature-gated**, defaulting off. A consumer enables the vendors it
-   uses. The provider trait, the neutral message vocabulary and the streaming contract are
-   always present.
-3. **The composition root is inverted.** Where the source application constructs the world in
-   one place, the library exposes the pieces and each consumer assembles them.
-4. **Public interface is deliberate.** Anything not needed by a consumer stays private. It is
-   cheaper to publish a type later than to withdraw one.
-
-## Proving the move did not change behavior
-
-**An equivalence baseline, captured before anything moves.** Representative ledgers are run
-through the source application's own projection and serving paths, and the outputs are recorded
-as canonical bytes. After extraction, the library must reproduce them **byte-identically**.
-Equality on canonical bytes is chosen so that any value or type difference fails, including a
-number silently changing type.
-
-The baseline covers, at minimum: an empty session; a streaming tail with a parked cursor; a
-fork and a fork of a fork; a dangling call with results arriving out of order; an approval
-parked and then approved; an approval denied; a tail at **every** ask state; and a session
-carrying every registered block kind.
-
-This is the only test shape that survives a rewrite of the thing it tests, and an extraction is
-exactly that. It means neither consumer has to review the move by eye.
+The corpus covers: an empty session; a streaming tail with a parked cursor; a fork and a fork
+of a fork; parallel calls whose results arrive out of order; an approval parked then approved;
+an approval denied; a tail at every ask state; and a session carrying every registered kind.
+Fixtures are generated by a committed script, are **scrubbed of credentials** — the same
+database holds provider API keys — and are regenerated by rerunning that script.
 
 ## The conformance kit
 
-The library ships tests a consumer runs **against its own block kinds and tools**. The moment a
-consumer registers its own kinds, the library's preconditions stop being checkable by the
-library, and every one of them is a prose rule a permissive test double can violate with
-nothing going red.
+Tests a consumer runs against **its own** kinds and tools. Revision 1 listed four checks; three
+were vocabulary from a different implementation and are struck. What can be checked against
+this source:
 
-Four checks, run over the consumer's registry:
-
-1. A kind declaring frontier transparency is inert in every direction — no ask, no work, no
-   routing.
-2. A tier override appears on a leaf type only, never on a shared base.
-3. Every registered kind parses from its stored form.
+1. Every registered kind parses from its stored form, and no kind silently resolves to the
+   inert fallback.
+2. Every kind that reports not-done has an out-of-band completion path — asserted as the
+   documented starvation contract, so it is explicit and not a surprise.
+3. Every content-table descriptor names a table the migrations actually create.
 4. Every tool carrying result-side behavior stays registered under its recorded name.
 
-## Sequencing
-
-**Stage 1 — this unit.** The library exists and stands alone: the moved modules compile, their
-moved tests pass, the equivalence baseline is captured and met, and the conformance kit exists
-with the library's own kinds passing it. Neither consumer is migrated.
-
-**Stage 2.** The source application depends on the library and deletes its copy. Its full suite
-passes unchanged. This stage needs write access to that repository, which the maintainer has to
-arrange; it is not blocked on anything here.
-
-**Stage 3.** The second project builds on the library: an authored chat-message kind, one
-adapter, and the access model already agreed.
-
-**Not in any stage yet**: the five identified runtime improvements. They land after Stage 2, so
-the equivalence baseline still means something while the move is being proven.
+Checks that would require a runtime improvement not yet built are **not** in the kit. They join
+it with the improvement.
 
 ## Acceptance criteria
 
-- **AC1** The library builds with no dependency on the source application, and no path
-  reference to it: `cargo build --workspace` succeeds, and its manifests name no local path
+Stage 2 unless stated.
+
+- **AC1** The library builds with no dependency on the source application and no path reference
   outside this repository.
-- **AC2** `cargo test --workspace` passes, running the moved tests. The count of test functions
-  is at least the count moved.
-- **AC3** `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check` both
-  exit zero.
-- **AC4** No file under `src/` names a domain concept from the source application. A grep for
-  the agreed vocabulary list finds nothing outside `docs/`.
-- **AC5** The equivalence baseline is committed as fixtures, and a test asserts the library
-  reproduces every recorded output byte-for-byte.
-- **AC6** The conformance kit exists as a public test entry point, and a test runs it against
-  the library's own registered kinds with every check passing.
-- **AC7** The suite runs with no network access and starts no external service; the store opens
-  in memory. A test asserting an outbound connection fails is present.
-- **AC8** The suite is parallel-safe: it passes with the default parallel test runner and again
-  under a single thread, with the same result.
-- **AC9** Every public item carries a doc comment, and `cargo doc` produces no warnings.
-- **AC10** The library exposes no constructor that silently picks a provider, a model or a
-  database path: each is supplied by the caller.
-- **AC11** Licensing is consistent: the manifest declares MPL-2.0, the license file is present,
-  and no moved file carries a conflicting header.
-- **AC12** The reference documents describing this architecture live in this repository, and the
-  consuming project's copies are replaced by pointers.
+- **AC2** `cargo test --workspace --all-features` passes and runs at least 250 test functions.
+  The feature-gated vendor modules hold 89 tests, so a default-feature run is not the check.
+- **AC3** `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
+  `cargo fmt --check` exit zero.
+- **AC4** No file under `src/` matches the vocabulary list in `docs/forbidden-vocabulary.txt`,
+  which is committed with this spec. AC4 is unfalsifiable without it.
+- **AC5** The equivalence fixtures are committed, contain no credential, and a test asserts the
+  library reproduces every recorded projection byte-for-byte.
+- **AC6** The conformance kit is a public test entry point, and a test runs it against the
+  library's own kinds with every check passing.
+- **AC7** The suite starts no external service and opens no socket: the store opens in memory,
+  and a test asserts an outbound connection attempt fails.
+- **AC8** The suite passes under the default parallel runner and again single-threaded, with
+  the same result.
+- **AC9** `cargo doc --all-features` produces no warnings, and every public item has a doc
+  comment.
+- **AC10** The library constructor takes a database path and nothing else. It selects no
+  provider, no model and no directory.
+- **AC11** The manifest declares GPL-3.0-or-later, the license file is present, and no moved
+  file carries a conflicting header.
+- **AC12** *(Stage 0)* The source application's suite passes unchanged after the seam work,
+  with the same test count.
+- **AC13** *(Stage 0)* A test in the source repository registers a kind defined **outside** the
+  library's own enum and proves it parses, loads, wakes a tick and takes a turn. This is the
+  check that the whole extension design exists for; without it, nothing else here is proven.
 
-## Open questions for the maintainer
+## Open questions
 
-1. **Crate naming.** `agent-ledger` is the working name and the crate name. Renaming is free
-   until first publication.
-2. **Write access to the source repository** is needed for Stage 2 and not before.
-3. **Which providers ship enabled by default.** The recommendation is none: every consumer
-   names what it uses.
+1. **Repository access** to the source application, needed for Stage 0.
+2. **Which providers ship enabled by default.** Recommendation: none — every consumer names
+   what it uses.
+3. **The existing-database upgrade path** across the migration split, for installations already
+   at the current counter.

@@ -1,0 +1,38 @@
+# Vocabulary that must not appear under src/ in this library.
+#
+# The library carries no knowledge of any product built on it. This list makes that
+# checkable instead of aspirational: acceptance criterion AC4 in the extraction spec greps
+# src/ for these terms, whole-word and case-insensitive, and fails on any match.
+#
+# Two rules for maintaining it:
+#   - A term joins this list when a product concept is found leaking, not pre-emptively.
+#   - A term leaves it only when the concept genuinely becomes general, with a note saying so.
+#
+# Blank lines and lines beginning with # are ignored by the check.
+
+# Product identity
+ronna
+lightspeed
+
+# Block kinds belonging to a consumer, not to the runtime
+tool_activity
+search_result
+search_complete
+
+# Stay-behind subsystems the runtime must never name
+deno
+lsp
+mcp
+tauri
+sandbox
+worktree
+skill
+proxy
+
+# Concrete search vendors
+serper
+langsearch
+
+# Product-side storage
+projects.json
+code_execution

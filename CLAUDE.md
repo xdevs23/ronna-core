@@ -57,7 +57,8 @@ workflows, and anything that knows what the product does.
 
 ## License
 
-Mozilla Public License 2.0. File-scoped copyleft: changes to this library's own files are
-published under the same terms, while a larger work linking it may be licensed as its author
-chooses. Chosen over LGPL because LGPL's relink requirement assumes dynamic linking, which
-static Rust builds cannot satisfy, and over GPL because that would bind every consumer.
+GNU General Public License v3.0 or later, carried over from the code this library is
+extracted from. A weaker copyleft was considered so that unrelated projects could adopt the
+library; it was rejected because the maintainer's stated need is their own projects, and
+keeping the original terms removes a relicensing step and its consent record entirely. Both
+current consumers are GPL-3.0 already.

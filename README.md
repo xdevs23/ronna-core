@@ -39,13 +39,12 @@ reaches nothing over the network.
 
 ## Documentation
 
-- `docs/reference` — the architecture, the permission subsystem, and the testing approach,
-  each rule stated with the failure that produced it.
-- `docs/decisions` — decision records, numbered in order, each with its date and rejected
-  alternatives.
+- `docs/extraction-spec.md` — what is being moved here, from where, and in what order. The
+  only document that exists yet.
 
-The invariants that bind every change are in `CLAUDE.md`.
+The invariants that bind every change are in `CLAUDE.md`. Architecture references and
+decision records arrive with the code they describe.
 
 ## License
 
-Mozilla Public License 2.0. See [LICENSE](LICENSE).
+GNU General Public License v3.0 or later. See [LICENSE](LICENSE).
