@@ -127,6 +127,33 @@ moved tests before the next begins:
 The identified runtime improvements land after Stage 3, so the equivalence baseline still means
 something while the move is being proven.
 
+## The test inventory, measured
+
+Run against a clean clone: **359 tests, 354 passing.** The five failures are all in the
+sandbox runtime — a stay-behind module whose subprocess is absent here — so the moving set is
+entirely green at the baseline.
+
+Per module, with what each contributes to the move:
+
+| Module | Tests | Moves | Note |
+|---|---|---|---|
+| `llm` | 121 | 118 | Minus the subprocess provider's 3 |
+| `store` | 49 | 49 | |
+| `agency` | 47 | 47 | Some assert on consumer kinds and are ported, not dropped |
+| `tools` | 29 | 16 | The admission suite; the two product tools take 13 with them |
+| `ingestion` | 19 | 19 | |
+| `metadata` | 12 | 12 | |
+| `turns` | 7 | 7 | |
+| `reactivity` | 7 | 7 | |
+| **Total moving** | | **275** | |
+| Stays | 84 | — | server, sandbox runtime, actions, project, session, skills, ambient context, platform, the subsystem bus, source control, the agent layer, and the two product tools |
+
+Of the moving 275, **86 sit in vendor provider modules** that ship feature-gated, so a
+default-feature run exercises 189 of them. That is why AC2 names `--all-features`.
+
+`file_store.rs` carries no tests of its own. Anything it needs proven gets a test written
+during its slice, and that is stated rather than left as an accidental gap.
+
 ## Inventory
 
 Line counts verified against the source tree.
@@ -216,8 +243,9 @@ Stage 2 unless stated.
 
 - **AC1** The library builds with no dependency on the source application and no path reference
   outside this repository.
-- **AC2** `cargo test --workspace --all-features` passes and runs at least 250 test functions.
-  The feature-gated vendor modules hold 89 tests, so a default-feature run is not the check.
+- **AC2** `cargo test --workspace --all-features` passes and runs at least **275** test
+  functions — the measured moving set. A default-feature run exercises 189 of them, so it is
+  not the check.
 - **AC3** `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
   `cargo fmt --check` exit zero.
 - **AC4** No file under `src/` matches the vocabulary list in `docs/forbidden-vocabulary.txt`,
@@ -236,9 +264,9 @@ Stage 2 unless stated.
   provider, no model and no directory.
 - **AC11** The manifest declares GPL-3.0-or-later, the license file is present, and no moved
   file carries a conflicting header.
-- **AC12** *(Stage 2)* No moved test is dropped. The library's test count is at least the
-  count of tests in the modules that moved, and any test deliberately not ported is named in
-  the slice's commit with the reason.
+- **AC12** *(Stage 2)* No moved test is dropped. Each slice's commit states the test count it
+  brought and the running total against the 275 measured, and any test deliberately not ported
+  is named with its reason.
 - **AC13** *(Stage 3)* A test registers a kind defined **outside** the library's own enum and
   proves it parses, loads, wakes a tick and takes a turn. This is the check the whole extension
   design exists for; without it, nothing else here is proven.
