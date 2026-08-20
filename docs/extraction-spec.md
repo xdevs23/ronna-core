@@ -1,7 +1,8 @@
 # Spec: extracting the ledger runtime into this library
 
-Date: 2026-08-20. Revision 2, rewritten after an unbriefed review probed revision 1 against
-the source tree and returned three blockers. Status: draft.
+Date: 2026-08-20. Revision 3. Revision 1 was rewritten after an unbriefed review probed it
+against the source tree and returned three blockers; revision 3 corrects the sequencing, which
+had assumed the source application would be modified. Status: draft.
 
 ## Context
 
@@ -85,21 +86,43 @@ Two associated items carry the parts that are not behavior:
   kind-blind, and it closes finding 2 with the same static mechanism, not a second
   dynamic one.
 
-## Sequencing: open the seams before moving anything
+## Sequencing: extract first, then open the seams
 
-The seam work happens **in the source repository first**, where 368 passing tests hold it
-honest, and the extraction follows as a genuine move.
+Revision 2 put the seam work in the source repository, to keep its passing suite as the safety
+net. **Superseded 2026-08-20:** the source application is a separate project and is not
+modified. It is read, never written.
+
+The reason revision 2 gave for going there first does not survive the correction. The tests
+live in the same files as the code they cover, so all 368 travel with the extraction. The
+safety net comes along, and the seam work can happen here with the moved tests holding it
+honest.
+
+Two consequences, both accepted:
+
+- This library becomes a **divergent copy** of the source's runtime. Improvements made here do
+  not reach the source application unless it later adopts the library.
+- "The source's suite passes unchanged" is no longer available as a check. **The moved tests
+  passing is the check**, which is why no slice may drop one silently: a moved test that is
+  deleted rather than ported is a defect, and the count is an acceptance criterion.
 
 | Stage | What happens | Needs |
 |---|---|---|
-| **0** | Nothing moves. In the source repository: make the runtime generic over the behavior trait, add the derive, make persistence descriptor-driven, and add a public synchronous ledger-append path usable inside the closure API. Its full suite passes unchanged throughout. | Write access to the source repository |
-| **1** | The equivalence baseline is captured from the source at its Stage-0 state. | Stage 0 |
-| **2** | The modules move here. The library builds standing alone, the moved tests pass, and the baseline is reproduced byte-for-byte. | Stage 1 |
-| **3** | The source application depends on this library and deletes its copy; its full suite passes unchanged. | Stage 2 |
-| **4** | The second project builds on the library: an authored chat-message kind, its adapters, the agreed access model. | Stage 2 |
+| **1** | The equivalence baseline is captured from a read-only clone of the source. | A clone |
+| **2** | The modules move here, in dependency order, one reviewed slice at a time. The library builds standing alone and the moved tests pass. | Stage 1 |
+| **3** | The seams open here: generic over the behavior trait, the derive, descriptor-driven persistence, a synchronous append path usable inside the closure API. AC13 proves an out-of-library kind works. | Stage 2 |
+| **4** | The second project builds on the library: an authored chat-message kind, its adapters, the agreed access model. | Stage 3 |
 
-**Stage 0 is blocked on repository access and cannot start without it.** Revision 1 placed that
-dependency at the wrong stage.
+**Nothing is blocked.** A read-only clone is all Stage 1 needs.
+
+**Slices for Stage 2**, bottom of the dependency graph upward. Each compiles and passes its
+moved tests before the next begins:
+
+1. Crate skeleton, block and role types, the event vocabulary, the reactive primitives.
+2. The store subset.
+3. The behavior layer and its ratchet, minus the three consumer kinds.
+4. The provider layer, with its cross-boundary imports severed.
+5. Tool registry, runner and admission, minus the two product tools.
+6. Stream ingestion, the session actor, the metadata ledger.
 
 The identified runtime improvements land after Stage 3, so the equivalence baseline still means
 something while the move is being proven.
@@ -213,16 +236,17 @@ Stage 2 unless stated.
   provider, no model and no directory.
 - **AC11** The manifest declares GPL-3.0-or-later, the license file is present, and no moved
   file carries a conflicting header.
-- **AC12** *(Stage 0)* The source application's suite passes unchanged after the seam work,
-  with the same test count.
-- **AC13** *(Stage 0)* A test in the source repository registers a kind defined **outside** the
-  library's own enum and proves it parses, loads, wakes a tick and takes a turn. This is the
-  check that the whole extension design exists for; without it, nothing else here is proven.
+- **AC12** *(Stage 2)* No moved test is dropped. The library's test count is at least the
+  count of tests in the modules that moved, and any test deliberately not ported is named in
+  the slice's commit with the reason.
+- **AC13** *(Stage 3)* A test registers a kind defined **outside** the library's own enum and
+  proves it parses, loads, wakes a tick and takes a turn. This is the check the whole extension
+  design exists for; without it, nothing else here is proven.
 
 ## Open questions
 
-1. **Repository access** to the source application, needed for Stage 0.
-2. **Which providers ship enabled by default.** Recommendation: none — every consumer names
+1. **Which providers ship enabled by default.** Recommendation: none — every consumer names
    what it uses.
-3. **The existing-database upgrade path** across the migration split, for installations already
-   at the current counter.
+2. **The existing-database upgrade path** across the migration split. Since this library
+   starts with no installed base, the question is whether it needs one at all before its first
+   consumer ships.
