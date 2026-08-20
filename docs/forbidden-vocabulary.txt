@@ -36,3 +36,10 @@ langsearch
 # Product-side storage
 projects.json
 code_execution
+
+# Stay-behind store tables, named by the source's block query and change hook
+block_tool_activity
+block_search_result
+block_search_complete
+pending_tool_calls
+tracked_project
