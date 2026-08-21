@@ -104,6 +104,70 @@ impl Serialize for Block {
 // know: behavior lives on the kind. The hook belongs to the layer that owns
 // block kinds, where each kind answers for its own text form.
 
+// --- Reasoning continuity ---
+
+/// The provider-native continuity payload for one reasoning block. Opaque to
+/// the machinery: captured from the stream, replayed faithfully, never
+/// interpreted. Shaped per vendor because the vendors' payloads are
+/// structurally different — a flat `{format, data}` scalar cannot hold
+/// `OpenRouter`'s multi-entry array verbatim.
+///
+/// It lives beside the block row because it is stored beside it: the store
+/// writes it in the same transaction that finalizes the thinking block. The
+/// provider layer that produces and replays it arrives in a later slice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpaquePayload {
+    /// `encrypted_content` plus the server-assigned reasoning-item id
+    /// (`rs_…`), both required for verbatim item replay.
+    OpenAiResponses {
+        /// The reasoning item's server-assigned id.
+        item_id: String,
+        /// The encrypted reasoning content, replayed as received.
+        encrypted_content: String,
+    },
+    /// The thinking block's signature, echoed back as a native thinking block.
+    Anthropic {
+        /// The signature the provider issued for the block.
+        signature: String,
+    },
+    /// The full `reasoning_details` entries, decomposed and order-preserving so
+    /// the array can be rebuilt and format-gated per entry. Documented entry
+    /// fields only — an undocumented extra field would be dropped.
+    OpenRouter {
+        /// The entries, in array order.
+        entries: Vec<ReasoningDetailEntry>,
+    },
+    /// No extra payload: the thinking chunk is rebuilt from the block's own
+    /// stored text, and the tag alone gates replay.
+    Mistral,
+}
+
+/// One `reasoning_details` entry, relational — every datum its own field, so no
+/// JSON blob is stored where columns will do.
+///
+/// `entry_type` is one of `reasoning.text`, `reasoning.summary` or
+/// `reasoning.encrypted`; `content` holds that variant's text, summary or data;
+/// `upstream_format` is the per-entry discriminator (for example
+/// `google-gemini-v1`) that drives the replay filter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningDetailEntry {
+    /// Array order, preserved for verbatim rebuild.
+    pub position: u32,
+    /// Which kind of entry this is.
+    pub entry_type: String,
+    /// The provider's own id for the entry, when it issued one.
+    pub entry_id: Option<String>,
+    /// The per-entry format discriminator the replay filter reads.
+    pub upstream_format: String,
+    /// The entry's index within its upstream array, when it carried one.
+    pub index: Option<u32>,
+    /// The entry's payload — text, summary or encrypted data.
+    pub content: String,
+    /// A `reasoning.text` entry may carry one.
+    pub signature: Option<String>,
+}
+
 /// The outcome of a tool call, as stored in the ledger.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -169,6 +233,6 @@ mod tests {
 }
 
 // The draft-block shape is not carried here. Its only readers are the draft
-// tables and the request surface, so the slice that owns draft persistence
-// decides its shape; pinning it from here would settle that outside the
-// review that owns it.
+// tables and the request surface, so the module that owns draft persistence
+// decides its shape: it is [`crate::store::DraftBlock`], defined beside the
+// tables it is read out of.

@@ -262,6 +262,15 @@ impl Clone for DeferSignal {
 
 /// A change event from an external source's update hook — the store's row
 /// change hook is the one this library wires up.
+///
+/// **A `ChangeEvent` is a prompt to re-derive, never evidence that a write
+/// landed.** The store's hook fires per row change, not per commit: a
+/// transaction that rolls back has already announced every row it touched, and
+/// those rows do not exist. Read the durable state and decide from that.
+///
+/// The fields say where to look, not what is there. [`rowid`](Self::rowid) in
+/// particular is advisory — by the time a consumer reads it the row may be
+/// gone, or the id may have been handed to a different row.
 #[derive(Debug, Clone)]
 pub struct ChangeEvent {
     /// The row action code (9 = DELETE, 18 = INSERT, 23 = UPDATE — the database
@@ -269,7 +278,8 @@ pub struct ChangeEvent {
     pub action: i32,
     /// Table the row lives in.
     pub table: String,
-    /// The row's id.
+    /// The row's id. Advisory: a hint about where to look, not a promise that
+    /// the row is there.
     pub rowid: i64,
 }
 

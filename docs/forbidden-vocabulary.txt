@@ -43,3 +43,5 @@ block_search_result
 block_search_complete
 pending_tool_calls
 tracked_project
+code_executions
+chat_messages

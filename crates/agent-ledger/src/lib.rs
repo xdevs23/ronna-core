@@ -5,10 +5,12 @@
 //! the kind, and everything derivable — conversation state, tool admission,
 //! spend — is folded from the ledger rather than stored beside it.
 //!
-//! This is the foundation layer: the value types every later layer names, the
-//! event vocabulary the runtime emits, the fan-out bus that carries it, and the
-//! reactive primitives the scheduler ticks on. Nothing here reaches a store, a
-//! provider or a tool.
+//! The foundation layer is the value types every later layer names, the event
+//! vocabulary the runtime emits, the fan-out bus that carries it, and the
+//! reactive primitives the scheduler ticks on. On top of it sits the
+//! [`store`]: one connection behind one writer, holding the append-only block
+//! ledger, the conversations that index it, the cursor that walks it, and the
+//! change hook that wakes the scheduler when any of it moves.
 //!
 //! ```
 //! use agent_ledger::{bus::EventBus, event::CoreEvent};
@@ -24,9 +26,13 @@ pub mod block;
 pub mod bus;
 pub mod event;
 pub mod reactivity;
+pub mod store;
 pub mod types;
 
-pub use block::{Block, RESERVED_FIELD_NAMES, Role, ToolCallResult};
+pub use block::{
+    Block, OpaquePayload, RESERVED_FIELD_NAMES, ReasoningDetailEntry, Role, ToolCallResult,
+};
 pub use bus::{AttachOutcome, EventBus, PushEnvelope, PushSink};
 pub use event::CoreEvent;
+pub use store::{Store, StoreError};
 pub use types::{ApprovalChoice, Awaiting, InputBlock, StopReason, StreamUsage};

@@ -32,3 +32,27 @@ library needs is small, and the extra features the tests need — a macro attrib
 multi-threaded runtime flavour, a timer — sit in the development section instead. Cargo unifies
 features across a dependency graph, so a feature enabled for a test would otherwise be
 compiled into every project that depends on this one.
+
+## 2026-08-21 — the store
+
+Same two questions, same sources: resolved versions from the lockfile, current versions from
+the registry API, advisories from the OSV aggregate.
+
+| Crate | Resolved | Latest at check | Advisories | Why it is here |
+|---|---|---|---|---|
+| rusqlite | 0.40.2 | 0.40.2 | none | The embedded database the ledger is stored in |
+| libsqlite3-sys | 0.38.2 | 0.38.2 | none | Pulled in by `rusqlite`; the engine itself, compiled from vendored source |
+| chrono | 0.4.45 | 0.4.45 | none | Local-timezone dates, which the date marker records and no standard-library type produces |
+| thiserror | 2.0.20 | 2.0.20 | none | The store's error type |
+
+All four resolved to the current latest.
+
+**The two features asked of the database crate.** `bundled` compiles the engine from vendored
+source rather than linking whatever the host happens to have: a consumer needs no system
+library, and every machine gets the same engine, which matters for a library whose tests assert
+on schema behaviour. `hooks` is the row change hook — the store's whole connection to the
+scheduler's heartbeat is that callback, so it is not optional here.
+
+**The one transitive dependency named.** `libsqlite3-sys` is not declared in any manifest; it
+is recorded because it is where the C engine actually comes from, and a review that checked the
+wrapper but not the thing it wraps would be checking the wrong artifact.

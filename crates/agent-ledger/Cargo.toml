@@ -15,11 +15,19 @@ workspace = true
 # The dependency set is deliberately small and stays that way: a library that
 # drags a consumer's toolchain into every dependent tree is the coupling this
 # crate exists to remove. Serialization, an async runtime for the reactive
-# primitives and the bus, and structured logging — nothing else yet.
+# primitives and the bus, structured logging, and the embedded database the
+# ledger is stored in — nothing else yet.
 [dependencies]
+chrono = "0.4"
+# `bundled` compiles SQLite from vendored source, so a consumer needs no system
+# library and every build gets the same engine. `hooks` is the row change hook
+# the reactive change log is driven from — without it the scheduler has no
+# heartbeat.
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strum = { version = "0.28.0", features = ["derive"] }
+thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync"] }
 tracing = "0.1"
 

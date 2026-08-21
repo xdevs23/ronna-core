@@ -32,8 +32,12 @@ crate `crates/ronna-server`, directory `src/store`. **Read it; never write to it
 | `block_cloner.rs` | 78 | 0 |
 | `providers.rs` | 60 | 0 |
 
-**48 tests.** Every one comes across. A test not ported is a defect, not a judgment call; if
-one genuinely cannot come, name it and its reason in the report.
+**48 tests.** Every one comes across or is named with its reason. Correction 2026-08-21: the
+count of 48 includes two tests over tables this slice forbids porting and six that replay
+historical migration shapes the collapsed sequence cannot have; the earlier sentence "every
+one comes across" was arithmetic the spec itself made impossible, and the honest rule is the
+one the extraction spec states — a dropped test is named with its reason, and end-state facts
+from unportable tests are kept as fresh-schema tests.
 
 ## The repairs this slice owes
 

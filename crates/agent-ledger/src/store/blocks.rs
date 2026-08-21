@@ -1,0 +1,632 @@
+//! Loading blocks back out of the ledger: the one statement that reads a
+//! block's header row together with whichever content table holds its payload.
+
+use rusqlite::{Connection, OptionalExtension};
+use serde_json::Value;
+
+use crate::block::{Block, OpaquePayload, ReasoningDetailEntry, Role};
+
+use super::StoreError;
+use super::block_content::parse_role;
+
+/// One hardcoded statement joining every content table by name.
+///
+/// **This list is the reason a consumer cannot yet add a block kind.** A kind
+/// whose content lives in a table not named here loads with an empty payload,
+/// silently, because the join that would have fetched it does not exist. Stage
+/// 3 replaces the list with content-table descriptors contributed by the kind
+/// itself, so the statement is built from what is registered rather than from
+/// what was typed here. Until then, adding a kind means editing this constant,
+/// which a consumer cannot do.
+///
+/// Three joins that stood here named tables belonging to the application this
+/// was extracted from. They do not exist in this library and are gone; nothing
+/// replaced them, because replacing them is the Stage 3 mechanism and it is
+/// deliberately not attempted in this slice.
+const BLOCKS_QUERY: &str = "SELECT
+            b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at,
+            bt.role AS bt_role, bt.content AS bt_content,
+            bq.role AS bq_role, bq.start_block_id, bq.start_pos, bq.end_block_id, bq.end_pos,
+            bc.role AS bc_role, bc.language AS bc_language, bc.content AS bc_content,
+            btc.role AS btc_role, btc.tool_call_id AS btc_tool_call_id, btc.name AS btc_name, btc.input AS btc_input, btc.interactive AS btc_interactive,
+            bstc.role AS bstc_role, bstc.tool_call_id AS bstc_tool_call_id, bstc.name AS bstc_name, bstc.input AS bstc_input,
+            btr.tool_call_id AS btr_tool_call_id, btr.content AS btr_content,
+            bte.tool_call_id AS bte_tool_call_id, bte.error AS bte_error,
+            bth.role AS bth_role, bth.content AS bth_content, bth.title AS bth_title, bth.summary AS bth_summary,
+            bth.opaque_kind AS bth_opaque_kind, bth.opaque_data AS bth_opaque_data, bth.opaque_item_id AS bth_opaque_item_id,
+            bs.status AS bs_status, bs.subtitle AS bs_subtitle,
+            bar.for_block_id AS bar_for_block_id,
+            bad.for_block_id AS bad_for_block_id, bad.decision AS bad_decision, bad.system_reason AS bad_system_reason, bad.user_reason AS bad_user_reason,
+            bdm.date AS bdm_date
+     FROM blocks b
+     LEFT JOIN block_text bt ON bt.block_id = b.id AND b.block_type IN ('text', 'streaming', 'system_prompt')
+     LEFT JOIN block_quote bq ON bq.block_id = b.id AND b.block_type = 'quote'
+     LEFT JOIN block_code bc ON bc.block_id = b.id AND b.block_type = 'code'
+     LEFT JOIN block_tool_call btc ON btc.block_id = b.id AND b.block_type = 'tool_call'
+     LEFT JOIN block_streaming_tool_call bstc ON bstc.block_id = b.id AND b.block_type = 'streaming_tool_call'
+     LEFT JOIN block_tool_result btr ON btr.block_id = b.id AND b.block_type = 'tool_result'
+     LEFT JOIN block_tool_error bte ON bte.block_id = b.id AND b.block_type = 'tool_error'
+     LEFT JOIN block_thinking bth ON bth.block_id = b.id AND b.block_type IN ('thinking', 'streaming_thinking')
+     LEFT JOIN block_status bs ON bs.block_id = b.id AND b.block_type = 'status'
+     LEFT JOIN block_approval_request bar ON bar.block_id = b.id AND b.block_type = 'approval_request'
+     LEFT JOIN block_approval_decision bad ON bad.block_id = b.id AND b.block_type = 'approval_decision'
+     LEFT JOIN block_date_marker bdm ON bdm.block_id = b.id AND b.block_type = 'date_marker'";
+
+pub(super) fn load_blocks_for_conversation(
+    conn: &Connection,
+    conversation_id: i64,
+) -> Result<Vec<Block>, StoreError> {
+    // Ledger position IS the junction order: strictly monotonic within a
+    // conversation regardless of how forks share block rows. Deep-copied
+    // blocks keep their source created_at, so a timestamp sort would misplace
+    // them relative to fork-inserted rows.
+    let mut stmt = conn.prepare(&format!(
+        "{BLOCKS_QUERY}
+         JOIN conversation_blocks cb ON cb.block_id = b.id
+         WHERE cb.conversation_id = ?1
+         ORDER BY cb.id"
+    ))?;
+    // A row that cannot be read is an error, never a block quietly left out of
+    // the history: this ledger's premise is that replay is faithful, and a
+    // shortened conversation is a lie the caller has no way to notice.
+    let rows = stmt.query_map([conversation_id], |row| Ok(row_to_block(row)))?;
+    let mut blocks = Vec::new();
+    for row in rows {
+        blocks.push(row??);
+    }
+    Ok(resolve_quotes(
+        conn,
+        Some(conversation_id),
+        resolve_reasoning_payloads(conn, blocks),
+    ))
+}
+
+pub(super) fn load_single_block(
+    conn: &Connection,
+    block_id: i64,
+) -> Result<Option<Block>, StoreError> {
+    let mut stmt = conn.prepare(&format!("{BLOCKS_QUERY} WHERE b.id = ?1"))?;
+    let Some(block) = stmt
+        .query_row([block_id], |row| Ok(row_to_block(row)))
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    // No conversation is named here, so a quote resolves along whichever
+    // conversation carries the quoting block.
+    Ok(
+        resolve_quotes(conn, None, resolve_reasoning_payloads(conn, vec![block?]))
+            .into_iter()
+            .next(),
+    )
+}
+
+fn col_opt<T: rusqlite::types::FromSql>(
+    row: &rusqlite::Row<'_>,
+    name: &str,
+) -> rusqlite::Result<Option<T>> {
+    row.get(name)
+}
+
+/// Read a column the block's content table declares NOT NULL.
+///
+/// The joins are outer, so a NULL here means one thing: the header row claims a
+/// kind whose content row is not there. That is reported as
+/// [`StoreError::MissingBlockContent`] naming the block and its kind. It used to
+/// become an empty string for text and a dropped block for quotes — an invented
+/// payload and a shortened history, both of them silent.
+fn required<T: rusqlite::types::FromSql>(
+    row: &rusqlite::Row<'_>,
+    name: &str,
+    block_id: i64,
+    block_type: &str,
+) -> Result<T, StoreError> {
+    match row.get::<_, Option<T>>(name)? {
+        Some(value) => Ok(value),
+        None => Err(StoreError::MissingBlockContent {
+            block_id,
+            block_type: block_type.to_owned(),
+        }),
+    }
+}
+
+/// The same read for a string column, which is most of them.
+fn required_str(
+    row: &rusqlite::Row<'_>,
+    name: &str,
+    block_id: i64,
+    block_type: &str,
+) -> Result<String, StoreError> {
+    required(row, name, block_id, block_type)
+}
+
+/// A block's payload as it comes off the row: whose voice it speaks in, and
+/// the kind-specific fields.
+type Payload = (Option<Role>, serde_json::Map<String, Value>);
+
+fn row_to_block(row: &rusqlite::Row<'_>) -> Result<Block, StoreError> {
+    let id: i64 = row.get("b_id")?;
+    let block_type: String = row.get("b_type")?;
+    let created_at: String = row.get("b_created_at")?;
+
+    // Split where the source of a block's role differs: `content_payload` and
+    // `tool_payload` read a role COLUMN off their content table, and
+    // `structural_payload` does not — those kinds' voice is a fact about the
+    // kind, and the last of its arms is where an unrecognised kind lands.
+    let (role, fields) = match content_payload(row, id, &block_type)? {
+        Some(payload) => payload,
+        None => structural_payload(row, id, &block_type)?,
+    };
+
+    Ok(Block {
+        id,
+        role,
+        block_type,
+        created_at,
+        fields,
+    })
+}
+
+/// The kinds whose content table carries their role and their fields.
+/// `None` means this is not one of them.
+fn content_payload(
+    row: &rusqlite::Row<'_>,
+    block_id: i64,
+    block_type: &str,
+) -> Result<Option<Payload>, StoreError> {
+    let mut fields = serde_json::Map::new();
+    let mut role: Option<Role> = None;
+
+    match block_type {
+        "text" | "streaming" | "system_prompt" => {
+            role = parse_role(col_opt::<String>(row, "bt_role")?.as_deref());
+            fields.insert(
+                "content".into(),
+                Value::String(required_str(row, "bt_content", block_id, block_type)?),
+            );
+        }
+        "quote" => {
+            role = parse_role(col_opt::<String>(row, "bq_role")?.as_deref());
+            for name in ["start_block_id", "start_pos", "end_block_id", "end_pos"] {
+                let value: i64 = required(row, name, block_id, block_type)?;
+                fields.insert(name.into(), Value::Number(value.into()));
+            }
+            fields.insert("text".into(), Value::String(String::new()));
+        }
+        "code" => {
+            role = parse_role(col_opt::<String>(row, "bc_role")?.as_deref());
+            let lang: Option<String> = col_opt(row, "bc_language")?;
+            fields.insert("language".into(), lang.map_or(Value::Null, Value::String));
+            fields.insert(
+                "content".into(),
+                Value::String(required_str(row, "bc_content", block_id, block_type)?),
+            );
+        }
+        "thinking" | "streaming_thinking" => {
+            role = parse_role(col_opt::<String>(row, "bth_role")?.as_deref());
+            fields.insert(
+                "content".into(),
+                Value::String(required_str(row, "bth_content", block_id, block_type)?),
+            );
+            // The display-only summary channel — surfaced for rendering, never
+            // consumed by projection.
+            if let Some(summary) = col_opt::<String>(row, "bth_summary")? {
+                fields.insert("summary".into(), Value::String(summary));
+            }
+            // Raw opaque columns — reconstructed into one `opaque` field by
+            // `resolve_reasoning_payloads`, which also fetches the multi-entry
+            // sidecar rows (a row callback has no connection to query with).
+            if let Some(kind) = col_opt::<String>(row, "bth_opaque_kind")? {
+                fields.insert("opaque_kind".into(), Value::String(kind));
+                if let Some(data) = col_opt::<String>(row, "bth_opaque_data")? {
+                    fields.insert("opaque_data".into(), Value::String(data));
+                }
+                if let Some(item_id) = col_opt::<String>(row, "bth_opaque_item_id")? {
+                    fields.insert("opaque_item_id".into(), Value::String(item_id));
+                }
+            }
+        }
+        "status" => {
+            fields.insert(
+                "status".into(),
+                Value::String(required_str(row, "bs_status", block_id, block_type)?),
+            );
+            let subtitle: Option<String> = col_opt(row, "bs_subtitle")?;
+            fields.insert(
+                "subtitle".into(),
+                subtitle.map_or(Value::Null, Value::String),
+            );
+        }
+        _ => return tool_payload(row, block_id, block_type),
+    }
+
+    Ok(Some((role, fields)))
+}
+
+/// The tool-call family: the call, the streamed input tail it replaces, and the
+/// two ways it resolves. `None` means this is not one of them.
+fn tool_payload(
+    row: &rusqlite::Row<'_>,
+    block_id: i64,
+    block_type: &str,
+) -> Result<Option<Payload>, StoreError> {
+    let mut fields = serde_json::Map::new();
+    let mut role: Option<Role> = None;
+
+    match block_type {
+        "tool_call" => {
+            role = parse_role(col_opt::<String>(row, "btc_role")?.as_deref());
+            fields.insert(
+                "tool_call_id".into(),
+                Value::String(required_str(row, "btc_tool_call_id", block_id, block_type)?),
+            );
+            fields.insert(
+                "name".into(),
+                Value::String(required_str(row, "btc_name", block_id, block_type)?),
+            );
+            fields.insert(
+                "input".into(),
+                Value::String(required_str(row, "btc_input", block_id, block_type)?),
+            );
+            // The interactive stamp, so the block answers who owes its next
+            // move from its own data on replay — never a tool-name match.
+            fields.insert(
+                "interactive".into(),
+                Value::Bool(col_opt::<i64>(row, "btc_interactive")?.unwrap_or(0) != 0),
+            );
+        }
+        "streaming_tool_call" => {
+            role = parse_role(col_opt::<String>(row, "bstc_role")?.as_deref());
+            fields.insert(
+                "tool_call_id".into(),
+                Value::String(required_str(
+                    row,
+                    "bstc_tool_call_id",
+                    block_id,
+                    block_type,
+                )?),
+            );
+            fields.insert(
+                "name".into(),
+                Value::String(required_str(row, "bstc_name", block_id, block_type)?),
+            );
+            fields.insert(
+                "input".into(),
+                Value::String(required_str(row, "bstc_input", block_id, block_type)?),
+            );
+        }
+        "tool_result" => {
+            fields.insert(
+                "tool_call_id".into(),
+                Value::String(required_str(row, "btr_tool_call_id", block_id, block_type)?),
+            );
+            fields.insert(
+                "content".into(),
+                Value::String(required_str(row, "btr_content", block_id, block_type)?),
+            );
+        }
+        "tool_error" => {
+            fields.insert(
+                "tool_call_id".into(),
+                Value::String(required_str(row, "bte_tool_call_id", block_id, block_type)?),
+            );
+            fields.insert(
+                "error".into(),
+                Value::String(required_str(row, "bte_error", block_id, block_type)?),
+            );
+        }
+        _ => return Ok(None),
+    }
+
+    Ok(Some((role, fields)))
+}
+
+/// The kinds whose role is not a column, and the fallback for a kind this
+/// query does not know — which is every kind a consumer might add, until Stage
+/// 3's descriptors let it contribute its own table.
+fn structural_payload(
+    row: &rusqlite::Row<'_>,
+    block_id: i64,
+    block_type: &str,
+) -> Result<Payload, StoreError> {
+    let mut fields = serde_json::Map::new();
+    let mut role: Option<Role> = None;
+
+    match block_type {
+        // Roleless in the row — its grouping under the harness's voice is the
+        // KIND's projection fact, not a stored column.
+        "date_marker" => {
+            fields.insert(
+                "date".into(),
+                Value::String(required_str(row, "bdm_date", block_id, block_type)?),
+            );
+        }
+        // The approval blocks are the human's — role user by nature, not by
+        // column. Mechanically load-bearing: the fork's group walk reads this
+        // RAW role, so role User is what keeps approval blocks inside the
+        // surrounding user turn's group boundary.
+        "approval_request" => {
+            role = Some(Role::User);
+            let for_block_id: i64 = required(row, "bar_for_block_id", block_id, block_type)?;
+            fields.insert("for_block_id".into(), Value::Number(for_block_id.into()));
+        }
+        "approval_decision" => {
+            role = Some(Role::User);
+            let for_block_id: i64 = required(row, "bad_for_block_id", block_id, block_type)?;
+            fields.insert("for_block_id".into(), Value::Number(for_block_id.into()));
+            fields.insert(
+                "decision".into(),
+                Value::String(required_str(row, "bad_decision", block_id, block_type)?),
+            );
+            let system_reason: Option<String> = col_opt(row, "bad_system_reason")?;
+            fields.insert(
+                "system_reason".into(),
+                system_reason.map_or(Value::Null, Value::String),
+            );
+            let user_reason: Option<String> = col_opt(row, "bad_user_reason")?;
+            fields.insert(
+                "user_reason".into(),
+                user_reason.map_or(Value::Null, Value::String),
+            );
+        }
+        // A kind this statement has no join for at all — every kind a consumer
+        // might add, until Stage 3's descriptors let it contribute its table.
+        // Empty content here is not an invented payload: there is no content
+        // row to have missed, because nothing selected one.
+        _ => {
+            fields.insert("content".into(), Value::String(String::new()));
+        }
+    }
+
+    Ok((role, fields))
+}
+
+/// Reconstruct each thinking block's stored [`OpaquePayload`] from the raw
+/// `opaque_*` columns — plus the `block_reasoning_detail` sidecar for the
+/// multi-entry variant — replacing them with a single `opaque` field the
+/// provider layer deserializes on the next turn.
+fn resolve_reasoning_payloads(conn: &Connection, mut blocks: Vec<Block>) -> Vec<Block> {
+    for block in &mut blocks {
+        let Some(Value::String(kind)) = block.fields.remove("opaque_kind") else {
+            continue;
+        };
+        let data = match block.fields.remove("opaque_data") {
+            Some(Value::String(s)) => Some(s),
+            _ => None,
+        };
+        let item_id = match block.fields.remove("opaque_item_id") {
+            Some(Value::String(s)) => Some(s),
+            _ => None,
+        };
+
+        let payload = match kind.as_str() {
+            "openai_responses" => {
+                if let (Some(item_id), Some(encrypted_content)) = (item_id, data) {
+                    Some(OpaquePayload::OpenAiResponses {
+                        item_id,
+                        encrypted_content,
+                    })
+                } else {
+                    tracing::warn!(
+                        block_id = block.id,
+                        "openai_responses payload missing item id or data"
+                    );
+                    None
+                }
+            }
+            "anthropic" => data.map(|signature| OpaquePayload::Anthropic { signature }),
+            "openrouter" => Some(OpaquePayload::OpenRouter {
+                entries: load_reasoning_details(conn, block.id),
+            }),
+            "mistral" => Some(OpaquePayload::Mistral),
+            other => {
+                tracing::warn!(
+                    block_id = block.id,
+                    kind = other,
+                    "unknown opaque_kind — payload dropped"
+                );
+                None
+            }
+        };
+
+        if let Some(payload) = payload
+            && let Ok(value) = serde_json::to_value(&payload)
+        {
+            block.fields.insert("opaque".into(), value);
+        }
+    }
+    blocks
+}
+
+/// Fetch a block's sidecar rows in position order — the verbatim rebuild order
+/// for the replayed entry array.
+fn load_reasoning_details(conn: &Connection, block_id: i64) -> Vec<ReasoningDetailEntry> {
+    conn.prepare(
+        "SELECT position, entry_type, entry_id, upstream_format, idx, content, signature
+         FROM block_reasoning_detail WHERE block_id = ?1 ORDER BY position",
+    )
+    .and_then(|mut stmt| {
+        let rows: Vec<ReasoningDetailEntry> = stmt
+            .query_map([block_id], |row| {
+                Ok(ReasoningDetailEntry {
+                    position: u32::try_from(row.get::<_, i64>(0)?).unwrap_or(0),
+                    entry_type: row.get(1)?,
+                    entry_id: row.get(2)?,
+                    upstream_format: row.get(3)?,
+                    index: row
+                        .get::<_, Option<i64>>(4)?
+                        .and_then(|i| u32::try_from(i).ok()),
+                    content: row.get(5)?,
+                    signature: row.get(6)?,
+                })
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    })
+    .unwrap_or_default()
+}
+
+fn resolve_quotes(
+    conn: &Connection,
+    conversation_id: Option<i64>,
+    mut blocks: Vec<Block>,
+) -> Vec<Block> {
+    for block in &mut blocks {
+        if block.block_type == "quote" {
+            let quoting_conversation = conversation_id.or_else(|| conversation_of(conn, block.id));
+            let field = |name: &str| block.fields.get(name).and_then(Value::as_i64).unwrap_or(0);
+            let text = resolve_quote_text(
+                conn,
+                quoting_conversation,
+                field("start_block_id"),
+                field("start_pos"),
+                field("end_block_id"),
+                field("end_pos"),
+            );
+            block.fields.insert("text".into(), Value::String(text));
+        }
+    }
+    blocks
+}
+
+/// One conversation a block hangs in, for callers that were handed a block id
+/// and no conversation. A junction-shared block answers with one of them.
+fn conversation_of(conn: &Connection, block_id: i64) -> Option<i64> {
+    conn.query_row(
+        "SELECT conversation_id FROM conversation_blocks WHERE block_id = ?1 LIMIT 1",
+        [block_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// Resolve quote text from a block range.
+///
+/// Collects text content from every text block the range covers, then applies
+/// the character offsets on the first and last.
+///
+/// **The range covers only what the quoting conversation can see** — its own
+/// blocks and the detached ones a fork cloned for it. Block ids are global and
+/// every conversation writes into the same sequence, so a bare id range picks
+/// up whatever any other conversation happened to append between the endpoints
+/// — another conversation's text, spliced into a quote nobody wrote that way.
+/// [`quoted_text_blocks`] holds that membership rule for both quote sites.
+pub(super) fn resolve_quote_text(
+    conn: &Connection,
+    conversation_id: Option<i64>,
+    start_block_id: i64,
+    start_pos: i64,
+    end_block_id: i64,
+    end_pos: i64,
+) -> String {
+    if start_block_id == end_block_id {
+        // Single-block quote — just a substring. No range, so nothing to walk.
+        let full: String = conn
+            .query_row(
+                "SELECT COALESCE(bt.content, '') FROM block_text bt WHERE bt.block_id = ?1",
+                [start_block_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        let s = usize::try_from(start_pos.max(0)).unwrap_or(0);
+        let e = usize::try_from(end_pos.max(0)).unwrap_or(0).min(full.len());
+        return if s < e {
+            full.chars().skip(s).take(e - s).collect()
+        } else {
+            String::new()
+        };
+    }
+
+    let parts = quoted_text_blocks(conn, conversation_id, start_block_id, end_block_id);
+
+    let mut result = String::new();
+    for (id, text) in &parts {
+        if *id == start_block_id {
+            let s = usize::try_from(start_pos.max(0)).unwrap_or(0);
+            result.push_str(&text.chars().skip(s).collect::<String>());
+        } else if *id == end_block_id {
+            let e = usize::try_from(end_pos.max(0)).unwrap_or(0).min(text.len());
+            result.push_str(&text.chars().take(e).collect::<String>());
+        } else {
+            result.push_str(text);
+        }
+    }
+    result
+}
+
+/// Every text-carrying block a quote range covers, in ledger order, with its
+/// content.
+///
+/// This is the one place that decides what "between these two blocks" means,
+/// and both quote sites — the resolved text and the fork's target collection —
+/// go through it, so the two can never answer differently.
+///
+/// **A block is in the range when it lies between the endpoints AND belongs to
+/// the quoting conversation** — where belonging has two shapes, because a quote
+/// has two:
+///
+///   - It hangs in the quoting conversation's junction. That is ordinary
+///     history, and another conversation's blocks are excluded by it: an
+///     interloper appending between the endpoints hangs in ITS junction, not
+///     this one's, so it cannot be spliced into a quote nobody wrote that way.
+///   - It hangs in no junction at all. The deep copy a new thread makes clones
+///     quote targets as detached rows on purpose, so that deleting the source
+///     cannot cascade them away; a detached block belongs to whoever quotes it
+///     and to nobody else.
+///
+/// Both at once is the normal case after a fork, not an exotic one: the copy
+/// junctions the group's own blocks and detaches the targets outside it, so one
+/// range routinely covers some of each. Admitting only one kind returns half
+/// the quoted text.
+///
+/// The order is the block id, which is the ledger order — every junction append
+/// points at a just-created block and copies preserve order, so ids ascend
+/// along junction order in every conversation.
+///
+/// One residual is accepted here, and it is that **a detached block carries no
+/// owner today**: two deep copies running concurrently could interleave the
+/// detached ids they write, and a range would then reach across into the other
+/// copy's clone. (A block whose conversation was deleted is detached the same
+/// way until collection sweeps it, so it is the same gap, not a second one.)
+/// Stage 3's content-table descriptors are where an owner column would land;
+/// until then the fork's single transaction is what keeps its clones
+/// consecutive.
+pub(super) fn quoted_text_blocks(
+    conn: &Connection,
+    conversation_id: Option<i64>,
+    start_block_id: i64,
+    end_block_id: i64,
+) -> Vec<(i64, String)> {
+    // Conversation ids start at 1, so a caller holding no conversation passes 0
+    // and the junction half of the rule matches nothing — leaving the detached
+    // half standing alone, which is the whole answer available to it.
+    let quoting = conversation_id.unwrap_or(0);
+    let sql = "SELECT b.id, COALESCE(bt.content, '')
+             FROM blocks b
+             JOIN block_text bt ON bt.block_id = b.id
+             WHERE b.id >= ?2 AND b.id <= ?3
+               AND (
+                   EXISTS (
+                       SELECT 1 FROM conversation_blocks cb
+                       WHERE cb.block_id = b.id AND cb.conversation_id = ?1
+                   )
+                   OR NOT EXISTS (
+                       SELECT 1 FROM conversation_blocks cb WHERE cb.block_id = b.id
+                   )
+               )
+             ORDER BY b.id";
+    let params = [quoting, start_block_id, end_block_id];
+
+    conn.prepare(sql)
+        .and_then(|mut stmt| {
+            let rows: Vec<(i64, String)> = stmt
+                .query_map(params, |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(Result::ok)
+                .collect();
+            Ok(rows)
+        })
+        .unwrap_or_default()
+}
