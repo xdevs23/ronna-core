@@ -51,6 +51,46 @@ impl Store {
         .await
     }
 
+    /// The metadata ledger's last row by insertion order, as a block — the
+    /// metadata frontier's one read, mirroring the conversation ledger's
+    /// latest-block query.
+    ///
+    /// # Errors
+    ///
+    /// If the query fails or the store's actor has stopped.
+    pub async fn latest_metadata_block(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Option<Block>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, meta_type, source_block_id, content, created_at
+                 FROM metadata WHERE conversation_id = ?1 ORDER BY id DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map([conversation_id], |row| {
+                let mut fields = serde_json::Map::new();
+                if let Some(source) = row.get::<_, Option<i64>>(2)? {
+                    fields.insert("source_block_id".into(), source.into());
+                }
+                if let Some(content) = row.get::<_, Option<String>>(3)? {
+                    fields.insert("content".into(), content.into());
+                }
+                Ok(Block {
+                    id: row.get(0)?,
+                    role: None,
+                    block_type: row.get(1)?,
+                    created_at: row.get(4)?,
+                    fields,
+                })
+            })?;
+            match rows.next() {
+                Some(row) => Ok(Some(row?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
     /// How far the ratchet has CONFIRMED driving this conversation's METADATA
     /// ledger — the metadata side's own cursor. One machinery, two ledgers, two
     /// cursors that never interact. 0 means nothing confirmed: the drive

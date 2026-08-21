@@ -304,6 +304,20 @@ pub enum AttachOutcome {
     Closed,
 }
 
+/// What the runtime requires of the event type a bus carries: it can be built
+/// from a [`CoreEvent`], and it can travel the two planes.
+///
+/// It is a name for a bound, not a second kind of event. Every layer of the
+/// runtime that publishes takes `E: RuntimeEvent` and calls
+/// [`EventBus::emit`]; writing the four bounds out at each of those sites is
+/// the same statement made repeatedly, and a statement made repeatedly is one
+/// that drifts. The blanket implementation means a consumer implements
+/// nothing: composing `From<CoreEvent>` on its own enum is the whole
+/// obligation.
+pub trait RuntimeEvent: From<CoreEvent> + Clone + Send + 'static {}
+
+impl<E: From<CoreEvent> + Clone + Send + 'static> RuntimeEvent for E {}
+
 /// The event bus — one ordered push hub for every attached transport, plus an
 /// in-process broadcast for reactor loops.
 ///

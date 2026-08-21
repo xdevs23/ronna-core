@@ -136,21 +136,10 @@ impl Store {
 mod tests {
     use serde_json::Value;
 
+    use crate::agency::denial_error_text;
     use crate::block::Role;
     use crate::store::{Store, ToolCallInsert};
     use crate::types::ApprovalChoice;
-
-    /// The text a denial hands the model. The behavior layer composes the real
-    /// one from the decision's two reason fields; that layer arrives in a later
-    /// slice, so these tests state the shape they need directly.
-    fn denial_error_text(system_reason: Option<&str>, user_reason: Option<&str>) -> String {
-        match (system_reason, user_reason) {
-            (Some(reason), _) | (None, Some(reason)) => {
-                format!("the call was denied: {reason}")
-            }
-            (None, None) => "the call was denied".to_string(),
-        }
-    }
 
     async fn fixture() -> (Store, i64, i64) {
         let store = Store::in_memory().unwrap();

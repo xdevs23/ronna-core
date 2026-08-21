@@ -52,6 +52,28 @@ const BLOCKS_QUERY: &str = "SELECT
      LEFT JOIN block_approval_decision bad ON bad.block_id = b.id AND b.block_type = 'approval_decision'
      LEFT JOIN block_date_marker bdm ON bdm.block_id = b.id AND b.block_type = 'date_marker'";
 
+/// The conversation's last block by junction order, or None when empty.
+///
+/// The ratchet asks this after every drive to decide the frontier, so it must
+/// not cost a full ledger read: same join and ordering as the full list, taken
+/// from the other end, one row.
+pub(super) fn latest_block_for_conversation(
+    conn: &Connection,
+    conversation_id: i64,
+) -> Result<Option<Block>, StoreError> {
+    let mut stmt = conn.prepare(&format!(
+        "{BLOCKS_QUERY}
+         JOIN conversation_blocks cb ON cb.block_id = b.id
+         WHERE cb.conversation_id = ?1
+         ORDER BY cb.id DESC LIMIT 1"
+    ))?;
+    let mut rows = stmt.query_map([conversation_id], |row| Ok(row_to_block(row)))?;
+    match rows.next() {
+        Some(row) => Ok(Some(row??)),
+        None => Ok(None),
+    }
+}
+
 pub(super) fn load_blocks_for_conversation(
     conn: &Connection,
     conversation_id: i64,

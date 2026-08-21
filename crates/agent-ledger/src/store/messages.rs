@@ -8,7 +8,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::block::{Block, OpaquePayload, Role};
 use crate::types::InputBlock;
 
-use super::blocks::{load_blocks_for_conversation, load_single_block};
+use super::blocks::{
+    latest_block_for_conversation, load_blocks_for_conversation, load_single_block,
+};
 use super::{Store, StoreError, now_iso8601, transact};
 
 /// The facts a tool call carries into the ledger, grouped because they travel
@@ -103,6 +105,17 @@ impl Store {
     /// If the query fails or the store's actor has stopped.
     pub async fn list_blocks(&self, conversation_id: i64) -> Result<Vec<Block>, StoreError> {
         self.run(move |conn| load_blocks_for_conversation(conn, conversation_id))
+            .await
+    }
+
+    /// The conversation's last block by junction order — the frontier's one
+    /// read. One row instead of the whole ledger.
+    ///
+    /// # Errors
+    ///
+    /// If the query fails or the store's actor has stopped.
+    pub async fn latest_block(&self, conversation_id: i64) -> Result<Option<Block>, StoreError> {
+        self.run(move |conn| latest_block_for_conversation(conn, conversation_id))
             .await
     }
 

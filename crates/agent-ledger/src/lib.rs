@@ -12,6 +12,11 @@
 //! ledger, the conversations that index it, the cursor that walks it, and the
 //! change hook that wakes the scheduler when any of it moves.
 //!
+//! On top of both sits [`agency`], the layer that makes a block an actor: one
+//! trait every kind implements, one module per kind, and the ratchet that
+//! drives those hooks forward from the persisted cursor without ever learning
+//! which kind it just ran.
+//!
 //! ```
 //! use agent_ledger::{bus::EventBus, event::CoreEvent};
 //!
@@ -22,6 +27,7 @@
 //! assert_eq!(seq, 1);
 //! ```
 
+pub mod agency;
 pub mod block;
 pub mod bus;
 pub mod event;
@@ -29,10 +35,13 @@ pub mod reactivity;
 pub mod store;
 pub mod types;
 
+pub use agency::{
+    Agency, AgencyCtx, BlockKind, ContentPart, GateDecision, Projection, denial_error_text,
+};
 pub use block::{
     Block, OpaquePayload, RESERVED_FIELD_NAMES, ReasoningDetailEntry, Role, ToolCallResult,
 };
-pub use bus::{AttachOutcome, EventBus, PushEnvelope, PushSink};
+pub use bus::{AttachOutcome, EventBus, PushEnvelope, PushSink, RuntimeEvent};
 pub use event::CoreEvent;
 pub use store::{Store, StoreError};
 pub use types::{ApprovalChoice, Awaiting, InputBlock, StopReason, StreamUsage};
