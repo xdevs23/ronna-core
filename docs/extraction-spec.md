@@ -56,10 +56,13 @@ A consumer composes:
 
 ```rust
 enum AssistantKind {
-    Core(agent_ledger::CoreKind),
+    Core(agent_ledger::BlockKind),
     ChatMessage(ChatMessage),
 }
 ```
+
+*(Amended 2026-08-21: the sketch originally wrote `CoreKind`; the tree's name is
+`BlockKind` and it stays — renaming every reference bought nothing.)*
 
 and derives the trait. The derive generates exactly the delegation the source maintains by
 hand today.
@@ -270,7 +273,9 @@ Stage 2 unless stated.
 - **AC9** `cargo doc --all-features` produces no warnings, and every public item has a doc
   comment.
 - **AC10** The library constructor takes a database path and nothing else. It selects no
-  provider, no model and no directory.
+  provider, no model and no directory. *(Amended 2026-08-21, Stage 3: `open`/`in_memory`
+  keep exactly this contract as the core-only form; the configured form `open_with` takes
+  the path plus a `StoreConfig` of descriptors and consumer migrations, validated at open.)*
 - **AC11** The manifest declares GPL-3.0-or-later, the license file is present, and no moved
   file carries a conflicting header.
 - **AC12** *(Stage 2)* No moved test is dropped. Each slice's commit states the test count it

@@ -1,82 +1,158 @@
 # Stage 3 — the extension seams
 
-Date: 2026-08-21. The extraction spec's Stage 3, now due: Stage 2 closed with commit
-`a5431c5`. Status: draft, awaiting cold review.
+Date: 2026-08-21. Revision 2, rewritten after an unbriefed cold review prototyped revision 1
+against the tree and returned two blockers and thirteen gaps. Status: settled for
+implementation.
 
-## What this stage is for
+## Disposition 2026-08-21: what the review proved, and what changed
 
-The library's reason to exist is that a consumer can add a block kind. Today it cannot: the
-typed kind layer is a closed enum, the store's block query and change-hook list name the
-library's content tables literally, and every ledger write is async on the store actor. This
-stage opens those seams — with **one mechanism used identically by the library and every
-consumer**, per the settled extension design in the extraction spec.
+1. **Revision 1's generic plan does not compile on stable.** Both seats prototyped it: the
+   drive is awaited inside spawned tasks, an AFIT future's Send-ness is unnameable from a
+   bound on `K`, and return-type notation is both unstable and excluded for hooks generic
+   over `E`. The satisfiable form — prototyped compiling by both seats — is hooks declared
+   `fn …<E: RuntimeEvent>(…) -> impl Future<Output = …> + Send`, with implementors keeping
+   native `async fn`. That is a signature change on `Agency`'s hooks, `LedgerSource`'s four,
+   and a new Send obligation on every implementor, stated below as the work it is.
+2. **The provider layer was omitted, and its failure mode is the silent one.** Raw blocks
+   cross the dyn provider boundary and every vendor runs the fold itself, so a consumer kind
+   reaching a stock vendor parses to the inert fallback and vanishes from the model request
+   with no error. Ruled below: blocks stop crossing the provider boundary at all.
+3. **The descriptor was a name without a shape.** The store's per-kind decode, the write
+   path, forking, garbage-collection references, ephemeral teardown, the actor's second
+   table allowlist, and the descriptor/migration lifecycle all needed contracts. Shaped
+   below.
+4. Thirteen further gaps (AC phrasing, naming, scan coverage, the vocabulary tripwire, the
+   AC10 collision) are each resolved inline.
 
-The proof the whole stage answers to is **AC13**: a test registers a kind defined outside the
-library's own enum and proves it parses, loads, wakes a tick and takes a turn.
+## The design, ruled
 
-## The design, restated from the extraction spec
+### R1 — hook signatures
 
-- **The runtime becomes generic over the behavior trait.** `BlockKind` already implements
-  `Agency` by delegating through a generated dispatch; the ratchet, the walk, the frontier,
-  the projection fold, the runner and the actor take `K: Agency + …` instead of naming
-  `BlockKind`. The library's enum stops being privileged: it is one implementor.
-- **A consumer composes**: an enum with a `Core(BlockKind)` variant plus its own kinds, and a
-  **derive** generates the delegation the library maintains by hand today.
-- **Parsing is an associated function** on the implementor: a composing enum tries its own
-  kinds and delegates the rest inward, so only a genuinely unknown type reaches the inert
-  fallback.
-- **Content-table descriptors** are an associated constant contributed by the same type: the
-  store builds its block query's joins and the change-hook allowlist from the descriptor
-  list, so a consumer's table is loaded and wakes ticks by declaration, not by editing the
-  library.
-- **Rejected, still**: a trait-object registry. Two classes of kind is the shape this
-  architecture exists to avoid, and object safety would cost native `async fn`.
+`Agency` and `LedgerSource` hooks become `fn name<E: RuntimeEvent>(…) -> impl Future<Output
+= …> + Send` with default bodies where they exist today. Implementors keep writing native
+`async fn` in impl blocks. Every implementor's futures must be Send — inherent to a
+multi-threaded runtime, now stated in the trait docs as the consumer's obligation.
 
-## Slices of this stage
+### R2 — blocks never cross the provider boundary
 
-This is one unit of design with three mechanical waves; each wave compiles and passes the
-whole suite before the next.
+`ProviderRequest::Stream` carries the **neutral messages**, not raw blocks. The projection
+fold runs on the caller's side — the actor, generic over `K` — and the vendors consume what
+the fold produced. This matches the recorded architecture ("one projection, per-provider
+encoders after it"), removes the concrete-kind parse from all five vendors, keeps
+`Box<dyn ProviderModule>` object-safe with no `K` anywhere in the provider layer, and makes
+a consumer kind's visibility to the model a property of its own `Projection` impl. The kimi
+request builder consumes neutral messages like every other vendor; its reasoning-fold
+difference lives in its encoder, where vendor difference belongs.
 
-1. **Genericize the machinery.** Thread `K` through `AgencyCtx`, the ratchet, redispatch,
-   projection, the runner, ingestion, the actor and the metadata worker. `BlockKind` is the
-   default everywhere existing tests touch, so the suite is byte-for-byte the same behavior.
-2. **The descriptor seam.** A `ContentDescriptor` list on the trait; the store takes the
-   list at open, builds the query and the hook allowlist from it. The library's own
-   descriptors produce the identical SQL the hardcoded strings produce today, proven by a
-   test comparing the built statement against the previous literal.
-3. **The derive and AC13.** `#[derive(Agency)]` (a new proc-macro crate in the workspace,
-   `agent-ledger-derive`) generating the delegation, the parse chain and the descriptor
-   concatenation for a composing enum. Then the AC13 test: a `ChatMessage` kind defined in
-   the test — its own content table, its own awaiting, driven end to end through the
-   composed runtime over a scripted provider.
+### R3 — the descriptor, shaped
 
-## What does not change
+```rust
+pub struct ContentDescriptor {
+    /// The content table this descriptor owns.
+    pub table: &'static str,
+    /// The stored type strings whose content rows live in that table.
+    pub kinds: &'static [&'static str],
+    /// The content columns, read by name into the block's fields.
+    pub columns: &'static [&'static str],
+    /// Columns in OTHER tables that reference blocks(id) through this kind —
+    /// the garbage collector's reference predicate extends over these.
+    pub reference_columns: &'static [ColumnRef],
+    /// Ephemeral kinds: deleted by the finalization that replaces them, never
+    /// a cursor anchor. Joins the streaming teardown sweep.
+    pub ephemeral: bool,
+}
+```
 
-- No behavior change for the library's own kinds: the full 392-test suite must pass
-  unchanged at every wave.
-- The sync-append seam from the extraction spec's earlier revision is NOT built: the
-  closure API question dissolved when the consumer stopped being an in-process co-tenant of
-  the store (the assistant owns its whole database through this library). Recorded here so
-  it is a decision, not an omission.
-- No runtime improvements from the deferred batch ride along.
+**The core kinds stay on their literal path, untouched.** The store's existing query,
+decode, cloner, gc predicate and teardown remain byte-identical for the library's own
+kinds. Consumer kinds load through a second step: header and junction rows from the
+existing query, then per-descriptor batch reads decoding declared columns by name into
+`fields`. One internal asymmetry, recorded as a dated decision: fidelity for the ported
+path, a declared seam for the new one, with migrating the core kinds onto descriptors left
+open for a later stage. Forking deep-copies a consumer row generically from its declared
+columns; gc's reference predicate is the literal union plus declared references; the
+ephemeral sweep is the literal union plus declared ephemerals.
+
+### R4 — the write path
+
+`Store::append_consumer_block(conversation_id, role, kind, fields)` — one public,
+conditional, transactional three-row write driven by the descriptor (header, junction,
+content row from declared columns). Core kinds keep their typed inserts. This is the seam
+AC13 writes through.
+
+### R5 — lifecycle: descriptors and migrations arrive together
+
+`Store::open_with(path, StoreConfig { descriptors, domain_migrations })` runs the library's
+migrations and the consumer's before any query is served, then **validates every
+descriptor** — each named table exists, each declared column exists, no table or kind
+collides with another descriptor or the core set — and fails open loudly otherwise. That
+validation is the conformance kit's check three, mechanical at open. `Store::open(path)`
+and `in_memory()` keep their arity as the core-only form; the extraction spec's AC10 gains
+a dated amendment naming `open_with` as the configured form.
+
+### R6 — one table list, one owner
+
+The store exposes its effective content-table list (core plus descriptors); the change-hook
+allowlist and the actor's block-watcher list both read it. The actor's hardcoded copy goes.
+
+### R7 — the parse contract
+
+Each leaf kind carries its stored type strings as an associated const; a composing enum's
+parse tries its own kinds and delegates inward. `BlockKind::from_block` stays the core
+enum's one literal site, now reading the consts. The "one place a stored string is
+compared" doc becomes "one place per implementor".
+
+### R8 — the derive
+
+`#[derive(Agency)]` on a composing enum generates: the `Agency` delegation, the
+`Projection` delegation, the parse chain, and the descriptor concatenation (a const
+concatenation — prototyped feasible by the review). One derive, both traits, documented.
+Error behavior is pinned by `compile_fail` doctests on the error code — no compile-fail
+harness dependency. The derive crate is `crates/agent-ledger-derive`; syn, quote and
+proc-macro2 pass the dependency rule before the manifest names them; the vocabulary and
+client-constructor scans are re-rooted to walk every workspace crate, so the new crate
+cannot escape them.
+
+### R9 — names and the tripwire
+
+`BlockKind` keeps its name; the extraction spec's `CoreKind` sketch gains a dated note.
+AC13's kind is `ChatMessage` with content table `block_chat_message` — singular, because
+the vocabulary list bans the plural.
+
+## Waves
+
+1. **Signatures and genericizing.** R1, then thread `K` through `AgencyCtx`, ratchet,
+   redispatch, projection, runner, ingestion, actor, metadata — and R2's provider-boundary
+   move, which is what keeps the provider layer out of the generic surface. Test edits are
+   expected and named (type annotations at construction sites; no generic-parameter
+   defaults exist on functions in stable Rust): behavior identical, the full suite green.
+2. **The store seam.** R3 through R6. The library's own kinds' SQL is untouched by
+   construction; a test descriptor's table loads, wakes the change log, forks, collects
+   and tears down.
+3. **The derive and AC13.** R7, R8, then the proof in `crates/agent-ledger/tests/` — an
+   integration test, outside the crate's `src`, seeing only the public API: a `ChatMessage`
+   kind with its own table, composed through the derive, parsing from its stored row,
+   loading through the descriptor path, waking a tick, owing a turn, and answered by a
+   scripted provider end to end.
 
 ## Acceptance criteria
 
-- **AC7-1** Wave 1 ends with the full suite passing unchanged (392 all-features / 289
-  default at current counts), clippy/fmt/doc clean, no test edited except type-parameter
-  plumbing.
-- **AC7-2** Wave 2's store accepts a descriptor list; the library's own list generates SQL
-  identical to the previous literals, proven by test; a table added by a test descriptor is
-  loaded and wakes the change log.
-- **AC7-3** The derive compiles a composing enum with zero hand-written dispatch, and a
-  compile-fail test pins the error for a non-exhaustive composition.
-- **AC7-4 (= extraction AC13)** A test defines a `ChatMessage` kind OUTSIDE the library —
-  own content table via descriptor, `awaiting` of Model for user-authored rows — registers
-  it through the composing enum, and proves end to end: it parses from its stored row, loads
-  through the store's descriptor-built query, its insert wakes a tick, the frontier owes a
-  turn, and a scripted provider answers it.
-- **AC7-5** The dependency rule covers the new proc-macro crate's dependencies (syn, quote,
-  proc-macro2) before any manifest names them.
-- **AC7-6** The suite stays parallel-safe and network-free; vocabulary scan clean.
-- **AC7-7** The extraction spec's Stage 3 sketch names `agent_ledger::CoreKind`; decide the
-  name (`BlockKind` stays or renames) once, in this stage, and record it.
+- **AC7-1** Wave 1 ends green at current counts (392 all-features / 289 default) with
+  behavior unchanged; edits to tests are type-annotation plumbing, enumerated in the
+  report. Clippy (all-features and mistral-only), fmt, doc clean.
+- **AC7-2** Wave 2: the core kinds' statements are byte-identical to before (asserted by
+  test against the literals); a test descriptor's table is created by its domain migration,
+  validated at open, loaded, woken on, forked, collected and torn down — each pinned.
+  `open_with` on a descriptor naming a missing table or colliding column fails loudly, also
+  pinned.
+- **AC7-3** The derive compiles a composing enum with zero hand-written dispatch, and
+  `compile_fail` doctests pin the error codes for its rejection cases.
+- **AC7-4 (= extraction AC13)** The integration test proves the out-of-crate kind end to
+  end: parse, load, wake, owed turn, answered turn — through the public API only.
+- **AC7-5** The derive crate's dependencies are recorded per the standing rule before any
+  manifest names them.
+- **AC7-6** Both source scans walk every workspace crate; vocabulary clean; suite
+  parallel-safe and network-free.
+- **AC7-7** No stock vendor parses blocks: a grep for the concrete kind parse under
+  `providers/` finds only the neutral-message fold's caller-side site, and the provider
+  request type carries no `Block`.
