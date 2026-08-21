@@ -328,13 +328,15 @@ impl Store {
         continuation: Continuation,
         model: ModelOverride,
     ) -> Result<i64, StoreError> {
+        let descriptors = self.descriptors;
+        let gate = self.gate.clone();
         self.run(move |conn| {
             let model_id = resolve_model_for_fork(conn, source_id, &model)?;
             let reasoning = resolve_reasoning_for_fork(conn, source_id, &model)?;
 
             let tx = conn.transaction()?;
 
-            let group = find_group_bounds(&tx, source_id, block_id)?;
+            let group = find_group_bounds(&tx, descriptors, &gate, source_id, block_id)?;
 
             let new_id = match &continuation {
                 Continuation::Rerun => {
@@ -382,7 +384,7 @@ impl Store {
                         new_id,
                         &super::date_markers::today_local(),
                     )?;
-                    deep_copy_group_into(&tx, source_id, new_id, &group)?;
+                    deep_copy_group_into(&tx, descriptors, source_id, new_id, &group)?;
                     new_id
                 }
             };
@@ -513,13 +515,16 @@ fn resolve_reasoning_for_fork(
 }
 
 /// Walk the source conversation to find the role-contiguous group containing
-/// `anchor_block_id`.
+/// `anchor_block_id`. The load runs the descriptor overlay, so a consumer
+/// block's role places it in its group exactly as a library block's does.
 fn find_group_bounds(
     conn: &rusqlite::Connection,
+    descriptors: &'static [super::descriptors::ContentDescriptor],
+    gate: &super::DomainGate,
     source_id: i64,
     anchor_block_id: i64,
 ) -> Result<GroupBounds, StoreError> {
-    let blocks = super::blocks::load_blocks_for_conversation(conn, source_id)?;
+    let blocks = super::blocks::load_blocks_for_conversation(conn, descriptors, gate, source_id)?;
     let idx = blocks
         .iter()
         .position(|b| b.id == anchor_block_id)
@@ -752,12 +757,13 @@ fn collect_quote_targets(
 /// thread's quotes stay resolvable even if the source is deleted.
 fn deep_copy_group_into(
     conn: &rusqlite::Connection,
+    descriptors: &'static [super::descriptors::ContentDescriptor],
     source_id: i64,
     dst_id: i64,
     group: &GroupBounds,
 ) -> Result<(), StoreError> {
     let detached_targets = collect_quote_targets(conn, source_id, &group.block_ids)?;
-    let mut cloner = BlockCloner::new(conn);
+    let mut cloner = BlockCloner::new(conn, descriptors);
 
     // Detached first — populates the remap so any quote in the group below
     // picks up the rewritten start and end ids when it is cloned. In ascending

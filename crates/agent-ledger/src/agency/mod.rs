@@ -222,6 +222,56 @@ pub trait FromBlock {
     fn from_block(block: &Block) -> Self;
 }
 
+/// The coherence check for one fact declared twice: a descriptor's
+/// `ephemeral` flag and its kinds' [`Agency::durable`] answer must be exact
+/// negations of each other, and this asserts they are — for every kind every
+/// descriptor in the set declares, by parsing a synthetic block of that kind
+/// through `K` and comparing both sides.
+///
+/// The two declarations are one fact about a row's lifetime: the store's side
+/// (`ephemeral`) puts the kind into the teardown sweep and the atomic
+/// finalization delete, and the kind's side (`durable`) keeps the ratchet's
+/// cursor off rows a finalization deletes. Their defaults disagree — a
+/// descriptor is durable unless declared ephemeral, and a kind that never
+/// overrides `durable()` (the inert fallback included) answers durable — so a
+/// consumer that declares only the store's side ships the cursor-anchor
+/// regression silently. Run this from the conformance tests over the full
+/// descriptor set and the composing kind; the wave-3 derive will generate
+/// both sides from one attribute and make the disagreement unrepresentable.
+///
+/// # Errors
+///
+/// The first kind whose two declarations disagree, named with both values.
+pub fn check_descriptor_durability<K: Agency + FromBlock>(
+    descriptors: &[crate::store::ContentDescriptor],
+) -> Result<(), String> {
+    for descriptor in descriptors {
+        for kind in descriptor.kinds {
+            let synthetic = Block {
+                id: 0,
+                role: None,
+                block_type: (*kind).to_owned(),
+                created_at: String::new(),
+                fields: serde_json::Map::new(),
+            };
+            let durable = K::from_block(&synthetic).durable();
+            if durable == descriptor.ephemeral {
+                return Err(format!(
+                    "kind '{kind}' declares one row-lifetime fact twice and the two \
+                     disagree: descriptor '{table}' says ephemeral = {ephemeral}, but the \
+                     kind's durable() answers {durable} (it must answer {expected}) — an \
+                     ephemeral row is deleted by the finalization that replaces it, so a \
+                     cursor anchored on one dangles",
+                    table = descriptor.table,
+                    ephemeral = descriptor.ephemeral,
+                    expected = !descriptor.ephemeral,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// What the machinery requires of the kind it is instantiated over: behavior,
 /// representation, parse, and futures that can cross a task boundary.
 ///

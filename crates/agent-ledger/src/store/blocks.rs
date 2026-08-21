@@ -6,24 +6,21 @@ use serde_json::Value;
 
 use crate::block::{Block, OpaquePayload, ReasoningDetailEntry, Role};
 
-use super::StoreError;
 use super::block_content::parse_role;
+use super::descriptors::{ContentDescriptor, overlay_consumer_content};
+use super::{DomainGate, StoreError};
 
-/// One hardcoded statement joining every content table by name.
+/// One statement joining every LIBRARY content table by name — the core kinds'
+/// load path, kept literal on purpose and pinned byte-identical by test.
 ///
-/// **This list is the reason a consumer cannot yet add a block kind.** A kind
-/// whose content lives in a table not named here loads with an empty payload,
-/// silently, because the join that would have fetched it does not exist. Stage
-/// 3 replaces the list with content-table descriptors contributed by the kind
-/// itself, so the statement is built from what is registered rather than from
-/// what was typed here. Until then, adding a kind means editing this constant,
-/// which a consumer cannot do.
-///
-/// Three joins that stood here named tables belonging to the application this
-/// was extracted from. They do not exist in this library and are gone; nothing
-/// replaced them, because replacing them is the Stage 3 mechanism and it is
-/// deliberately not attempted in this slice.
-const BLOCKS_QUERY: &str = "SELECT
+/// A kind this statement has no join for loads its header with an inert
+/// payload; the second load step
+/// ([`overlay_consumer_content`]) then fills in any kind a content-table
+/// descriptor claims, reading the declared columns by name from the
+/// descriptor's own table. A kind neither this statement nor a descriptor
+/// knows stays inert, which is the documented fallback for a newer ledger read
+/// by an older build.
+pub(super) const BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at,
             bt.role AS bt_role, bt.content AS bt_content,
             bq.role AS bq_role, bq.start_block_id, bq.start_pos, bq.end_block_id, bq.end_pos,
@@ -59,6 +56,8 @@ const BLOCKS_QUERY: &str = "SELECT
 /// from the other end, one row.
 pub(super) fn latest_block_for_conversation(
     conn: &Connection,
+    descriptors: &'static [ContentDescriptor],
+    gate: &DomainGate,
     conversation_id: i64,
 ) -> Result<Option<Block>, StoreError> {
     let mut stmt = conn.prepare(&format!(
@@ -69,13 +68,20 @@ pub(super) fn latest_block_for_conversation(
     ))?;
     let mut rows = stmt.query_map([conversation_id], |row| Ok(row_to_block(row)))?;
     match rows.next() {
-        Some(row) => Ok(Some(row??)),
+        Some(row) => {
+            let mut latest = [row??];
+            overlay_consumer_content(conn, descriptors, gate, &mut latest)?;
+            let [block] = latest;
+            Ok(Some(block))
+        }
         None => Ok(None),
     }
 }
 
 pub(super) fn load_blocks_for_conversation(
     conn: &Connection,
+    descriptors: &'static [ContentDescriptor],
+    gate: &DomainGate,
     conversation_id: i64,
 ) -> Result<Vec<Block>, StoreError> {
     // Ledger position IS the junction order: strictly monotonic within a
@@ -96,6 +102,7 @@ pub(super) fn load_blocks_for_conversation(
     for row in rows {
         blocks.push(row??);
     }
+    overlay_consumer_content(conn, descriptors, gate, &mut blocks)?;
     Ok(resolve_quotes(
         conn,
         Some(conversation_id),
@@ -105,6 +112,8 @@ pub(super) fn load_blocks_for_conversation(
 
 pub(super) fn load_single_block(
     conn: &Connection,
+    descriptors: &'static [ContentDescriptor],
+    gate: &DomainGate,
     block_id: i64,
 ) -> Result<Option<Block>, StoreError> {
     let mut stmt = conn.prepare(&format!("{BLOCKS_QUERY} WHERE b.id = ?1"))?;
@@ -114,10 +123,12 @@ pub(super) fn load_single_block(
     else {
         return Ok(None);
     };
+    let mut blocks = vec![block?];
+    overlay_consumer_content(conn, descriptors, gate, &mut blocks)?;
     // No conversation is named here, so a quote resolves along whichever
     // conversation carries the quoting block.
     Ok(
-        resolve_quotes(conn, None, resolve_reasoning_payloads(conn, vec![block?]))
+        resolve_quotes(conn, None, resolve_reasoning_payloads(conn, blocks))
             .into_iter()
             .next(),
     )
@@ -344,8 +355,9 @@ fn tool_payload(
 }
 
 /// The kinds whose role is not a column, and the fallback for a kind this
-/// query does not know — which is every kind a consumer might add, until Stage
-/// 3's descriptors let it contribute its own table.
+/// query does not know. A consumer kind lands in the fallback here and is
+/// filled in by the descriptor overlay afterwards; a kind with no descriptor
+/// either stays inert.
 fn structural_payload(
     row: &rusqlite::Row<'_>,
     block_id: i64,
@@ -391,10 +403,11 @@ fn structural_payload(
                 user_reason.map_or(Value::Null, Value::String),
             );
         }
-        // A kind this statement has no join for at all — every kind a consumer
-        // might add, until Stage 3's descriptors let it contribute its table.
-        // Empty content here is not an invented payload: there is no content
-        // row to have missed, because nothing selected one.
+        // A kind this statement has no join for at all. A descriptor-claimed
+        // kind is filled in by the overlay step after this query; anything
+        // else stays inert. Empty content here is not an invented payload:
+        // there is no content row to have missed, because nothing selected
+        // one.
         _ => {
             fields.insert("content".into(), Value::String(String::new()));
         }

@@ -12,16 +12,19 @@ use rusqlite::{Connection, params};
 
 use super::StoreError;
 use super::block_content::BlockContent;
+use super::descriptors::{ContentDescriptor, clone_consumer_content, descriptor_for_kind};
 
 pub(super) struct BlockCloner<'c> {
     conn: &'c Connection,
+    descriptors: &'static [ContentDescriptor],
     remap: HashMap<i64, i64>,
 }
 
 impl<'c> BlockCloner<'c> {
-    pub(super) fn new(conn: &'c Connection) -> Self {
+    pub(super) fn new(conn: &'c Connection, descriptors: &'static [ContentDescriptor]) -> Self {
         Self {
             conn,
+            descriptors,
             remap: HashMap::new(),
         }
     }
@@ -58,8 +61,21 @@ impl<'c> BlockCloner<'c> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
 
-        let mut content = BlockContent::read(self.conn, src_block_id, &block_type)?;
-        content.remap(&self.remap);
+        // A descriptor-claimed kind is copied generically from its declared
+        // columns; the library's own kinds keep the typed content path,
+        // untouched. A consumer row's declared reference columns are resolved
+        // through the same remap the core kinds use: rewritten to the clone's
+        // id where the referenced block was cloned, kept by reference where it
+        // was not — and the kept reference holds its source block alive
+        // through the collector's reference predicate.
+        let descriptor = descriptor_for_kind(self.descriptors, &block_type);
+        let core_content = if descriptor.is_some() {
+            None
+        } else {
+            let mut content = BlockContent::read(self.conn, src_block_id, &block_type)?;
+            content.remap(&self.remap);
+            Some(content)
+        };
 
         self.conn.execute(
             "INSERT INTO blocks (block_type, created_at) VALUES (?1, ?2)",
@@ -67,7 +83,19 @@ impl<'c> BlockCloner<'c> {
         )?;
         let new_block_id = self.conn.last_insert_rowid();
 
-        content.write(self.conn, new_block_id)?;
+        if let Some(descriptor) = descriptor {
+            clone_consumer_content(
+                self.conn,
+                self.descriptors,
+                descriptor,
+                src_block_id,
+                new_block_id,
+                &block_type,
+                &self.remap,
+            )?;
+        } else if let Some(content) = core_content {
+            content.write(self.conn, new_block_id)?;
+        }
         self.remap.insert(src_block_id, new_block_id);
 
         if let Some(conversation_id) = link_to {

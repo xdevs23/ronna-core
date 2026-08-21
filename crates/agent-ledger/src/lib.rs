@@ -90,6 +90,9 @@ pub use providers::{
     LlmError, ProviderModule, ProviderRegistry, ProviderRequest, ProviderResponse, StreamEvent,
     blocks_to_messages,
 };
-pub use store::{Store, StoreError};
+pub use store::{
+    Column, ColumnRef, ColumnType, ContentDescriptor, DomainMigrations, Store, StoreConfig,
+    StoreError,
+};
 pub use tools::{ToolContext, ToolHandler, ToolOutcome, ToolRegistry, ToolRunner, submit_approval};
 pub use types::{ApprovalChoice, Awaiting, InputBlock, StopReason, StreamUsage, denial_error_text};

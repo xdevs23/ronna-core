@@ -11,6 +11,7 @@ use crate::types::InputBlock;
 use super::blocks::{
     latest_block_for_conversation, load_blocks_for_conversation, load_single_block,
 };
+use super::descriptors::ContentDescriptor;
 use super::{Store, StoreError, now_iso8601, transact};
 
 /// The facts a tool call carries into the ledger, grouped because they travel
@@ -53,16 +54,45 @@ fn opaque_columns(
     }
 }
 
-/// The ephemeral streaming block types — the ONLY rows a finalization may
-/// delete. Block storage is append-only once promoted; streaming blocks are the
-/// documented exception: they are replaced by their final blocks.
-const STREAMING_TYPES_SQL: &str = "('streaming', 'streaming_thinking', 'streaming_tool_call')";
+/// The library's ephemeral streaming block types — with any kinds a descriptor
+/// declares ephemeral, the ONLY rows a finalization may delete. Block storage
+/// is append-only once promoted; streaming blocks are the documented
+/// exception: they are replaced by their final blocks.
+pub(super) const STREAMING_TYPES: &[&str] =
+    &["streaming", "streaming_thinking", "streaming_tool_call"];
 
-/// Delete one streaming block by id, type-guarded so this seam can never touch
+/// The SQL `IN` list of every ephemeral block type: the library's literal
+/// union plus the kinds the descriptors declare ephemeral. With no ephemeral
+/// descriptors the output is byte-identical to the literal the library always
+/// used, and a test pins that.
+pub(super) fn ephemeral_types_sql(descriptors: &[ContentDescriptor]) -> String {
+    let names = STREAMING_TYPES
+        .iter()
+        .copied()
+        .chain(
+            descriptors
+                .iter()
+                .filter(|d| d.ephemeral)
+                .flat_map(|d| d.kinds.iter().copied()),
+        )
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({names})")
+}
+
+/// Delete one ephemeral block by id, type-guarded so this seam can never touch
 /// a committed block. Cascades to the content table and the junction rows.
-fn delete_streaming_counterpart(conn: &Connection, block_id: i64) -> Result<bool, StoreError> {
+pub(super) fn delete_streaming_counterpart(
+    conn: &Connection,
+    descriptors: &[ContentDescriptor],
+    block_id: i64,
+) -> Result<bool, StoreError> {
     let deleted = conn.execute(
-        &format!("DELETE FROM blocks WHERE id = ?1 AND block_type IN {STREAMING_TYPES_SQL}"),
+        &format!(
+            "DELETE FROM blocks WHERE id = ?1 AND block_type IN {}",
+            ephemeral_types_sql(descriptors)
+        ),
         params![block_id],
     )?;
     Ok(deleted > 0)
@@ -104,8 +134,12 @@ impl Store {
     ///
     /// If the query fails or the store's actor has stopped.
     pub async fn list_blocks(&self, conversation_id: i64) -> Result<Vec<Block>, StoreError> {
-        self.run(move |conn| load_blocks_for_conversation(conn, conversation_id))
-            .await
+        let descriptors = self.descriptors;
+        let gate = self.gate.clone();
+        self.run(move |conn| {
+            load_blocks_for_conversation(conn, descriptors, &gate, conversation_id)
+        })
+        .await
     }
 
     /// The conversation's last block by junction order — the frontier's one
@@ -115,8 +149,12 @@ impl Store {
     ///
     /// If the query fails or the store's actor has stopped.
     pub async fn latest_block(&self, conversation_id: i64) -> Result<Option<Block>, StoreError> {
-        self.run(move |conn| latest_block_for_conversation(conn, conversation_id))
-            .await
+        let descriptors = self.descriptors;
+        let gate = self.gate.clone();
+        self.run(move |conn| {
+            latest_block_for_conversation(conn, descriptors, &gate, conversation_id)
+        })
+        .await
     }
 
     /// One block by id, whichever conversations it belongs to.
@@ -125,7 +163,9 @@ impl Store {
     ///
     /// If the query fails or the store's actor has stopped.
     pub async fn find_block(&self, block_id: i64) -> Result<Option<Block>, StoreError> {
-        self.run(move |conn| load_single_block(conn, block_id))
+        let descriptors = self.descriptors;
+        let gate = self.gate.clone();
+        self.run(move |conn| load_single_block(conn, descriptors, &gate, block_id))
             .await
     }
 
@@ -187,6 +227,7 @@ impl Store {
         content: String,
         replaces_streaming: Option<i64>,
     ) -> Result<i64, StoreError> {
+        let descriptors = self.descriptors;
         self.run(move |conn| {
             let tx = conn.transaction()?;
             let block_id = insert_block(&tx, conversation_id, "text")?;
@@ -195,7 +236,7 @@ impl Store {
                 params![block_id, role.as_str(), content],
             )?;
             if let Some(streaming_id) = replaces_streaming {
-                delete_streaming_counterpart(&tx, streaming_id)?;
+                delete_streaming_counterpart(&tx, descriptors, streaming_id)?;
             }
             tx.commit()?;
             Ok(block_id)
@@ -211,7 +252,8 @@ impl Store {
     ///
     /// If the delete fails or the store's actor has stopped.
     pub async fn discard_streaming_block(&self, block_id: i64) -> Result<bool, StoreError> {
-        self.run(move |conn| delete_streaming_counterpart(conn, block_id))
+        let descriptors = self.descriptors;
+        self.run(move |conn| delete_streaming_counterpart(conn, descriptors, block_id))
             .await
     }
 
@@ -330,6 +372,7 @@ impl Store {
         opaque: Option<OpaquePayload>,
         replaces_streaming: Option<i64>,
     ) -> Result<i64, StoreError> {
+        let descriptors = self.descriptors;
         self.run(move |conn| {
             let tx = conn.transaction()?;
             let block_id = insert_block(&tx, conversation_id, "thinking")?;
@@ -359,7 +402,7 @@ impl Store {
                 }
             }
             if let Some(streaming_id) = replaces_streaming {
-                delete_streaming_counterpart(&tx, streaming_id)?;
+                delete_streaming_counterpart(&tx, descriptors, streaming_id)?;
             }
             tx.commit()?;
             Ok(block_id)
@@ -380,6 +423,7 @@ impl Store {
         call: ToolCallInsert,
         replaces_streaming: Option<i64>,
     ) -> Result<i64, StoreError> {
+        let descriptors = self.descriptors;
         self.run(move |conn| {
             let tx = conn.transaction()?;
             let block_id = insert_block(&tx, conversation_id, "tool_call")?;
@@ -396,7 +440,7 @@ impl Store {
                 ],
             )?;
             if let Some(streaming_id) = replaces_streaming {
-                delete_streaming_counterpart(&tx, streaming_id)?;
+                delete_streaming_counterpart(&tx, descriptors, streaming_id)?;
             }
             tx.commit()?;
             Ok(block_id)
@@ -823,26 +867,29 @@ impl Store {
 
     /// Restart-clean: delete every still-streaming block for a conversation.
     ///
-    /// Targets only the transient `streaming`, `streaming_thinking` and
-    /// `streaming_tool_call` types — the uncommitted partials a dropped stream
-    /// left behind. Committed `text`, `thinking` and `tool_call` blocks and all
-    /// `tool_result` and `tool_error` rows are untouched, so a regenerated turn
-    /// starts from the last committed block with no duplication. Returns the
-    /// number removed. Deleting the `blocks` rows cascades to their content
-    /// tables and junction rows.
+    /// Targets only the ephemeral types — the transient `streaming`,
+    /// `streaming_thinking` and `streaming_tool_call` types plus any kinds a
+    /// descriptor declares ephemeral: the uncommitted partials a dropped
+    /// stream left behind. Committed `text`, `thinking` and `tool_call` blocks
+    /// and all `tool_result` and `tool_error` rows are untouched, so a
+    /// regenerated turn starts from the last committed block with no
+    /// duplication. Returns the number removed. Deleting the `blocks` rows
+    /// cascades to their content tables and junction rows.
     ///
     /// # Errors
     ///
     /// If the delete fails or the store's actor has stopped.
     pub async fn delete_streaming_blocks(&self, conversation_id: i64) -> Result<u64, StoreError> {
+        let descriptors = self.descriptors;
         self.run(move |conn| {
             let deleted = conn.execute(
                 &format!(
                     "DELETE FROM blocks
-                     WHERE block_type IN {STREAMING_TYPES_SQL}
+                     WHERE block_type IN {}
                        AND id IN (
                            SELECT block_id FROM conversation_blocks WHERE conversation_id = ?1
-                       )"
+                       )",
+                    ephemeral_types_sql(descriptors)
                 ),
                 params![conversation_id],
             )?;
@@ -871,9 +918,18 @@ impl Store {
     ///
     /// If the delete fails or the store's actor has stopped.
     pub async fn gc_orphan_blocks(&self) -> Result<u64, StoreError> {
+        let descriptors = self.descriptors;
+        let gate = self.gate.clone();
         self.run(move |conn| {
+            // The predicate reads every declared reference table, so a domain
+            // whose migrations failed refuses collection with that failure
+            // rather than running over schema in doubt.
+            gate.ensure_each(descriptors.iter().map(|d| d.domain))?;
             transact(conn, |tx| {
-                let sql = format!("DELETE FROM blocks WHERE {}", orphan_block_predicate());
+                let sql = format!(
+                    "DELETE FROM blocks WHERE {}",
+                    orphan_block_predicate(descriptors)
+                );
                 let mut collected: u64 = 0;
                 loop {
                     let deleted = tx.execute(&sql, [])?;
@@ -933,8 +989,12 @@ const BLOCK_REFERENCES: &[(&str, &[&str])] = &[
 /// them.
 ///
 /// Built as a SQL predicate over `blocks` so the definition and the statement
-/// that acts on it cannot drift apart.
-fn orphan_block_predicate() -> String {
+/// that acts on it cannot drift apart. The predicate is the library's literal
+/// reference union plus every reference column the descriptors declare — a
+/// consumer table pointing at a block keeps that block alive exactly as a
+/// quote's endpoint does. With no descriptors the output is byte-identical to
+/// the core-only form, and a test pins that.
+pub(super) fn orphan_block_predicate(descriptors: &[ContentDescriptor]) -> String {
     BLOCK_REFERENCES
         .iter()
         .map(|(table, columns)| {
@@ -945,6 +1005,22 @@ fn orphan_block_predicate() -> String {
                 .join(" OR ");
             format!("NOT EXISTS (SELECT 1 FROM {table} r WHERE {names})")
         })
+        .chain(
+            descriptors
+                .iter()
+                .flat_map(|d| d.reference_columns.iter())
+                .map(|reference| {
+                    // Descriptor-supplied identifiers are quoted everywhere they
+                    // enter generated SQL; this arm was the one site left bare,
+                    // and a keyword-named reference column killed collection
+                    // outright with a syntax error.
+                    format!(
+                        "NOT EXISTS (SELECT 1 FROM {} r WHERE r.{} = blocks.id)",
+                        super::descriptors::quoted(reference.table),
+                        super::descriptors::quoted(reference.column)
+                    )
+                }),
+        )
         .collect::<Vec<_>>()
         .join("\n    AND ")
 }

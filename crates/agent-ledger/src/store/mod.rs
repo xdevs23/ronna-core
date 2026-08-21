@@ -31,6 +31,7 @@ mod block_content;
 mod blocks;
 mod conversations;
 mod date_markers;
+mod descriptors;
 mod drafts;
 mod messages;
 mod metadata;
@@ -40,6 +41,7 @@ mod providers;
 mod tool_calls;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -49,6 +51,9 @@ use crate::reactivity::ChangeLog;
 pub use attachments::{Attachment, ByteRange};
 pub use conversations::{
     BranchPoint, Continuation, Conversation, ConversationModel, ModelOverride,
+};
+pub use descriptors::{
+    Column, ColumnRef, ColumnType, ContentDescriptor, DomainMigrations, StoreConfig,
 };
 pub use drafts::DraftBlock;
 pub use messages::ToolCallInsert;
@@ -85,6 +90,33 @@ pub enum StoreError {
         block_type: String,
         /// The operation that has no mapping for it.
         operation: &'static str,
+    },
+    /// A content-table descriptor failed its open-time check: its table is
+    /// missing, a declared column is missing or collides with a reserved name,
+    /// or its table or a kind collides with another descriptor or the library's
+    /// own set. The open fails loudly instead of leaving a kind that would load
+    /// empty payloads silently.
+    #[error("descriptor for table '{table}' is invalid: {reason}")]
+    InvalidDescriptor {
+        /// The table the failing descriptor names.
+        table: String,
+        /// What the check found.
+        reason: String,
+    },
+    /// The database needs its descriptors: it was created with content-table
+    /// descriptors this open does not supply. Read without them it is a
+    /// different ledger — consumer blocks render as empty content and the
+    /// collector aborts on their references — so the open refuses instead of
+    /// misreading. Reopen with [`Store::open_with`] and the descriptor set
+    /// that covers the named tables.
+    #[error(
+        "the database needs its descriptors: its registry names content tables this \
+         open does not cover: {tables:?}"
+    )]
+    MissingDescriptors {
+        /// The registered content tables the supplied descriptor set does not
+        /// cover.
+        tables: Vec<String>,
     },
     /// A domain's migrations failed, so its tables are in an unknown state and
     /// every query for that domain is refused with this instead of being run or
@@ -149,6 +181,16 @@ pub type StoreTx = mpsc::UnboundedSender<StoreOp>;
 #[derive(Clone)]
 pub struct Store {
     tx: StoreTx,
+    /// The consumer's content-table descriptors, empty for a core-only store.
+    /// They drive the consumer load, write, fork, collection and teardown
+    /// paths; the library's own kinds never consult them.
+    descriptors: &'static [ContentDescriptor],
+    /// The effective content-table list — see [`Store::content_tables`].
+    content_tables: Arc<[&'static str]>,
+    /// The consumer domains' health, shared with the actor: descriptor-path
+    /// reads and writes consult it so a failed consumer migration answers
+    /// them with [`StoreError::MigrationFailed`] instead of running raw.
+    gate: DomainGate,
     /// Fires whenever a relevant table changes, carrying the action, the table
     /// and the row id per change. Backed by the database's own row change hook.
     pub changes: ChangeLog,
@@ -162,7 +204,7 @@ impl Store {
         self.tx.clone()
     }
 
-    /// Open a store at a database location.
+    /// Open a store at a database location, core kinds only.
     ///
     /// **A location and nothing else.** No configuration directory, no
     /// provider, no model, no import of anything a product happens to keep
@@ -174,22 +216,66 @@ impl Store {
     ///
     /// If the database cannot be opened or its migrations fail.
     pub fn open(db_path: &Path) -> Result<Self, StoreError> {
-        let conn = Connection::open(db_path)?;
-        Self::init(conn)
+        Self::open_with(db_path, StoreConfig::default())
     }
 
-    /// Open a store held entirely in memory. Nothing touches the disk, which is
-    /// what every test in this library uses.
+    /// Open a store at a database location with a consumer's configuration:
+    /// its content-table descriptors and the domain migrations that create
+    /// their tables.
+    ///
+    /// The two arrive together on purpose. The library's migrations and the
+    /// consumer's run before any query is served, then every descriptor is
+    /// validated against the schema they produced — the table exists, every
+    /// declared column exists, nothing collides with another descriptor or the
+    /// library's own set — and the open fails loudly otherwise. A kind whose
+    /// table was never wired up therefore cannot exist quietly.
+    ///
+    /// # Errors
+    ///
+    /// If the database cannot be opened, if any migrations fail, or if a
+    /// descriptor fails validation ([`StoreError::InvalidDescriptor`]).
+    pub fn open_with(db_path: &Path, config: StoreConfig) -> Result<Self, StoreError> {
+        let conn = Connection::open(db_path)?;
+        Self::init(conn, config)
+    }
+
+    /// Open a store held entirely in memory, core kinds only. Nothing touches
+    /// the disk, which is what every test in this library uses.
     ///
     /// # Errors
     ///
     /// If the database cannot be created or its migrations fail.
     pub fn in_memory() -> Result<Self, StoreError> {
-        let conn = Connection::open_in_memory()?;
-        Self::init(conn)
+        Self::in_memory_with(StoreConfig::default())
     }
 
-    fn init(conn: Connection) -> Result<Self, StoreError> {
+    /// Open a store held entirely in memory with a consumer's configuration —
+    /// [`Store::open_with`]'s contract, without a disk. This is what a
+    /// consumer's tests use for the same reason the library's own do: fast,
+    /// parallel, nothing shared.
+    ///
+    /// # Errors
+    ///
+    /// If the database cannot be created, if any migrations fail, or if a
+    /// descriptor fails validation ([`StoreError::InvalidDescriptor`]).
+    pub fn in_memory_with(config: StoreConfig) -> Result<Self, StoreError> {
+        let conn = Connection::open_in_memory()?;
+        Self::init(conn, config)
+    }
+
+    /// The effective content-table list: the library's own block content
+    /// tables followed by every configured descriptor's table.
+    ///
+    /// One list, one owner. The row change hook's allowlist is built from it
+    /// and the runtime's block watcher filters by it, so a descriptor's table
+    /// wakes the same machinery a library table does — and the two consumers
+    /// of the list cannot drift apart, because neither keeps a copy.
+    #[must_use]
+    pub fn content_tables(&self) -> &[&'static str] {
+        &self.content_tables
+    }
+
+    fn init(mut conn: Connection, config: StoreConfig) -> Result<Self, StoreError> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -197,6 +283,66 @@ impl Store {
         conn.pragma_update(None, "cache_size", -8000)?;
 
         migrations::run(&conn)?;
+        ensure_tracking_tables(&conn)?;
+
+        // What the library's own migrations create, snapshotted from a
+        // pristine schema — the collision set descriptor validation checks
+        // tables against, correct by construction with no literal to rot.
+        let core_tables = core_table_snapshot()?;
+
+        let StoreConfig {
+            descriptors,
+            domain_migrations,
+        } = config;
+
+        // Descriptors are durable facts: a database created with them refuses
+        // an open that does not supply them, before anything else consumer-side
+        // runs.
+        descriptors::check_registry(&conn, descriptors)?;
+
+        // The consumer's own migrations, before anything can query: the
+        // descriptors are validated against the schema these create, so they
+        // cannot run later. Each domain advances on its own version row,
+        // exactly as a call to `domain_migrate` would advance it — and one
+        // entry per domain, because a second entry's steps would silently
+        // re-count the first's versions and never run.
+        let mut premigrated: std::collections::HashSet<&'static str> =
+            std::collections::HashSet::new();
+        premigrated.insert(CORE_DOMAIN);
+        for migration in domain_migrations {
+            if migration.domain == CORE_DOMAIN {
+                return Err(StoreError::Other(format!(
+                    "domain '{CORE_DOMAIN}' is the library's own; a consumer domain needs a name of its own"
+                )));
+            }
+            if premigrated.contains(migration.domain) {
+                return Err(StoreError::Other(format!(
+                    "domain '{}' is submitted twice in one StoreConfig — one \
+                     DomainMigrations per domain, or the second entry's steps are \
+                     silently skipped by the version counter",
+                    migration.domain
+                )));
+            }
+            run_domain_migrations(&mut conn, migration.domain, &migration.sqls)
+                .map_err(|failure| failure.error(migration.domain))?;
+            premigrated.insert(migration.domain);
+        }
+
+        descriptors::validate(&conn, descriptors, &core_tables)?;
+        descriptors::record_registry(&conn, descriptors)?;
+
+        // A descriptor's domain is ready the moment its schema validated: its
+        // tables exist in the shape the descriptor declares, which is the fact
+        // the migration gate stands for. Without this, a reopened database
+        // whose migrations were all applied on an earlier open would park
+        // descriptor queries forever behind migrations nobody resubmits.
+        for descriptor in descriptors {
+            premigrated.insert(descriptor.domain);
+        }
+
+        let content_tables: Arc<[&'static str]> =
+            descriptors::effective_content_tables(descriptors).into();
+        let hook_tables = descriptors::change_hook_tables(descriptors);
 
         // The hook's installation is checked, not assumed: a store whose hook
         // never attached would accept every write and wake nothing, and the
@@ -216,7 +362,7 @@ impl Store {
         let changes = ChangeLog::new(|push| {
             hook_installed = conn.update_hook(Some(
                 move |action: rusqlite::hooks::Action, _: &str, table: &str, rowid: i64| {
-                    if CHANGE_HOOK_TABLES.contains(&table) {
+                    if hook_tables.contains(&table) {
                         push(action as i32, table, rowid);
                     }
                 },
@@ -224,25 +370,37 @@ impl Store {
         });
         hook_installed?;
 
+        let gate = DomainGate::default();
+        let actor_gate = gate.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        std::thread::spawn(move || Self::actor(rx, conn));
+        std::thread::spawn(move || Self::actor(rx, conn, premigrated, &actor_gate));
 
-        Ok(Self { tx, changes })
+        Ok(Self {
+            tx,
+            descriptors,
+            content_tables,
+            gate,
+            changes,
+        })
     }
 
     /// The actor loop — owns the connection and executes operations
     /// sequentially. A domain's migrations run before any of its queries, and a
     /// domain whose migrations failed answers every query with that failure.
-    fn actor(mut rx: mpsc::UnboundedReceiver<StoreOp>, mut conn: Connection) {
+    ///
+    /// `premigrated` names the domains `init` migrated before this thread
+    /// started: always the library's own, plus every domain the configured
+    /// open ran for the consumer.
+    fn actor(
+        mut rx: mpsc::UnboundedReceiver<StoreOp>,
+        mut conn: Connection,
+        premigrated: std::collections::HashSet<&'static str>,
+        gate: &DomainGate,
+    ) {
         use std::collections::{HashMap, HashSet, VecDeque};
 
-        let mut migrated: HashSet<&'static str> = HashSet::new();
+        let mut migrated: HashSet<&'static str> = premigrated;
         let mut deferred: HashMap<&'static str, VecDeque<QueryFn>> = HashMap::new();
-        let mut failed: HashMap<&'static str, FailedMigration> = HashMap::new();
-
-        // The library's own domain is pre-migrated: `init` ran it before this
-        // thread started.
-        migrated.insert(CORE_DOMAIN);
 
         while let Some(op) = rx.blocking_recv() {
             match op {
@@ -254,7 +412,7 @@ impl Store {
                             migrated.insert(domain);
                             // A corrected retry clears the refusal: the failure
                             // is a state of the schema, not a life sentence.
-                            failed.remove(domain);
+                            gate.clear(domain);
                             let _ = done.send(Ok(()));
                             // Drain whatever queued up while this domain waited.
                             for f in deferred.remove(domain).unwrap_or_default() {
@@ -270,13 +428,13 @@ impl Store {
                             for f in deferred.remove(domain).unwrap_or_default() {
                                 f(Err(failure.error(domain)));
                             }
-                            failed.insert(domain, failure);
+                            gate.record(domain, failure);
                         }
                     }
                 }
                 StoreOp::Query { domain, f } => {
-                    if let Some(failure) = failed.get(domain) {
-                        f(Err(failure.error(domain)));
+                    if let Some(refusal) = gate.failure(domain) {
+                        f(Err(refusal));
                     } else if migrated.contains(domain) {
                         f(Ok(&mut conn));
                     } else {
@@ -305,57 +463,18 @@ impl Store {
 /// The domain name the library's own tables live under.
 const CORE_DOMAIN: &str = "core";
 
-/// The tables whose row changes reach the change log — and, through it, the
-/// scheduler.
-///
-/// **This list is the second reason a consumer cannot yet add a block kind.** A
-/// change to a table not named here fires no wakeup, so a consumer's own block
-/// could be written and nothing would ever tick. Stage 3 replaces the list with
-/// content-table descriptors contributed by the kind itself, the same static
-/// mechanism that replaces the hardcoded load query, so the two never drift
-/// apart again.
-///
-/// The rule the list holds to until then: **every library table whose rows
-/// carry ledger content is named here.** Both ledgers count — `metadata` is the
-/// second one, and while it was missing nothing on it ever woke anybody. A
-/// content table left off the list is no safer: a consumer waking on the header
-/// and junction rows of the same transaction sees the content only by the order
-/// the rows happen to be written in, which is not a guarantee anything states.
-///
-/// Left off deliberately, because their rows are not ledger content: drafts
-/// (mutable composer state), attachments and their sidecars, and the provider
-/// and model registries.
-///
-/// This list is not the source's. Five entries that stood there are gone: four
-/// named tables belonging to the application this was extracted from, and the
-/// fifth named a table that existed nowhere in it — an entry that had been dead
-/// since before the move. Two entries the source never had are added, because
-/// the rule above says so and the source broke it: `block_streaming_tool_call`,
-/// the content table of a tool call whose arguments arrive in deltas, and
-/// `block_reasoning_detail`, the thinking block's sidecar. Both carry ledger
-/// content a consumer reads.
-const CHANGE_HOOK_TABLES: &[&str] = &[
-    "blocks",
-    "conversation_blocks",
-    "conversations",
-    "block_text",
-    "block_thinking",
-    "block_reasoning_detail",
-    "block_code",
-    "block_quote",
-    "block_tool_call",
-    "block_streaming_tool_call",
-    "block_tool_result",
-    "block_tool_error",
-    "block_status",
-    "block_approval_request",
-    "block_approval_decision",
-    "block_date_marker",
-    "metadata",
-];
+// The change hook's allowlist is built by `descriptors::change_hook_tables`:
+// the structural ledger tables plus the effective content-table list, which is
+// also what `Store::content_tables` exposes. The rule it holds to: **every
+// table whose rows carry ledger content is announced.** A content table left
+// off would leave a consumer waking on the header and junction rows of the
+// same transaction, seeing the content only by the order the rows happen to be
+// written in — which is not a guarantee anything states.
 
-/// The migration step that failed for a domain, kept by the actor so every
-/// query for that domain can be answered with the same error.
+/// The migration step that failed for a domain, kept behind the
+/// [`DomainGate`] so every query for that domain can be answered with the
+/// same error.
+#[derive(Clone)]
 struct FailedMigration {
     version: i64,
     reason: String,
@@ -369,6 +488,109 @@ impl FailedMigration {
             reason: self.reason.clone(),
         }
     }
+}
+
+/// The consumer domains' failed-migration state, shared between the actor —
+/// which records and clears it as migrations run — and the store's
+/// descriptor-path operations, which consult it before touching a
+/// descriptor's tables.
+///
+/// This is what routes descriptor reads and writes through the domain-aware
+/// discipline: the tables a descriptor drives are migrated under the
+/// consumer's domain, so a read or write of them while that domain's
+/// migrations are in a failed state answers with
+/// [`StoreError::MigrationFailed`] — the exact answer [`domain_run`] gives —
+/// instead of running raw against a schema in doubt. The checks run inside
+/// closures on the actor thread, which processes operations in order, so a
+/// failure recorded by an earlier migration op is always visible to a later
+/// query's check.
+#[derive(Clone, Default)]
+pub(crate) struct DomainGate {
+    failures: Arc<std::sync::Mutex<std::collections::HashMap<&'static str, FailedMigration>>>,
+}
+
+impl DomainGate {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<&'static str, FailedMigration>> {
+        self.failures.lock().expect("domain gate lock poisoned")
+    }
+
+    /// Record a domain's migration failure; queries for it are refused with it
+    /// until a corrected migration clears it.
+    fn record(&self, domain: &'static str, failure: FailedMigration) {
+        self.lock().insert(domain, failure);
+    }
+
+    /// A corrected migration lifts the refusal.
+    fn clear(&self, domain: &'static str) {
+        self.lock().remove(domain);
+    }
+
+    /// The refusal a domain currently carries, if any.
+    fn failure(&self, domain: &str) -> Option<StoreError> {
+        self.lock().get(domain).map(|f| f.error(domain))
+    }
+
+    /// Refuse when the domain is in a failed-migration state.
+    pub(crate) fn ensure(&self, domain: &str) -> Result<(), StoreError> {
+        match self.failure(domain) {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
+        }
+    }
+
+    /// Refuse when any of the given domains is in a failed-migration state.
+    pub(crate) fn ensure_each<'d, I>(&self, domains: I) -> Result<(), StoreError>
+    where
+        I: IntoIterator<Item = &'d str>,
+    {
+        for domain in domains {
+            self.ensure(domain)?;
+        }
+        Ok(())
+    }
+}
+
+/// The store's own bookkeeping tables, created idempotently at open beside
+/// the core migrations: the per-domain migration counter and the descriptor
+/// registry that makes descriptors durable facts of the database.
+fn ensure_tracking_tables(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS domain_migrations (
+            domain TEXT PRIMARY KEY,
+            version INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS content_descriptors (
+            table_name TEXT PRIMARY KEY,
+            domain     TEXT NOT NULL,
+            kinds      TEXT NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
+/// Every table the library's own migrations (plus the tracking tables)
+/// create, as a snapshot of `sqlite_master` — the set a descriptor's table
+/// may not collide with.
+///
+/// Taken from a throwaway in-memory schema rather than the connection being
+/// opened, deliberately: after the core migrations, and before any consumer
+/// migration ever touches it, which is the only moment the snapshot means
+/// "the library's tables and nothing else". The opened database itself offers
+/// no such moment on a reopen — the consumer's tables from earlier opens are
+/// already in ITS `sqlite_master`, and a snapshot there would claim them as
+/// the library's. Correct by construction, with no hand-mirrored literal to
+/// rot.
+fn core_table_snapshot() -> Result<std::collections::HashSet<String>, StoreError> {
+    let conn = Connection::open_in_memory()?;
+    migrations::run(&conn)?;
+    ensure_tracking_tables(&conn)?;
+    let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+    let tables = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    Ok(tables)
 }
 
 /// Apply one domain's migrations, tracking its version in `domain_migrations`.

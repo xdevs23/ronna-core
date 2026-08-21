@@ -1067,11 +1067,13 @@ fn spawn_conversations_watcher<K: RuntimeKind, E: RuntimeEvent>(ctx: &RuntimeCon
 /// tables change. Runs globally (not per-conversation). The update hook
 /// provides the rowid, and the conversation id is resolved from the store.
 ///
-/// The table list below is hardcoded for the same reason the store's
-/// change-hook allowlist is, and Stage 3 replaces both with content-table
-/// descriptors contributed by the kind itself. Until then it names the tables
-/// whose rows a consumer re-renders live — the header, the junction, and the
-/// content of the kinds that stream or resolve.
+/// The tables it watches are the header, the junction, and the store's own
+/// effective content-table list — the one list the change-hook allowlist is
+/// also built from, core tables and descriptor tables alike. The watcher keeps
+/// no copy of its own, so a consumer kind's table wakes it the moment the
+/// store is opened with the descriptor. Every content table is keyed
+/// `block_id INTEGER PRIMARY KEY`, which is what lets the change's rowid be
+/// read as the block id below.
 fn spawn_block_watcher<K: RuntimeKind, E: RuntimeEvent>(ctx: &RuntimeContext<K, E>) {
     let db_changes = ctx.store.changes.consumer();
     let store = ctx.store.clone();
@@ -1081,12 +1083,7 @@ fn spawn_block_watcher<K: RuntimeKind, E: RuntimeEvent>(ctx: &RuntimeContext<K, 
         reactive!(db_changes, change, {
             if change.table == "blocks"
                 || change.table == "conversation_blocks"
-                || change.table == "block_text"
-                || change.table == "block_thinking"
-                || change.table == "block_code"
-                || change.table == "block_tool_call"
-                || change.table == "block_tool_result"
-                || change.table == "block_status"
+                || store.content_tables().iter().any(|t| *t == change.table)
             {
                 let block_id = if change.table == "conversation_blocks" {
                     // For junction table changes, the rowid IS the junction
