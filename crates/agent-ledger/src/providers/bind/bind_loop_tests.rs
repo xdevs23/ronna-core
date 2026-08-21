@@ -15,7 +15,12 @@ use crate::providers::types::{StopReason, Usage};
 /// Drive the loop with a single stream request and collect every response until
 /// the channel closes.
 async fn drive(
-    open: impl Fn(Vec<Block>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>) -> EventStream
+    open: impl Fn(
+        Vec<Message>,
+        ModelSelector,
+        Vec<ToolDefinition>,
+        Option<ReasoningLevel>,
+    ) -> EventStream
     + Send
     + Sync
     + 'static,
@@ -30,7 +35,7 @@ async fn drive(
 
     req_tx
         .send(ProviderRequest::Stream {
-            blocks: vec![],
+            messages: vec![],
             model: ModelSelector::Lightweight,
             tools: vec![],
             reasoning: None,
@@ -340,7 +345,7 @@ async fn dropping_the_sender_stops_the_cycle() {
 
     req_tx
         .send(ProviderRequest::Stream {
-            blocks: vec![],
+            messages: vec![],
             model: ModelSelector::Lightweight,
             tools: vec![],
             reasoning: None,
@@ -417,7 +422,7 @@ async fn a_superseded_turn_sends_no_close() {
     ));
 
     let request = || ProviderRequest::Stream {
-        blocks: vec![],
+        messages: vec![],
         model: ModelSelector::Lightweight,
         tools: vec![],
         reasoning: None,

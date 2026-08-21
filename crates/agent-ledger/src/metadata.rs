@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::agency::ratchet::{self, MetadataLedger};
-use crate::agency::{AgencyCtx, BlockKind, Projection};
+use crate::agency::{AgencyCtx, BlockKind, FromBlock, RuntimeKind};
 use crate::block::{Block, Role};
 use crate::bus::RuntimeEvent;
 use crate::event::{AsCoreEvent, CoreEvent};
@@ -114,9 +114,9 @@ fn log_millis(delay: Duration) -> u64 {
 
 /// Spawn the per-conversation metadata subsystem. Returns join handles so the
 /// conversation actor can abort them on shutdown.
-pub(crate) fn spawn<E: RuntimeEvent + AsCoreEvent>(
+pub(crate) fn spawn<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent>(
     conv_id: i64,
-    ctx: RuntimeContext<E>,
+    ctx: RuntimeContext<K, E>,
     latched: ReadSignal<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     // Subscribed here, before the spawn, so no wakeup can slip between the
@@ -152,7 +152,10 @@ pub(crate) fn spawn<E: RuntimeEvent + AsCoreEvent>(
 /// orchestration and rests behind the latch, so a boot-latched conversation
 /// may accrue the request but derivation cannot fire in a boot burst — it
 /// heals on the next unlatch via the cursor.
-async fn run_policy_watcher<E: RuntimeEvent>(conv_id: i64, ctx: RuntimeContext<E>) {
+async fn run_policy_watcher<K: RuntimeKind, E: RuntimeEvent>(
+    conv_id: i64,
+    ctx: RuntimeContext<K, E>,
+) {
     let store = ctx.store().clone();
     let db_changes = store.changes.watcher();
 
@@ -206,14 +209,14 @@ pub(crate) async fn policy_tick(store: &Store, conv_id: i64) {
 /// [`MetadataLedger`] and nothing else. The metadata frontier never owes a
 /// model turn (its kinds await System or nothing), so unlike the conversation
 /// tick there is no gate signal to wire.
-pub(crate) async fn metadata_tick<E: RuntimeEvent>(
+pub(crate) async fn metadata_tick<K: RuntimeKind, E: RuntimeEvent>(
     ctx: &AgencyCtx<E>,
     latched: bool,
 ) -> Option<ratchet::Outcome> {
     if latched {
         return None;
     }
-    match ratchet::drive_ledger(ctx, &MetadataLedger).await {
+    match ratchet::drive_ledger::<K, E>(ctx, &MetadataLedger).await {
         Ok(outcome) => {
             tracing::debug!(
                 conversation_id = ctx.conversation_id,
@@ -231,9 +234,9 @@ pub(crate) async fn metadata_tick<E: RuntimeEvent>(
 
 /// Metadata scheduler — the SINGLE driver of the metadata cursor for its
 /// conversation, behind the SAME latch signal as the conversation scheduler.
-async fn run_metadata_scheduler<E: RuntimeEvent>(
+async fn run_metadata_scheduler<K: RuntimeKind, E: RuntimeEvent>(
     conv_id: i64,
-    ctx: RuntimeContext<E>,
+    ctx: RuntimeContext<K, E>,
     read_latched: ReadSignal<bool>,
 ) {
     let agency = ctx.agency(conv_id);
@@ -243,7 +246,7 @@ async fn run_metadata_scheduler<E: RuntimeEvent>(
         let latched = read_latched.get();
         db_changes.react();
 
-        metadata_tick(&agency, latched).await;
+        metadata_tick::<K, E>(&agency, latched).await;
     }
 }
 
@@ -256,9 +259,9 @@ async fn run_metadata_scheduler<E: RuntimeEvent>(
 /// Tests drive it with a stub provider channel pre-cached in `provider_tx`
 /// (the lazy bind then never touches the registry) and an externally
 /// observable throttle; production passes `None` and a fresh throttle.
-pub(crate) async fn fulfillment_loop<E: RuntimeEvent + AsCoreEvent>(
+pub(crate) async fn fulfillment_loop<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent>(
     conv_id: i64,
-    ctx: RuntimeContext<E>,
+    ctx: RuntimeContext<K, E>,
     latched: ReadSignal<bool>,
     mut rx: tokio::sync::broadcast::Receiver<E>,
     mut provider_tx: Option<ProviderTx>,
@@ -360,7 +363,7 @@ pub(crate) async fn fulfillment_loop<E: RuntimeEvent + AsCoreEvent>(
                 // actor's streaming flag is set after its dispatch and is safe
                 // only because one task owns both writes.)
                 streaming.store(true, Ordering::Relaxed);
-                if !request_title_stream(&store, conv_id, &tx).await {
+                if !request_title_stream::<K>(&store, conv_id, &tx).await {
                     streaming.store(false, Ordering::Relaxed);
                 }
             }
@@ -381,11 +384,11 @@ pub(crate) async fn fulfillment_loop<E: RuntimeEvent + AsCoreEvent>(
 /// tool calls, no tool results, no reasoning, no system rows. Tool history is
 /// token noise here, and tool-shaped messages without declared tools risk
 /// provider rejections.
-fn title_source_blocks(blocks: Vec<Block>) -> Vec<Block> {
+fn title_source_blocks<K: RuntimeKind>(blocks: Vec<Block>) -> Vec<Block> {
     blocks
         .into_iter()
         .filter(|block| {
-            let kind = BlockKind::from_block(block);
+            let kind = K::from_block(block);
             matches!(kind.group_role(), Some(Role::User | Role::Assistant))
                 && kind.llm_text().is_some_and(|text| !text.is_empty())
         })
@@ -394,9 +397,16 @@ fn title_source_blocks(blocks: Vec<Block>) -> Vec<Block> {
 
 /// Build the derivation request off the conversation's prose and send it.
 /// Returns whether a stream request went out.
-async fn request_title_stream(store: &Store, conv_id: i64, tx: &ProviderTx) -> bool {
+///
+/// The projection fold runs HERE, on the caller's side: the provider channel
+/// carries neutral messages, never blocks.
+async fn request_title_stream<K: RuntimeKind>(
+    store: &Store,
+    conv_id: i64,
+    tx: &ProviderTx,
+) -> bool {
     let blocks = match store.list_blocks(conv_id).await {
-        Ok(b) => title_source_blocks(b),
+        Ok(b) => title_source_blocks::<K>(b),
         Err(_) => return false,
     };
     if blocks.is_empty() {
@@ -425,7 +435,7 @@ async fn request_title_stream(store: &Store, conv_id: i64, tx: &ProviderTx) -> b
     });
 
     tx.send(ProviderRequest::Stream {
-        blocks: title_blocks,
+        messages: crate::providers::blocks_to_messages::<K>(&title_blocks),
         model: ModelSelector::Lightweight,
         tools: vec![],
         // Title derivation uses the lightweight model with no reasoning.
@@ -437,9 +447,9 @@ async fn request_title_stream(store: &Store, conv_id: i64, tx: &ProviderTx) -> b
 /// Ingestion reader for the fulfillment actor. Collects text deltas, writes
 /// `title_response` metadata, and emits [`CoreEvent::TitleUpdated`] on the
 /// bus.
-pub(crate) async fn run_fulfillment_ingestion<E: RuntimeEvent>(
+pub(crate) async fn run_fulfillment_ingestion<K: RuntimeKind, E: RuntimeEvent>(
     conv_id: i64,
-    ctx: RuntimeContext<E>,
+    ctx: RuntimeContext<K, E>,
     mut provider_rx: ProviderRx,
     streaming: Arc<AtomicBool>,
     throttle: Arc<FulfillmentThrottle>,
@@ -559,9 +569,9 @@ pub(crate) async fn run_fulfillment_ingestion<E: RuntimeEvent>(
 
 // ─── Provider binding ───────────────────────────────────────────────────────
 
-async fn ensure_provider<E: RuntimeEvent>(
+async fn ensure_provider<K: RuntimeKind, E: RuntimeEvent>(
     conv_id: i64,
-    ctx: &RuntimeContext<E>,
+    ctx: &RuntimeContext<K, E>,
     cached_tx: &mut Option<ProviderTx>,
     streaming: &Arc<AtomicBool>,
     throttle: &Arc<FulfillmentThrottle>,
@@ -620,6 +630,7 @@ mod tests {
 
     use crate::agency::ratchet::oracle::Oracle;
     use crate::providers::ProviderRegistry;
+    use crate::providers::types::Message;
     use crate::reactivity::{WriteSignal, create_signal};
     use crate::store::ToolCallInsert;
     use crate::tools::ToolRegistry;
@@ -680,7 +691,7 @@ mod tests {
     /// A [`RuntimeContext`] over the oracle's store and bus with empty
     /// registries — the shape production hands the fulfillment loop, minus
     /// the provider the tests stub at the channel instead.
-    fn runtime_ctx(o: &Oracle) -> RuntimeContext<CoreEvent> {
+    fn runtime_ctx(o: &Oracle) -> RuntimeContext<BlockKind, CoreEvent> {
         RuntimeContext::new(
             o.ctx.store.clone(),
             Arc::clone(&o.ctx.bus),
@@ -739,13 +750,13 @@ mod tests {
             });
         }
 
-        /// The next stream request's blocks, awaited up to `window` — panics
-        /// if none arrives (the dispatch was expected).
-        async fn next_stream_blocks(&mut self, window: Duration) -> Vec<Block> {
+        /// The next stream request's neutral messages, awaited up to `window` —
+        /// panics if none arrives (the dispatch was expected).
+        async fn next_stream_messages(&mut self, window: Duration) -> Vec<Message> {
             let deadline = Instant::now() + window;
             loop {
                 match self.stub_rx.try_recv() {
-                    Ok(ProviderRequest::Stream { blocks, .. }) => return blocks,
+                    Ok(ProviderRequest::Stream { messages, .. }) => return messages,
                     Ok(ProviderRequest::Interrupt) => {}
                     Err(_) if Instant::now() < deadline => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -834,7 +845,11 @@ mod tests {
 
         // The latched ratchet rests entirely: no drive, no wakeup, no cursor.
         for _ in 0..3 {
-            assert!(metadata_tick(&rig.o.ctx, true).await.is_none());
+            assert!(
+                metadata_tick::<BlockKind, _>(&rig.o.ctx, true)
+                    .await
+                    .is_none()
+            );
         }
         rig.o.expect_silence();
         assert_eq!(metadata_cursor(&rig.o).await, 0);
@@ -846,7 +861,9 @@ mod tests {
 
         // Unlatch: the tick re-emits, the actor dispatches exactly once.
         rig.write_latched.set(false);
-        let outcome = metadata_tick(&rig.o.ctx, false).await.unwrap();
+        let outcome = metadata_tick::<BlockKind, _>(&rig.o.ctx, false)
+            .await
+            .unwrap();
         assert!(outcome.parked);
         expect_request_wakeup(&mut rig.o, request);
         assert_eq!(
@@ -858,7 +875,9 @@ mod tests {
         // The response lands: the ratchet settles in silence — nothing
         // further ever reaches the actor.
         let response = title_response(&rig.o).await;
-        let outcome = metadata_tick(&rig.o.ctx, false).await.unwrap();
+        let outcome = metadata_tick::<BlockKind, _>(&rig.o.ctx, false)
+            .await
+            .unwrap();
         assert!(!outcome.parked);
         assert_eq!(outcome.cursor, response);
         rig.o.expect_silence();
@@ -1205,8 +1224,8 @@ mod tests {
 
     /// The title request carries PROSE only: user/assistant text through the
     /// projection surface — no tool calls, no tool results, no reasoning, no
-    /// system rows — plus the trailing instruction. The neutral render of the
-    /// dispatched blocks contains zero tool parts.
+    /// system rows — plus the trailing instruction. The dispatched neutral
+    /// messages contain zero tool parts.
     #[tokio::test]
     async fn title_request_carries_only_prose() {
         let mut rig = FulfillmentRig::new(false).await;
@@ -1249,15 +1268,17 @@ mod tests {
         let request = title_request(&rig.o).await;
         rig.send_wakeup(request);
 
-        let blocks = rig.next_stream_blocks(Duration::from_secs(2)).await;
-        let types: Vec<&str> = blocks.iter().map(|b| b.block_type.as_str()).collect();
+        let messages = rig.next_stream_messages(Duration::from_secs(2)).await;
+        let roles: Vec<crate::providers::MessageRole> = messages.iter().map(|m| m.role).collect();
         assert_eq!(
-            types,
-            vec!["text", "text", "text"],
+            roles,
+            vec![
+                crate::providers::MessageRole::User,
+                crate::providers::MessageRole::Assistant,
+                crate::providers::MessageRole::User,
+            ],
             "user prose, assistant prose, the instruction — nothing else"
         );
-
-        let messages = crate::providers::blocks_to_messages(&blocks);
         assert!(
             messages
                 .iter()

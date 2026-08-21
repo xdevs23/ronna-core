@@ -1,11 +1,13 @@
-//! This vendor's pins: the direct block-to-message build, and the one place its
-//! reasoning must land.
+//! This vendor's pins: the request encoder over the neutral messages, and the
+//! one place its reasoning must land.
 //!
 //! Six of the source's seven tests for this vendor are here; the seventh is
 //! named with its reason in the provider module's header, because it pinned a
 //! request builder this layer deliberately does not have.
 
 use super::*;
+use crate::block::{Block, Role};
+use crate::providers::render::blocks_to_messages;
 
 fn block(id: i64, role: Role, block_type: &str, fields: &[(&str, &str)]) -> Block {
     let mut map = serde_json::Map::new();
@@ -21,12 +23,29 @@ fn block(id: i64, role: Role, block_type: &str, fields: &[(&str, &str)]) -> Bloc
     }
 }
 
-/// The exact layout that produced a rejected request: an unfinalized reasoning
+/// A ledger's wire form on this vendor: the one central projection pass, then
+/// this vendor's encoder — the same two steps a live turn takes.
+fn wire(blocks: &[Block], thinking_enabled: bool) -> Vec<WireMessage> {
+    messages_to_wire_messages(
+        &blocks_to_messages::<crate::agency::BlockKind>(blocks),
+        thinking_enabled,
+    )
+}
+
+/// The layout that once produced a rejected request: an unfinalized reasoning
 /// tail, then an unfinalized call tail, then the committed call — all one
-/// assistant turn. The reasoning must ride on the same message as the call, and
-/// the tail in between must not split the turn.
+/// assistant turn. The tails are projection-invisible, so they neither split
+/// the turn nor leak an empty message, and the required reasoning field rides
+/// as the empty string the endpoint accepts.
+///
+/// This pin asserts the OPPOSITE of its predecessor, and the difference is a
+/// trade, made knowingly. The old builder replayed an unfinalized reasoning
+/// tail as the only record of an interrupted turn's reasoning. The shared
+/// projection excludes streaming tails, and the interrupt teardown deletes
+/// those rows anyway, so the fallback's premise no longer exists in this
+/// runtime. The replay field degrades to empty.
 #[test]
-fn streaming_thinking_survives_as_reasoning_on_tool_call() {
+fn streaming_tails_neither_split_the_turn_nor_leak_a_message() {
     let blocks = vec![
         block(1, Role::User, "text", &[("content", "hi")]),
         block(
@@ -48,12 +67,16 @@ fn streaming_thinking_survives_as_reasoning_on_tool_call() {
             &[("tool_call_id", "t1"), ("name", "run"), ("input", "{}")],
         ),
     ];
-    let wire = blocks_to_wire_messages(&blocks, true);
+    let wire = wire(&blocks, true);
 
     assert_eq!(wire.len(), 2, "user plus a single assistant message");
     let assistant = &wire[1];
     assert_eq!(assistant.role, "assistant");
-    assert_eq!(assistant.reasoning_content.as_deref(), Some("let me think"));
+    assert_eq!(
+        assistant.reasoning_content.as_deref(),
+        Some(""),
+        "the required field rides empty: an unfinalized tail never projects"
+    );
     assert!(assistant.tool_calls.as_ref().is_some_and(|t| t.len() == 1));
 }
 
@@ -77,7 +100,7 @@ fn date_marker_joins_the_system_message() {
         marker,
         block(3, Role::User, "text", &[("content", "hi")]),
     ];
-    let wire = blocks_to_wire_messages(&blocks, false);
+    let wire = wire(&blocks, false);
 
     assert_eq!(wire[0].role, "system");
     assert_eq!(
@@ -87,8 +110,10 @@ fn date_marker_joins_the_system_message() {
     );
 }
 
-/// Finalized reasoning is authoritative and wins over any tail left in the same
-/// turn — the tail is a partial copy of the same words.
+/// Finalized reasoning is authoritative and wins over any tail left in the
+/// same turn: the tail is a partial copy of the same words and never projects,
+/// so only the finalized reasoning reaches the sibling field — riding the same
+/// message as the turn's call and content.
 #[test]
 fn finalized_thinking_preferred_over_streaming() {
     let blocks = vec![
@@ -105,8 +130,14 @@ fn finalized_thinking_preferred_over_streaming() {
             &[("content", "final reasoning")],
         ),
         block(3, Role::Assistant, "text", &[("content", "answer")]),
+        block(
+            4,
+            Role::Assistant,
+            "tool_call",
+            &[("tool_call_id", "t1"), ("name", "run"), ("input", "{}")],
+        ),
     ];
-    let wire = blocks_to_wire_messages(&blocks, true);
+    let wire = wire(&blocks, true);
 
     assert_eq!(wire.len(), 1);
     assert_eq!(
@@ -114,6 +145,47 @@ fn finalized_thinking_preferred_over_streaming() {
         Some("final reasoning")
     );
     assert_eq!(wire[0].content.as_deref(), Some("answer"));
+    assert!(wire[0].tool_calls.as_ref().is_some_and(|t| t.len() == 1));
+}
+
+/// The same turn without its call — finalized reasoning, then text, nothing
+/// else. A text-only group folds through the projection's text policy, which
+/// drops reasoning before any vendor runs (the asymmetry pinned in the render
+/// goldens), so nothing reaches the sibling field and it rides as the required
+/// empty string. Reasoning replays on this wire only when the turn carries a
+/// call: the parts-mode shape the previous test pins.
+///
+/// A trade, made knowingly: the old builder replayed an unfinalized reasoning
+/// tail as the only record of an interrupted turn's reasoning. The shared
+/// projection excludes streaming tails and the interrupt teardown deletes
+/// those rows anyway, so the replay field degrades to empty.
+#[test]
+fn text_only_turn_sends_no_reasoning_despite_a_finalized_block() {
+    let blocks = vec![
+        block(
+            1,
+            Role::Assistant,
+            "streaming_thinking",
+            &[("content", "partial")],
+        ),
+        block(
+            2,
+            Role::Assistant,
+            "thinking",
+            &[("content", "final reasoning")],
+        ),
+        block(3, Role::Assistant, "text", &[("content", "answer")]),
+    ];
+    let wire = wire(&blocks, true);
+
+    assert_eq!(wire.len(), 1);
+    assert_eq!(
+        wire[0].reasoning_content.as_deref(),
+        Some(""),
+        "the text-mode fold dropped the reasoning, so the required field rides empty"
+    );
+    assert_eq!(wire[0].content.as_deref(), Some("answer"));
+    assert!(wire[0].tool_calls.is_none());
 }
 
 /// Reasoning on but none present: the endpoint requires the field, so an empty
@@ -126,7 +198,7 @@ fn empty_reasoning_when_thinking_enabled_and_none_present() {
         "tool_call",
         &[("tool_call_id", "t1"), ("name", "run"), ("input", "{}")],
     )];
-    let wire = blocks_to_wire_messages(&blocks, true);
+    let wire = wire(&blocks, true);
 
     assert_eq!(wire.len(), 1);
     assert_eq!(wire[0].reasoning_content.as_deref(), Some(""));
@@ -141,7 +213,7 @@ fn no_reasoning_field_when_thinking_disabled() {
         "text",
         &[("content", "plain answer")],
     )];
-    let wire = blocks_to_wire_messages(&blocks, false);
+    let wire = wire(&blocks, false);
 
     assert_eq!(wire.len(), 1);
     assert!(wire[0].reasoning_content.is_none());
@@ -158,8 +230,8 @@ fn lone_reasoning_is_dropped() {
         "streaming_thinking",
         &[("content", "orphan")],
     )];
-    assert!(blocks_to_wire_messages(&streaming, false).is_empty());
-    assert!(blocks_to_wire_messages(&streaming, true).is_empty());
+    assert!(wire(&streaming, false).is_empty());
+    assert!(wire(&streaming, true).is_empty());
 
     let finalized = vec![block(
         1,
@@ -167,7 +239,7 @@ fn lone_reasoning_is_dropped() {
         "thinking",
         &[("content", "orphan")],
     )];
-    assert!(blocks_to_wire_messages(&finalized, true).is_empty());
+    assert!(wire(&finalized, true).is_empty());
 }
 
 /// The response side, decoded by the shared chat-completions decoder.

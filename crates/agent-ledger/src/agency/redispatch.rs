@@ -18,20 +18,23 @@
 use crate::bus::RuntimeEvent;
 use crate::store::StoreError;
 
-use super::{Agency, AgencyCtx, BlockKind};
+use super::{AgencyCtx, RuntimeKind};
 
 /// Walk this conversation's deferred-work chain and unwind it, terminus first.
+///
+/// `K` is the kind the runtime is instantiated over; every call site in this
+/// library names [`BlockKind`](super::BlockKind).
 ///
 /// # Errors
 ///
 /// If listing the ledger fails, or a block's deferred body fails.
-pub async fn walk<E: RuntimeEvent>(ctx: &AgencyCtx<E>) -> Result<(), StoreError> {
+pub async fn walk<K: RuntimeKind, E: RuntimeEvent>(ctx: &AgencyCtx<E>) -> Result<(), StoreError> {
     let ledger = ctx.store.list_blocks(ctx.conversation_id).await?;
     let Some(anchor) = ledger.last() else {
         return Ok(());
     };
 
-    let mut chain = vec![BlockKind::from_block(anchor)];
+    let mut chain = vec![K::from_block(anchor)];
     let mut visited = vec![anchor.id];
     // The chain starts non-empty and only grows, so the head always exists; the
     // loop ends on a kind that routes nowhere, on a cycle, or on a dangling id.
@@ -52,7 +55,7 @@ pub async fn walk<E: RuntimeEvent>(ctx: &AgencyCtx<E>) -> Result<(), StoreError>
             break;
         };
         visited.push(next_id);
-        chain.push(BlockKind::from_block(next));
+        chain.push(K::from_block(next));
     }
 
     if chain.len() == 1 {

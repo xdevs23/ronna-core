@@ -6,7 +6,7 @@ use crate::block::Block;
 use crate::types::{ApprovalChoice, Awaiting};
 
 use super::projection::Projection;
-use super::{Agency, BlockKind};
+use super::{Agency, BlockKind, FromBlock};
 
 /// The human's verdict on an approval request.
 ///

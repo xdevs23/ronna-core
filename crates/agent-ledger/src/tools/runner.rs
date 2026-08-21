@@ -14,11 +14,12 @@
 //! and an error.
 
 use std::collections::HashSet;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use tracing::{info, warn};
 
-use crate::agency::{Agency, AgencyCtx, BlockKind, GateDecision, ToolCall};
+use crate::agency::{AgencyCtx, BlockKind, FromBlock, GateDecision, RuntimeKind, ToolCall};
 use crate::block::{Block, Role};
 use crate::bus::RuntimeEvent;
 use crate::store::{StoreError, ToolCallInsert};
@@ -35,9 +36,14 @@ use super::{ToolContext, ToolHandler, ToolOutcome, ToolRegistry};
 /// it: the conditional resolution writes are what make a second outcome
 /// impossible to record, and the body is deliberately at-least-once across a
 /// crash — the ledger holds exactly one resolution either way.
-pub struct ToolRunner<E> {
+pub struct ToolRunner<K: RuntimeKind, E> {
     registry: Arc<ToolRegistry<E>>,
     in_flight: Mutex<HashSet<(i64, i64)>>,
+    /// The kind the live-tail drive at the insert seam parses through — a
+    /// type-level collaborator the runner never owns. The `fn() -> K` form is
+    /// what says so to the compiler: the runner's auto traits and drop check
+    /// stay independent of `K`'s.
+    _kind: PhantomData<fn() -> K>,
 }
 
 /// A held claim, released when dropped. Every exit path releases it — the
@@ -50,21 +56,21 @@ pub struct ToolRunner<E> {
 /// Keyed on the call BLOCK id, like everything else about a call's identity:
 /// a model's `tool_call_id` can repeat, and two calls sharing one provider id
 /// must claim independently.
-struct Claim<'r, E> {
-    runner: &'r ToolRunner<E>,
+struct Claim<'r, K: RuntimeKind, E> {
+    runner: &'r ToolRunner<K, E>,
     conversation_id: i64,
     call_block_id: i64,
     held: bool,
 }
 
-impl<E> Claim<'_, E> {
+impl<K: RuntimeKind, E> Claim<'_, K, E> {
     /// Keep the claim past this pass: the backing system owns the resolution.
     fn keep(mut self) {
         self.held = false;
     }
 }
 
-impl<E> Drop for Claim<'_, E> {
+impl<K: RuntimeKind, E> Drop for Claim<'_, K, E> {
     fn drop(&mut self) {
         if self.held {
             self.runner
@@ -73,7 +79,7 @@ impl<E> Drop for Claim<'_, E> {
     }
 }
 
-impl<E> ToolRunner<E> {
+impl<K: RuntimeKind, E> ToolRunner<K, E> {
     /// A runner over this registry. The `Arc` is shared rather than owned
     /// because a consumer also builds the model's schema list from it.
     #[must_use]
@@ -81,6 +87,7 @@ impl<E> ToolRunner<E> {
         Self {
             registry,
             in_flight: Mutex::new(HashSet::new()),
+            _kind: PhantomData,
         }
     }
 
@@ -95,7 +102,7 @@ impl<E> ToolRunner<E> {
     /// The lock is released before anything is awaited: holding a
     /// synchronous lock across an await point parks every other conversation's
     /// runner behind whichever tool body happens to be slowest.
-    fn claim(&self, conversation_id: i64, call_block_id: i64) -> Option<Claim<'_, E>> {
+    fn claim(&self, conversation_id: i64, call_block_id: i64) -> Option<Claim<'_, K, E>> {
         let mut in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| {
             // A panicking tool body must not disable the guard for the rest of
             // the process. The set carries no invariant a panic could break —
@@ -123,7 +130,7 @@ impl<E> ToolRunner<E> {
     }
 }
 
-impl<E: RuntimeEvent> ToolRunner<E> {
+impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
     /// Record a tool call, then drive it once.
     ///
     /// **Insert-first, then act.** The block is in the ledger before any hook
@@ -184,7 +191,7 @@ impl<E: RuntimeEvent> ToolRunner<E> {
             return Ok(block_id);
         }
         if let Some(block) = ctx.store.find_block(block_id).await? {
-            BlockKind::from_block(&block).run(ctx).await?;
+            K::from_block(&block).run(ctx).await?;
         }
         Ok(block_id)
     }
@@ -234,6 +241,9 @@ impl<E: RuntimeEvent> ToolRunner<E> {
             }
         };
 
+        // The call row is one of the LIBRARY's own kinds, so it is read
+        // through the library's own parse: a composed consumer kind delegates
+        // the core type strings inward to the same place.
         let Some(call) = ledger
             .iter()
             .filter(|block| block.id == call_block_id)

@@ -6,6 +6,7 @@ use serde_json::json;
 use super::wire::{AnthropicSseState, parse_sse_event};
 use super::*;
 use crate::block::{Block, Role};
+use crate::providers::render::blocks_to_messages;
 use crate::providers::types::{StopReason, StreamEvent};
 
 /// The reasoning ingest: a block start, its deltas, its signature fragments,
@@ -271,8 +272,10 @@ mod replay_tests {
     }
 
     fn wire_for(payload: &OpaquePayload, include: bool) -> (Value, bool) {
-        let (_, wire, carried) =
-            convert_messages(&blocks_to_messages(&blocks_with_payload(payload)), include);
+        let (_, wire, carried) = convert_messages(
+            &blocks_to_messages::<crate::agency::BlockKind>(&blocks_with_payload(payload)),
+            include,
+        );
         (
             serde_json::to_value(&wire).expect("the wire serializes"),
             carried,
@@ -384,7 +387,7 @@ mod bind_request_golden {
 
         let request = turn_request(
             ModelSelector::Lightweight,
-            &blocks,
+            blocks_to_messages::<crate::agency::BlockKind>(&blocks),
             tools,
             Some(ReasoningLevel::High),
         );
@@ -468,7 +471,10 @@ mod wire_golden {
             ),
         ];
 
-        let (system, wire, carried) = convert_messages(&blocks_to_messages(&blocks), true);
+        let (system, wire, carried) = convert_messages(
+            &blocks_to_messages::<crate::agency::BlockKind>(&blocks),
+            true,
+        );
         assert!(system.is_none());
         assert!(!carried, "no stored payload means nothing replayed");
 
@@ -512,7 +518,10 @@ mod wire_golden {
             block(6, Some(Role::User), "text", &[("content", "next day")]),
         ];
 
-        let (system, wire, _) = convert_messages(&blocks_to_messages(&blocks), true);
+        let (system, wire, _) = convert_messages(
+            &blocks_to_messages::<crate::agency::BlockKind>(&blocks),
+            true,
+        );
         assert_eq!(
             system.as_deref(),
             Some(

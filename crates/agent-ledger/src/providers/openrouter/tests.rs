@@ -5,6 +5,7 @@ use serde_json::json;
 
 use super::*;
 use crate::block::{Block, Role};
+use crate::providers::render::blocks_to_messages;
 use crate::providers::types::{OpaquePayload, ReasoningDetailEntry};
 
 /// The background slug is pinned so a change to it is a decision someone made,
@@ -130,7 +131,8 @@ mod replay {
 
     fn assistant_message(payload: &OpaquePayload, include: bool) -> (Value, bool) {
         let provider = openrouter_provider("test-key".into(), None);
-        let messages = blocks_to_messages(&blocks_with_payload(payload));
+        let messages =
+            blocks_to_messages::<crate::agency::BlockKind>(&blocks_with_payload(payload));
         let (wire, carried) = provider.convert_messages(&messages, include);
         (
             serde_json::to_value(&wire).expect("the wire serializes"),
@@ -310,7 +312,10 @@ mod wire_golden {
         ];
 
         let provider = openrouter_provider("test-key".into(), None);
-        let (wire, carried) = provider.convert_messages(&blocks_to_messages(&blocks), true);
+        let (wire, carried) = provider.convert_messages(
+            &blocks_to_messages::<crate::agency::BlockKind>(&blocks),
+            true,
+        );
         assert!(!carried, "no stored payload means nothing replayed");
 
         let actual = serde_json::to_value(&wire).expect("the wire serializes");

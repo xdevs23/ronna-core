@@ -41,16 +41,16 @@
 //! this slice, 116 are here; these two are the whole of the difference.
 //!
 //! - **`kimi::reasoning_part_folds_identically_to_text`.** Its subject is that
-//!   vendor's *second* request builder in the source — the message-shaped one
-//!   behind the legacy stream call — which folded a reasoning part into the
-//!   assistant content, and the test pinned that fold as a no-op on the wire.
-//!   This layer keeps one request path per vendor, and for that vendor it is
-//!   the block-native one, which carries reasoning in the vendor's own sibling
-//!   field precisely because folding it into the content is what that endpoint
-//!   rejects. The two builders disagree by design, so the assertion has no
-//!   subject left to make: porting it would mean restoring the second builder,
-//!   which is the duplication this layer exists without. Where that vendor's
-//!   reasoning must land is pinned by its own tests instead.
+//!   vendor's *second* request builder in the source — the one that folded a
+//!   reasoning part into the assistant content, with the test pinning that fold
+//!   as a no-op on the wire. This layer keeps one request path per vendor, and
+//!   for that vendor it consumes the neutral messages like every other and
+//!   carries reasoning in the vendor's own sibling field, never folded into
+//!   the content — folding it in is what that endpoint rejects. So the
+//!   assertion has no subject left to make: porting it would mean restoring
+//!   the content fold, which is the shape this vendor's encoder exists to
+//!   avoid. Where that vendor's reasoning must land is pinned by its own tests
+//!   instead.
 //! - **`config::tool_definitions_complete`.** Its subject is the source
 //!   application's own catalogue of tool definitions, and the descriptions it
 //!   asserts on name stay-behind subsystems this library must never name.

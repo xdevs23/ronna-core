@@ -9,7 +9,7 @@ use crate::store::StoreError;
 use crate::types::Awaiting;
 
 use super::projection::Projection;
-use super::{Agency, AgencyCtx, BlockKind};
+use super::{Agency, AgencyCtx, BlockKind, FromBlock};
 
 /// The metadata ledger's ask for a derived title.
 ///

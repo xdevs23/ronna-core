@@ -1,6 +1,6 @@
 //! The ratchet — the ONE place a processed cursor moves.
 //!
-//! It drives every block's [`Agency`] hooks blindly, forward from the persisted
+//! It drives every block's [`Agency`](super::Agency) hooks blindly, forward from the persisted
 //! cursor, and reports whether the frontier owes a model turn. It never names a
 //! block type and never branches on a domain concept; per-kind behavior lives
 //! on the kinds.
@@ -9,27 +9,37 @@
 //! the caller instantiates it with and never learns which. That is what makes
 //! "the second ledger" a second instantiation rather than a second scheduler.
 
+use std::future::Future;
+
 use crate::block::Block;
 use crate::bus::RuntimeEvent;
 use crate::store::StoreError;
 use crate::types::Awaiting;
 
-use super::{Agency, AgencyCtx, BlockKind};
+use super::{AgencyCtx, RuntimeKind};
 
 /// The drive's one seam onto persistence: list the ledger, read its cursor,
 /// persist its cursor.
 ///
 /// Each instantiation hands in its own triple, and the ratchet stays
-/// ledger-blind. A closed set with static dispatch, so the hooks stay native
-/// `async fn` with nothing boxed.
-#[allow(async_fn_in_trait)]
-pub trait LedgerSource {
+/// ledger-blind. A closed set with static dispatch, nothing boxed.
+///
+/// Like [`Agency`](super::Agency), the hooks are declared `fn … -> impl Future<Output = …> +
+/// Send` so their Send-ness is nameable from a bound; implementors keep
+/// writing native `async fn`, and each such future MUST be `Send` — the
+/// implementor's obligation on a multi-threaded runtime, checked at the impl.
+/// `Sync` is a supertrait because the default [`tail`](Self::tail) borrows the
+/// source across an await.
+pub trait LedgerSource: Sync {
     /// Every block in this ledger, in ledger order.
     ///
     /// # Errors
     ///
     /// If the underlying read fails.
-    async fn list<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<Vec<Block>, StoreError>;
+    fn list<E: RuntimeEvent>(
+        &self,
+        ctx: &AgencyCtx<E>,
+    ) -> impl Future<Output = Result<Vec<Block>, StoreError>> + Send;
 
     /// This ledger's LAST block right now, or `None` when it is empty.
     ///
@@ -42,8 +52,11 @@ pub trait LedgerSource {
     /// # Errors
     ///
     /// If the underlying read fails.
-    async fn tail<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<Option<Block>, StoreError> {
-        Ok(self.list(ctx).await?.pop())
+    fn tail<E: RuntimeEvent>(
+        &self,
+        ctx: &AgencyCtx<E>,
+    ) -> impl Future<Output = Result<Option<Block>, StoreError>> + Send {
+        async { Ok(self.list(ctx).await?.pop()) }
     }
 
     /// This ledger's persisted cursor; 0 when nothing is confirmed.
@@ -51,18 +64,21 @@ pub trait LedgerSource {
     /// # Errors
     ///
     /// If the underlying read fails.
-    async fn cursor<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<i64, StoreError>;
+    fn cursor<E: RuntimeEvent>(
+        &self,
+        ctx: &AgencyCtx<E>,
+    ) -> impl Future<Output = Result<i64, StoreError>> + Send;
 
     /// Advance this ledger's persisted cursor to a confirmed block id.
     ///
     /// # Errors
     ///
     /// If the underlying write fails.
-    async fn persist_cursor<E: RuntimeEvent>(
+    fn persist_cursor<E: RuntimeEvent>(
         &self,
         ctx: &AgencyCtx<E>,
         confirmed_id: i64,
-    ) -> Result<(), StoreError>;
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
 /// The conversation ledger: junction-ordered blocks, cursored on the
@@ -130,7 +146,8 @@ impl LedgerSource for MetadataLedger {
 pub struct Outcome {
     /// The persisted cursor after the drive — the last DURABLE block id it
     /// confirmed, 0 when nothing is confirmed yet. An ephemeral block the
-    /// drive confirmed is not a candidate: see [`Agency::durable`].
+    /// drive confirmed is not a candidate: see
+    /// [`Agency::durable`](super::Agency::durable).
     pub cursor: i64,
     /// The frontier gate: the drive confirmed its whole SNAPSHOT without
     /// parking, AND the tail — read fresh after the drive — awaits the model.
@@ -142,7 +159,8 @@ pub struct Outcome {
     /// The drive stopped before confirming the tail — a block reported
     /// not-done, or its `run()` failed. A fresh tick re-drives it.
     pub parked: bool,
-    /// The tail block's own ask, straight off [`Agency::awaiting`], read from
+    /// The tail block's own ask, straight off
+    /// [`Agency::awaiting`](super::Agency::awaiting), read from
     /// the same fresh tail `owes_turn` is decided on. Published on
     /// conversation state so a consumer can tell an out-of-band ask from a
     /// chat reply. Orthogonal to `owes_turn`, which additionally requires the
@@ -153,11 +171,16 @@ pub struct Outcome {
 /// The conversation instantiation of [`drive_ledger`] — the turn scheduler's
 /// drive.
 ///
+/// `K` is the kind the runtime is instantiated over; every call site in this
+/// library names [`BlockKind`](super::BlockKind).
+///
 /// # Errors
 ///
 /// If listing the ledger, reading the cursor or persisting it fails.
-pub async fn drive<E: RuntimeEvent>(ctx: &AgencyCtx<E>) -> Result<Outcome, StoreError> {
-    drive_ledger(ctx, &ConversationLedger).await
+pub async fn drive<K: RuntimeKind, E: RuntimeEvent>(
+    ctx: &AgencyCtx<E>,
+) -> Result<Outcome, StoreError> {
+    drive_ledger::<K, E>(ctx, &ConversationLedger).await
 }
 
 /// Drive a ledger forward, inclusively, from its persisted cursor.
@@ -183,7 +206,7 @@ pub async fn drive<E: RuntimeEvent>(ctx: &AgencyCtx<E>) -> Result<Outcome, Store
 ///
 /// If listing the ledger, reading the cursor or persisting it fails. A block's
 /// own `run()` failing is NOT an error here — it parks the drive.
-pub async fn drive_ledger<E: RuntimeEvent>(
+pub async fn drive_ledger<K: RuntimeKind, E: RuntimeEvent>(
     ctx: &AgencyCtx<E>,
     source: &impl LedgerSource,
 ) -> Result<Outcome, StoreError> {
@@ -203,7 +226,7 @@ pub async fn drive_ledger<E: RuntimeEvent>(
 
     let mut parked = false;
     for block in &ledger[start..] {
-        let kind = BlockKind::from_block(block);
+        let kind = K::from_block(block);
         match kind.run(ctx).await {
             Ok(true) => {
                 // An ephemeral row is confirmed but never anchored: its
@@ -238,7 +261,7 @@ pub async fn drive_ledger<E: RuntimeEvent>(
     let awaiting = source
         .tail(ctx)
         .await?
-        .and_then(|tail| BlockKind::from_block(&tail).awaiting());
+        .and_then(|tail| K::from_block(&tail).awaiting());
     let owes_turn = !parked && awaiting == Some(Awaiting::Model);
 
     Ok(Outcome {
@@ -269,7 +292,7 @@ pub(crate) mod oracle {
     use crate::event::CoreEvent;
     use crate::store::{Store, ToolCallInsert};
 
-    use super::super::AgencyCtx;
+    use super::super::{AgencyCtx, BlockKind};
     use super::Outcome;
 
     pub(crate) struct Oracle {
@@ -311,7 +334,7 @@ pub(crate) mod oracle {
         }
 
         pub async fn drive(&self) -> Outcome {
-            let outcome = super::drive(&self.ctx).await.unwrap();
+            let outcome = super::drive::<BlockKind, _>(&self.ctx).await.unwrap();
             let persisted = self
                 .ctx
                 .store

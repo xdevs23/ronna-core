@@ -17,7 +17,6 @@ use crate::store::{StoreError, StoreTx};
 use super::bind;
 use super::chat::{ChatProvider, WireModel, provider_from_config};
 use super::http_store::{HttpProviderConfig, HttpProviderStore};
-use super::render::blocks_to_messages;
 use super::types::{
     CompletionRequest, LlmError, ModelInfo, ModelSelector, ProviderRx, ProviderTx,
     ReasoningCapability, ReasoningLevel,
@@ -151,7 +150,7 @@ impl ProviderModule for OpenRouterModule {
         tokio::spawn(bind::run_http_bind_loop_with_replay(
             req_rx,
             resp_tx,
-            move |blocks, selector, tools, reasoning, include_reasoning_payloads| {
+            move |messages, selector, tools, reasoning, include_reasoning_payloads| {
                 let model = match selector {
                     ModelSelector::Specific(m) => m,
                     ModelSelector::Lightweight => OPENROUTER_LIGHTWEIGHT_MODEL.into(),
@@ -159,7 +158,7 @@ impl ProviderModule for OpenRouterModule {
                 let provider = openrouter_provider(api_key.clone(), base_url.clone());
                 let request = CompletionRequest {
                     model,
-                    messages: blocks_to_messages(&blocks),
+                    messages,
                     tools,
                     max_tokens: None,
                     temperature: None,

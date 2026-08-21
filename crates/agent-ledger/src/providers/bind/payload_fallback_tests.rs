@@ -36,7 +36,7 @@ async fn drive_replay(
 
     req_tx
         .send(ProviderRequest::Stream {
-            blocks: vec![],
+            messages: vec![],
             model: ModelSelector::Lightweight,
             tools: vec![],
             reasoning: None,

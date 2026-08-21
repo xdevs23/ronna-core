@@ -8,31 +8,28 @@
 //! field. This vendor carries reasoning in a sibling field of its own and
 //! requires that field on every assistant message once reasoning is enabled —
 //! the shared base folds reasoning into the content instead, which this
-//! endpoint rejects. So this module builds its messages from blocks directly.
+//! endpoint rejects. So this module keeps a request encoder of its own. It
+//! consumes the same neutral messages as every other vendor — blocks never
+//! cross the provider boundary — and the reasoning fold into the sibling field
+//! happens inside that encoder, where vendor difference belongs.
 //!
 //! Its **responses** are ordinary chat-completions events, so they are read by
 //! the shared decoder. A parser of its own is what silently lost events: the
 //! two decoders drifted, and every fix made for the other vendors stopped at
 //! the module boundary.
-//!
-//! That direct build is the one place in this library where a module reads block
-//! types by name. It is a deliberate, contained exception with a cost: a block
-//! kind added elsewhere is invisible to this vendor until it is named here.
 
 use std::future::Future;
 
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::agency::{BlockKind, Projection};
-use crate::block::{Block, Role};
 use crate::store::{StoreError, StoreTx};
 
 use super::bind;
 use super::http;
 use super::types::{
-    EventStream, LlmError, ModelInfo, ModelSelector, ProviderRx, ProviderTx, ReasoningCapability,
-    ReasoningLevel, ToolDefinition,
+    ContentPart, EventStream, LlmError, Message, MessageContent, MessageRole, ModelInfo,
+    ModelSelector, ProviderRx, ProviderTx, ReasoningCapability, ReasoningLevel, ToolDefinition,
 };
 use super::{BoxFuture, ProviderModule};
 
@@ -121,11 +118,11 @@ impl KimiProvider {
         )
     }
 
-    /// Build a request straight from blocks, preserving reasoning in this
+    /// Build a request from neutral messages, folding reasoning into this
     /// vendor's own field.
-    fn build_request_from_blocks(
+    fn build_request(
         &self,
-        blocks: &[Block],
+        messages: &[Message],
         model: String,
         tools: &[ToolDefinition],
         stream: bool,
@@ -138,7 +135,7 @@ impl KimiProvider {
         WireRequest {
             model,
             max_tokens: None,
-            messages: blocks_to_wire_messages(blocks, thinking_enabled),
+            messages: messages_to_wire_messages(messages, thinking_enabled),
             tools: Self::wire_tools(tools),
             temperature: None,
             stream,
@@ -197,14 +194,14 @@ impl KimiProvider {
         Ok(models)
     }
 
-    /// Open one streaming turn from blocks, preserving reasoning.
-    fn stream_from_blocks(
+    /// Open one streaming turn from neutral messages.
+    fn stream_turn(
         &self,
-        blocks: &[Block],
+        messages: &[Message],
         model: String,
         tools: &[ToolDefinition],
     ) -> EventStream {
-        let body = self.build_request_from_blocks(blocks, model, tools, true);
+        let body = self.build_request(messages, model, tools, true);
         wire::open_stream(
             self.client.clone(),
             self.access_token.clone(),
@@ -214,96 +211,50 @@ impl KimiProvider {
     }
 }
 
-/// Convert blocks straight into this vendor's messages, preserving reasoning in
-/// its own field.
+/// Encode neutral messages into this vendor's wire messages.
 ///
-/// Two hazards this shape exists to avoid, both of which produced rejected
-/// requests:
-///
-/// **Dropped reasoning.** An unfinalized reasoning tail is the ONLY record of
-/// reasoning when no finalized sibling exists, so excluding it loses an
-/// interrupted turn's reasoning entirely. The priority is finalized reasoning
-/// first, the tail as a fallback, then an empty string when reasoning is on,
-/// then nothing.
-///
-/// **A split turn.** The grouping walk steps OVER a boundary-invisible block
-/// within a same-role run rather than terminating on it. An unfinalized call
-/// tail sitting between a reasoning tail and its committed call would otherwise
-/// split one assistant turn into two messages, stranding the reasoning on the
-/// wrong one.
-fn blocks_to_wire_messages(blocks: &[Block], thinking_enabled: bool) -> Vec<WireMessage> {
+/// The vendor difference lives HERE and nowhere earlier: reasoning parts fold
+/// into the endpoint's own sibling field — required on every assistant message
+/// once reasoning is enabled — and a tool-result part becomes a message of
+/// this wire's tool role, because the neutral layer has no tool voice while
+/// this wire does. What a block contributes at all is the neutral projection's
+/// answer, made before the messages reach any vendor.
+fn messages_to_wire_messages(messages: &[Message], thinking_enabled: bool) -> Vec<WireMessage> {
     let mut wire_messages = Vec::new();
-    let mut i = 0;
-
-    while i < blocks.len() {
-        let Some(role) = effective_role(&blocks[i]) else {
-            i += 1;
-            continue;
-        };
-        let start = i;
-        let mut end = i;
-        while i < blocks.len() {
-            match effective_role(&blocks[i]) {
-                Some(r) if r == role => {
-                    i += 1;
-                    end = i;
-                }
-                None => i += 1,
-                Some(_) => break,
+    for message in messages {
+        match message.role {
+            MessageRole::System => push_system(message, &mut wire_messages),
+            MessageRole::User => push_user(message, &mut wire_messages),
+            MessageRole::Assistant => {
+                push_assistant(message, thinking_enabled, &mut wire_messages);
             }
         }
-        let group = &blocks[start..end];
-
-        match role {
-            Role::System => push_system(group, &mut wire_messages),
-            Role::User => push_user(group, &mut wire_messages),
-            Role::Tool => push_tool(group, &mut wire_messages),
-            Role::Assistant => push_assistant(group, thinking_enabled, &mut wire_messages),
-        }
     }
-
     wire_messages
 }
 
-/// The role a block groups under for THIS vendor.
-///
-/// It differs from the projection role in one direction only: an unfinalized
-/// reasoning tail stays in its assistant group, because it is the fallback
-/// source for the reasoning field.
-fn effective_role(block: &Block) -> Option<Role> {
-    match block.block_type.as_str() {
-        // Unfinalized text and call tails carry no persistable content: their
-        // content is carried by their committed siblings.
-        "streaming" | "streaming_tool_call" => None,
-        "streaming_thinking" => Some(Role::Assistant),
-        "tool_result" | "tool_error" => Some(Role::Tool),
-        // The calendar entry is roleless on the row; on the projection axis it
-        // is a system line, so it groups with system content and the model
-        // learns the date.
-        "date_marker" => Some(Role::System),
-        _ => block.role,
+/// A message's plain-string content on this wire: the joined text form as-is,
+/// or a parts message's text parts joined the way the text mode joins.
+fn text_content(message: &Message) -> String {
+    match &message.content {
+        MessageContent::Text(text) => text.clone(),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
     }
 }
 
-fn str_field<'a>(block: &'a Block, key: &str) -> &'a str {
-    block.fields.get(key).and_then(Value::as_str).unwrap_or("")
-}
-
-fn push_system(group: &[Block], out: &mut Vec<WireMessage>) {
-    let text: Vec<String> = group
-        .iter()
-        .filter_map(|b| match b.block_type.as_str() {
-            "text" | "system_prompt" => Some(str_field(b, "content").to_string()),
-            // The dated line is the block's own projection, never a second copy
-            // of the same format string.
-            "date_marker" => BlockKind::from_block(b).llm_text(),
-            _ => None,
-        })
-        .collect();
+fn push_system(message: &Message, out: &mut Vec<WireMessage>) {
+    let text = text_content(message);
     if !text.is_empty() {
         out.push(WireMessage {
             role: "system".to_string(),
-            content: Some(text.join("\n\n")),
+            content: Some(text),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -311,27 +262,45 @@ fn push_system(group: &[Block], out: &mut Vec<WireMessage>) {
     }
 }
 
-fn push_user(group: &[Block], out: &mut Vec<WireMessage>) {
-    let text: Vec<String> = group
-        .iter()
-        .filter_map(|b| match b.block_type.as_str() {
-            "text" => Some(str_field(b, "content").to_string()),
-            "quote" => Some(format!("> {}", str_field(b, "text"))),
-            "code" => {
-                let lang = b
-                    .fields
-                    .get("language")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                Some(format!("```{lang}\n{}\n```", str_field(b, "content")))
+/// A user-voiced message. Each tool-result part becomes a message of this
+/// wire's tool role, keyed on its call; a result naming no call is skipped
+/// with a warning, because an unkeyed tool message is rejected outright. The
+/// text contribution, when there is one, follows as a user message.
+fn push_user(message: &Message, out: &mut Vec<WireMessage>) {
+    if let MessageContent::Parts(parts) = &message.content {
+        for part in parts {
+            let ContentPart::ToolResult {
+                tool_use_id,
+                content,
+            } = part
+            else {
+                continue;
+            };
+            if tool_use_id.is_empty() {
+                // The two facts that make the skip actionable: the id exactly
+                // as it arrived, and enough of what the part carried to find
+                // the result it came from.
+                warn!(
+                    tool_use_id = %tool_use_id,
+                    content_preview = %content.chars().take(120).collect::<String>(),
+                    "a tool result names no call, so it is skipped"
+                );
+                continue;
             }
-            _ => None,
-        })
-        .collect();
+            out.push(WireMessage {
+                role: "tool".to_string(),
+                content: Some(content.clone()),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some(tool_use_id.clone()),
+            });
+        }
+    }
+    let text = text_content(message);
     if !text.is_empty() {
         out.push(WireMessage {
             role: "user".to_string(),
-            content: Some(text.join("\n\n")),
+            content: Some(text),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -339,81 +308,50 @@ fn push_user(group: &[Block], out: &mut Vec<WireMessage>) {
     }
 }
 
-fn push_tool(group: &[Block], out: &mut Vec<WireMessage>) {
-    for block in group {
-        let content = match block.block_type.as_str() {
-            "tool_result" => str_field(block, "content").to_string(),
-            "tool_error" => str_field(block, "error").to_string(),
-            _ => continue,
-        };
-        let tool_call_id = str_field(block, "tool_call_id");
-        if tool_call_id.is_empty() {
-            warn!(
-                block_id = block.id,
-                block_type = %block.block_type,
-                "a tool result names no call, so it is skipped"
-            );
-            continue;
-        }
-        out.push(WireMessage {
-            role: "tool".to_string(),
-            content: Some(content),
-            reasoning_content: None,
-            tool_calls: None,
-            tool_call_id: Some(tool_call_id.to_string()),
-        });
-    }
-}
-
-fn push_assistant(group: &[Block], thinking_enabled: bool, out: &mut Vec<WireMessage>) {
-    let mut text_parts = Vec::new();
-    let mut reasoning_parts = Vec::new();
-    let mut streaming_reasoning_parts = Vec::new();
+fn push_assistant(message: &Message, thinking_enabled: bool, out: &mut Vec<WireMessage>) {
+    let mut text_parts: Vec<&str> = Vec::new();
+    let mut reasoning_parts: Vec<&str> = Vec::new();
     let mut tool_calls = Vec::new();
 
-    for block in group {
-        match block.block_type.as_str() {
-            "text" => text_parts.push(str_field(block, "content").to_string()),
-            "thinking" => reasoning_parts.push(str_field(block, "content").to_string()),
-            "streaming_thinking" => {
-                streaming_reasoning_parts.push(str_field(block, "content").to_string());
+    match &message.content {
+        MessageContent::Text(text) => {
+            if !text.is_empty() {
+                text_parts.push(text);
             }
-            "tool_call" => {
-                let input = str_field(block, "input");
-                let input_value = serde_json::from_str(input)
-                    .unwrap_or_else(|_| Value::String(input.to_string()));
-                tool_calls.push(WireToolCall {
-                    id: str_field(block, "tool_call_id").to_string(),
-                    r#type: "function".to_string(),
-                    function: WireToolCallFunction {
-                        name: str_field(block, "name").to_string(),
-                        arguments: serde_json::to_string(&input_value).unwrap_or_default(),
-                    },
-                });
+        }
+        MessageContent::Parts(parts) => {
+            for part in parts {
+                match part {
+                    ContentPart::Text { text } => text_parts.push(text),
+                    // The sibling field carries the text; this wire has no
+                    // continuity payload of its own to replay.
+                    ContentPart::Reasoning { text, .. } => reasoning_parts.push(text),
+                    ContentPart::ToolUse { id, name, input } => tool_calls.push(WireToolCall {
+                        id: id.clone(),
+                        r#type: "function".to_string(),
+                        function: WireToolCallFunction {
+                            name: name.clone(),
+                            arguments: serde_json::to_string(input).unwrap_or_default(),
+                        },
+                    }),
+                    ContentPart::ToolResult { .. } => {}
+                }
             }
-            _ => {}
         }
     }
 
-    // Finalized reasoning is authoritative. The unfinalized tail is the
-    // fallback when a turn was never finalized — an interrupted stream, or a
-    // conversation from before finalization existed — so the reasoning is still
-    // sent faithfully rather than discarded.
     let reasoning_content = if reasoning_parts.is_empty() {
-        if streaming_reasoning_parts.is_empty() {
-            // The endpoint requires the field whenever reasoning is on, and
-            // there is none for this turn.
-            thinking_enabled.then(String::new)
-        } else {
-            Some(streaming_reasoning_parts.join("\n\n"))
-        }
+        // The endpoint requires the field whenever reasoning is on, and there
+        // is none for this turn: an empty string goes out rather than the
+        // field being omitted.
+        thinking_enabled.then(String::new)
     } else {
         Some(reasoning_parts.join("\n\n"))
     };
 
     // An assistant message is valid only with content or calls. Reasoning is a
-    // rider on those, never a payload of its own: a lone reasoning block would
-    // otherwise become an empty message the endpoint rejects.
+    // rider on those, never a payload of its own: a lone reasoning contribution
+    // would otherwise become an empty message the endpoint rejects.
     if !text_parts.is_empty() || !tool_calls.is_empty() {
         out.push(WireMessage {
             role: "assistant".to_string(),
@@ -616,7 +554,7 @@ impl ProviderModule for KimiModule {
         tokio::spawn(bind::run_http_bind_loop(
             req_rx,
             resp_tx,
-            move |blocks, selector, tools, reasoning| {
+            move |messages, selector, tools, reasoning| {
                 let model = match selector {
                     ModelSelector::Specific(m) => m,
                     ModelSelector::Lightweight => LIGHTWEIGHT_MODEL.into(),
@@ -640,7 +578,7 @@ impl ProviderModule for KimiModule {
                             .with_thinking(thinking)
                             .with_reasoning_effort(effort);
 
-                    Ok(provider.stream_from_blocks(&blocks, model, &tools))
+                    Ok(provider.stream_turn(&messages, model, &tools))
                 }
             },
         ));

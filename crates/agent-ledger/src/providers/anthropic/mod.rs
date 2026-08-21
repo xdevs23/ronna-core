@@ -8,13 +8,11 @@
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use crate::block::Block;
 use crate::store::{StoreError, StoreTx};
 
 use super::bind::{self, OpenedTurn};
 use super::http;
 use super::http_store::{HttpProviderConfig, HttpProviderStore};
-use super::render::blocks_to_messages;
 use super::types::{
     CompletionRequest, ContentPart, LlmError, Message, MessageContent, MessageRole, ModelInfo,
     ModelSelector, OpaquePayload, ProviderRx, ProviderTx, ReasoningCapability, ReasoningLevel,
@@ -218,7 +216,7 @@ impl AnthropicProvider {
 /// is rejected outright with a 400 — the whole turn, for a field nobody chose.
 fn turn_request(
     selector: ModelSelector,
-    blocks: &[Block],
+    messages: Vec<Message>,
     tools: Vec<ToolDefinition>,
     reasoning: Option<ReasoningLevel>,
 ) -> CompletionRequest {
@@ -227,7 +225,7 @@ fn turn_request(
             ModelSelector::Specific(m) => m,
             ModelSelector::Lightweight => LIGHTWEIGHT_MODEL.into(),
         },
-        messages: blocks_to_messages(blocks),
+        messages,
         tools,
         max_tokens: None,
         temperature: None,
@@ -481,9 +479,9 @@ impl ProviderModule for AnthropicModule {
         tokio::spawn(bind::run_http_bind_loop_with_replay(
             req_rx,
             resp_tx,
-            move |blocks, selector, tools, reasoning, include_reasoning_payloads| {
+            move |messages, selector, tools, reasoning, include_reasoning_payloads| {
                 let provider = AnthropicProvider::new(api_key.clone(), base_url.clone());
-                let request = turn_request(selector, &blocks, tools, reasoning);
+                let request = turn_request(selector, messages, tools, reasoning);
                 async move {
                     provider
                         .open_turn(request, include_reasoning_payloads)

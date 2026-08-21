@@ -15,8 +15,8 @@ use crate::event::CoreEvent;
 use crate::store::{Continuation, ModelOverride, StoreError};
 use crate::types::InputBlock;
 
-use super::AgencyCtx;
 use super::ratchet::{self, ConversationLedger, LedgerSource, MetadataLedger, oracle::Oracle};
+use super::{AgencyCtx, BlockKind};
 
 // ─── The parallel-call stall regression ─────────────────────────────────
 
@@ -327,7 +327,9 @@ async fn a_streaming_finalize_costs_one_cursor_write_not_the_ledger_length() {
         .unwrap();
 
     let counting = CountingLedger::new();
-    let outcome = ratchet::drive_ledger(&o.ctx, &counting).await.unwrap();
+    let outcome = ratchet::drive_ledger::<BlockKind, _>(&o.ctx, &counting)
+        .await
+        .unwrap();
     assert_eq!(outcome.cursor, finalized);
     assert_eq!(
         counting.writes(),
@@ -370,7 +372,9 @@ async fn a_vanished_anchor_re_drives_only_the_tail_after_it() {
         .unwrap();
 
     let counting = CountingLedger::new();
-    let outcome = ratchet::drive_ledger(&o.ctx, &counting).await.unwrap();
+    let outcome = ratchet::drive_ledger::<BlockKind, _>(&o.ctx, &counting)
+        .await
+        .unwrap();
     assert_eq!(outcome.cursor, finalized, "the drive caught up to the tail");
     assert_eq!(
         counting.writes(),
@@ -500,7 +504,9 @@ async fn a_cap_committed_during_the_drive_caps_the_frontier() {
     let source = InterruptingLedger {
         reads: AtomicUsize::new(0),
     };
-    let outcome = ratchet::drive_ledger(&o.ctx, &source).await.unwrap();
+    let outcome = ratchet::drive_ledger::<BlockKind, _>(&o.ctx, &source)
+        .await
+        .unwrap();
 
     assert!(
         !outcome.owes_turn,
@@ -940,7 +946,7 @@ async fn title_response(o: &Oracle) -> i64 {
 }
 
 async fn drive_metadata(o: &Oracle) -> ratchet::Outcome {
-    ratchet::drive_ledger(&o.ctx, &MetadataLedger)
+    ratchet::drive_ledger::<BlockKind, _>(&o.ctx, &MetadataLedger)
         .await
         .unwrap()
 }

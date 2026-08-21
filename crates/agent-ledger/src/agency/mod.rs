@@ -13,6 +13,7 @@
 //! than one wider trait because they evolve independently: the approval blocks
 //! are orchestration-loud and model-invisible.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -107,11 +108,18 @@ pub struct AgencyCtx<E> {
 
 /// One trait, implemented by every block kind, all hooks defaulting inert.
 ///
-/// The hooks are native `async fn` with static dispatch — nothing is boxed and
-/// nothing is `dyn`. That is deliberate: an object-safe form would force every
-/// hook to return a boxed future, and the whole reason behavior lives on the
-/// kind is that the compiler can check it.
-#[allow(async_fn_in_trait)]
+/// The hooks dispatch statically — nothing is boxed and nothing is `dyn`.
+/// That is deliberate: an object-safe form would force every hook to return a
+/// boxed future, and the whole reason behavior lives on the kind is that the
+/// compiler can check it.
+///
+/// The async hooks are declared `fn … -> impl Future<Output = …> + Send`
+/// rather than native `async fn`, and the `Send` is the point: the machinery
+/// awaits these hooks inside spawned tasks, and a native `async fn`'s future
+/// has no nameable Send-ness from a bound on the implementor. Implementors
+/// keep writing native `async fn` in their impl blocks; the futures those
+/// desugar to MUST be `Send` — inherent to a multi-threaded runtime, and the
+/// implementor's obligation, checked by the compiler at the impl.
 pub trait Agency {
     /// Who owes the next move, by this block's nature. Default: no ask.
     fn awaiting(&self) -> Option<Awaiting> {
@@ -147,8 +155,11 @@ pub trait Agency {
     /// ([`tools`](crate::tools)), which owns the tool registry. This hook
     /// exists for blocks whose vetting is answerable from the store and the bus
     /// alone.
-    async fn gate<E: RuntimeEvent>(&self, _ctx: &AgencyCtx<E>) -> GateDecision {
-        GateDecision::Proceed
+    fn gate<E: RuntimeEvent>(
+        &self,
+        _ctx: &AgencyCtx<E>,
+    ) -> impl Future<Output = GateDecision> + Send {
+        async { GateDecision::Proceed }
     }
 
     /// Do this block's OWN work and report doneness.
@@ -162,8 +173,11 @@ pub trait Agency {
     /// # Errors
     ///
     /// If the block's own work fails. The drive parks rather than advancing.
-    async fn run<E: RuntimeEvent>(&self, _ctx: &AgencyCtx<E>) -> Result<bool, StoreError> {
-        Ok(true)
+    fn run<E: RuntimeEvent>(
+        &self,
+        _ctx: &AgencyCtx<E>,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        async { Ok(true) }
     }
 
     /// Deferred-work routing: the block id to route the redispatch walk to
@@ -182,10 +196,44 @@ pub trait Agency {
     /// # Errors
     ///
     /// If the deferred work fails.
-    async fn run_post_gate<E: RuntimeEvent>(&self, _ctx: &AgencyCtx<E>) -> Result<(), StoreError> {
-        Ok(())
+    fn run_post_gate<E: RuntimeEvent>(
+        &self,
+        _ctx: &AgencyCtx<E>,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        async { Ok(()) }
     }
 }
+
+/// How a stored row becomes a typed kind — the parse half of the kind
+/// contract, beside the behavior half ([`Agency`]) and the representation half
+/// ([`Projection`]).
+///
+/// Implemented by the composing types the machinery is instantiated over:
+/// [`BlockKind`] for the library's own kinds, and a consumer's composing enum,
+/// whose parse tries its own kinds and delegates anything unrecognised down to
+/// the inner implementor — so the library's kinds resolve through the library
+/// and only a genuinely unknown type reaches the inert fallback. The
+/// implementation is the ONE place per implementor a stored type string is
+/// compared to a literal.
+pub trait FromBlock {
+    /// Resolve a stored row to its typed kind. Total: an unrecognised type
+    /// resolves to the implementor's inert fallback, never an error — an old
+    /// build reading a newer ledger fails safe instead of misinterpreting it.
+    fn from_block(block: &Block) -> Self;
+}
+
+/// What the machinery requires of the kind it is instantiated over: behavior,
+/// representation, parse, and futures that can cross a task boundary.
+///
+/// A name for a bound, not a second kind of kind — the same statement
+/// [`RuntimeEvent`] makes for the event type. Every generic seam of the
+/// runtime takes `K: RuntimeKind`; writing the five bounds out at each of
+/// those sites is the same statement made repeatedly, and a statement made
+/// repeatedly is one that drifts. The blanket implementation means an
+/// implementor of the three traits qualifies with nothing further to write.
+pub trait RuntimeKind: Agency + Projection + FromBlock + Send + Sync + 'static {}
+
+impl<K: Agency + Projection + FromBlock + Send + Sync + 'static> RuntimeKind for K {}
 
 /// The typed block layer: one variant per stored block type, each carrying what
 /// its agency reads.
@@ -236,15 +284,14 @@ pub enum BlockKind {
     Unknown(Unknown),
 }
 
-impl BlockKind {
+impl FromBlock for BlockKind {
     /// Resolve a stored row to its typed kind.
     ///
-    /// This is the ONE place a stored type string is compared to a literal.
-    /// Every other comparison would be a second table of type names, and two
-    /// tables of the same names is how a kind ends up behaving one way in the
-    /// drive and another way in a query.
-    #[must_use]
-    pub fn from_block(block: &Block) -> Self {
+    /// This is the ONE place in the library a stored type string is compared
+    /// to a literal. Every other comparison would be a second table of type
+    /// names, and two tables of the same names is how a kind ends up behaving
+    /// one way in the drive and another way in a query.
+    fn from_block(block: &Block) -> Self {
         match block.block_type.as_str() {
             "text" => Self::Text(Text::parse(block)),
             "quote" => Self::Quote(Quote::parse(block)),

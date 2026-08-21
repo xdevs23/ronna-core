@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use crate::agency::AgencyCtx;
+use crate::agency::{AgencyCtx, RuntimeKind};
 use crate::bus::RuntimeEvent;
 use crate::event::CoreEvent;
 use crate::providers::types::{
@@ -37,9 +37,9 @@ use super::actor::RuntimeContext;
 /// `generation` is the binding identity the actor assigned at this bind. The
 /// reader stamps it on every stream-lifecycle signal it emits, so the actor
 /// can ignore a signal from a reader it already tore down.
-pub(crate) fn spawn_channel<E: RuntimeEvent>(
+pub(crate) fn spawn_channel<K: RuntimeKind, E: RuntimeEvent>(
     conv_id: i64,
-    ctx: RuntimeContext<E>,
+    ctx: RuntimeContext<K, E>,
     provider_rx: ProviderRx,
     latched: ReadSignal<bool>,
     generation: u64,
@@ -84,9 +84,9 @@ enum TailFinalization {
 
 /// The reader itself: the hook context, the runner whose insert seam
 /// finalizes tool calls, the latch, and the turn's trackers.
-struct ChannelReader<E> {
+struct ChannelReader<K: RuntimeKind, E> {
     ctx: AgencyCtx<E>,
-    runner: Arc<ToolRunner<E>>,
+    runner: Arc<ToolRunner<K, E>>,
     latched: ReadSignal<bool>,
     trackers: TurnTrackers,
     /// A turn is open: something arrived since the last `Done`. What makes the
@@ -101,9 +101,9 @@ struct ChannelReader<E> {
     generation: u64,
 }
 
-async fn run_channel<E: RuntimeEvent>(
+async fn run_channel<K: RuntimeKind, E: RuntimeEvent>(
     conv_id: i64,
-    ctx: RuntimeContext<E>,
+    ctx: RuntimeContext<K, E>,
     mut provider_rx: ProviderRx,
     latched: ReadSignal<bool>,
     generation: u64,
@@ -148,7 +148,7 @@ async fn run_channel<E: RuntimeEvent>(
     tracing::info!(conversation_id = conv_id, "ingestion stopped");
 }
 
-impl<E: RuntimeEvent> ChannelReader<E> {
+impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
     async fn handle_response(&mut self, response: ProviderResponse) {
         let conv_id = self.ctx.conversation_id;
         if !matches!(response, ProviderResponse::Done) {
@@ -911,6 +911,7 @@ impl<E: RuntimeEvent> ChannelReader<E> {
 mod tests {
     use std::sync::Arc;
 
+    use crate::agency::BlockKind;
     use crate::block::OpaquePayload;
     use crate::bus::EventBus;
     use crate::providers::Usage;
@@ -941,7 +942,9 @@ mod tests {
         let (latched, _write_latched) = create_signal(latched);
         let mut reader = ChannelReader {
             ctx: ctx.clone(),
-            runner: Arc::new(ToolRunner::new(Arc::new(ToolRegistry::new()))),
+            runner: Arc::new(ToolRunner::<BlockKind, _>::new(Arc::new(
+                ToolRegistry::new(),
+            ))),
             latched,
             trackers: TurnTrackers::default(),
             mid_turn: false,
@@ -1842,7 +1845,9 @@ mod tests {
             0,
             "an unterminated lifecycle never finalizes"
         );
-        let outcome = crate::agency::ratchet::drive(&ctx).await.unwrap();
+        let outcome = crate::agency::ratchet::drive::<crate::agency::BlockKind, _>(&ctx)
+            .await
+            .unwrap();
         assert!(outcome.owes_turn, "the frontier stays owed after the sweep");
     }
 
@@ -1880,14 +1885,16 @@ mod tests {
     fn bare_reader(
         ctx: &AgencyCtx<CoreEvent>,
     ) -> (
-        ChannelReader<CoreEvent>,
+        ChannelReader<BlockKind, CoreEvent>,
         crate::reactivity::WriteSignal<bool>,
     ) {
         let (latched, write_latched) = create_signal(false);
         (
             ChannelReader {
                 ctx: ctx.clone(),
-                runner: Arc::new(ToolRunner::new(Arc::new(ToolRegistry::new()))),
+                runner: Arc::new(ToolRunner::<BlockKind, _>::new(Arc::new(
+                    ToolRegistry::new(),
+                ))),
                 latched,
                 trackers: TurnTrackers::default(),
                 mid_turn: false,
@@ -2229,7 +2236,7 @@ mod tests {
     #[tokio::test]
     async fn provider_error_then_close_emits_no_second_stream_end() {
         let (ctx, mut rx) = fixture().await;
-        let runtime = RuntimeContext::new(
+        let runtime: RuntimeContext<BlockKind, CoreEvent> = RuntimeContext::new(
             ctx.store.clone(),
             Arc::clone(&ctx.bus),
             Arc::new(crate::providers::ProviderRegistry::new()),

@@ -6,6 +6,7 @@ use serde_json::json;
 use super::*;
 use crate::block::{Block, Role};
 use crate::providers::chat::sse::parse_sse_chunk;
+use crate::providers::render::blocks_to_messages;
 use crate::providers::types::ReasoningDetailEntry;
 
 /// The decoder fixtures run through the FULL base parser, so the shared
@@ -289,7 +290,7 @@ mod replay {
         let provider = mistral_provider("test-key".into(), None);
         let request = CompletionRequest {
             model: "mistral-medium-3-5".into(),
-            messages: blocks_to_messages(&blocks_with_payload(payload)),
+            messages: blocks_to_messages::<crate::agency::BlockKind>(&blocks_with_payload(payload)),
             tools: vec![],
             max_tokens: None,
             temperature: None,

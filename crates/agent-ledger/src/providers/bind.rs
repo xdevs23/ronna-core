@@ -23,12 +23,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::block::Block;
-
 use super::http;
 use super::types::{
-    EventStream, LlmError, ModelSelector, ProviderRequest, ProviderResponse, ReasoningLevel,
-    StreamEvent, ToolDefinition,
+    EventStream, LlmError, Message, ModelSelector, ProviderRequest, ProviderResponse,
+    ReasoningLevel, StreamEvent, ToolDefinition,
 };
 
 /// The application-level idle window for a streaming connection. If no event
@@ -221,7 +219,7 @@ pub async fn run_http_bind_loop<F, Fut>(
     resp_tx: UnboundedSender<ProviderResponse>,
     open_stream: F,
 ) where
-    F: Fn(Vec<Block>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>) -> Fut
+    F: Fn(Vec<Message>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>) -> Fut
         + Send
         + Sync
         + 'static,
@@ -230,8 +228,8 @@ pub async fn run_http_bind_loop<F, Fut>(
     run_http_bind_loop_with_replay(
         req_rx,
         resp_tx,
-        move |blocks, model, tools, reasoning, _include_reasoning_payloads| {
-            let events = open_stream(blocks, model, tools, reasoning);
+        move |messages, model, tools, reasoning, _include_reasoning_payloads| {
+            let events = open_stream(messages, model, tools, reasoning);
             async move {
                 Ok(OpenedTurn {
                     events: events.await?,
@@ -260,7 +258,7 @@ pub async fn run_http_bind_loop_with_replay<F, Fut>(
     resp_tx: UnboundedSender<ProviderResponse>,
     open_stream: F,
 ) where
-    F: Fn(Vec<Block>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>, bool) -> Fut
+    F: Fn(Vec<Message>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>, bool) -> Fut
         + Send
         + Sync
         + 'static,
@@ -272,7 +270,7 @@ pub async fn run_http_bind_loop_with_replay<F, Fut>(
     while let Some(req) = req_rx.recv().await {
         match req {
             ProviderRequest::Stream {
-                blocks,
+                messages,
                 model,
                 tools,
                 reasoning,
@@ -292,7 +290,7 @@ pub async fn run_http_bind_loop_with_replay<F, Fut>(
                     resp_tx.clone(),
                     token,
                     TurnRequest {
-                        blocks,
+                        messages,
                         model,
                         tools,
                         reasoning,
@@ -325,7 +323,7 @@ pub async fn run_http_bind_loop_with_replay<F, Fut>(
 /// use the SAME ones — a reconnect that rebuilt them from anything live would
 /// silently change the request mid-turn.
 struct TurnRequest {
-    blocks: Vec<Block>,
+    messages: Vec<Message>,
     model: ModelSelector,
     tools: Vec<ToolDefinition>,
     reasoning: Option<ReasoningLevel>,
@@ -375,7 +373,7 @@ async fn run_stream_cycle<F, Fut>(
     token: CancellationToken,
     turn: TurnRequest,
 ) where
-    F: Fn(Vec<Block>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>, bool) -> Fut
+    F: Fn(Vec<Message>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>, bool) -> Fut
         + Send
         + Sync,
     Fut: Future<Output = Result<OpenedTurn, LlmError>> + Send,
@@ -487,7 +485,7 @@ async fn run_stream_cycle<F, Fut>(
                     () = tokio::time::sleep(Duration::from_secs(reconnect_backoff)) => {}
                 }
                 reconnect_backoff = (reconnect_backoff * 2).min(MAX_BACKOFF_SECS);
-                // Loop back to Opening: the SAME turn, same blocks and tools.
+                // Loop back to Opening: the SAME turn, same messages and tools.
             }
         }
     }
@@ -567,14 +565,14 @@ async fn open_with_rate_limit_retry<F, Fut>(
     budget: &mut RateLimitBudget,
 ) -> Option<Result<OpenedTurn, LlmError>>
 where
-    F: Fn(Vec<Block>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>, bool) -> Fut
+    F: Fn(Vec<Message>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>, bool) -> Fut
         + Send
         + Sync,
     Fut: Future<Output = Result<OpenedTurn, LlmError>> + Send,
 {
     loop {
         let opened = open_stream(
-            turn.blocks.clone(),
+            turn.messages.clone(),
             turn.model.clone(),
             turn.tools.clone(),
             turn.reasoning,

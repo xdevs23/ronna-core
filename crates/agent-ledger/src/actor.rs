@@ -45,7 +45,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::agency::{AgencyCtx, ratchet, redispatch};
+use crate::agency::{AgencyCtx, RuntimeKind, ratchet, redispatch};
 use crate::bus::{EventBus, RuntimeEvent};
 use crate::event::{AsCoreEvent, CoreEvent};
 use crate::providers::types::ReasoningLevel;
@@ -72,14 +72,21 @@ use crate::types::{ApprovalChoice, InputBlock};
 /// hands in. It is derived state rather than a fifth collaborator: one runner
 /// per context keeps the in-flight guard process-wide, and a consumer that
 /// could hand in its own runner could hand in two.
-pub struct RuntimeContext<E> {
+///
+/// `K` is the kind the runtime is instantiated over and `E` the consumer's
+/// event type; the library's own instantiation names
+/// [`BlockKind`](crate::agency::BlockKind) for `K`. The [`RuntimeKind`] bound
+/// lives HERE, where `K` is introduced: a kind missing one of the runtime's
+/// halves errors at the context a consumer builds, not at a distant seam, and
+/// every seam that names this type is compiler-forced to agree with it.
+pub struct RuntimeContext<K: RuntimeKind, E> {
     store: Store,
     bus: Arc<EventBus<E>>,
     providers: Arc<ProviderRegistry>,
-    runner: Arc<ToolRunner<E>>,
+    runner: Arc<ToolRunner<K, E>>,
 }
 
-impl<E> Clone for RuntimeContext<E> {
+impl<K: RuntimeKind, E> Clone for RuntimeContext<K, E> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
@@ -90,7 +97,7 @@ impl<E> Clone for RuntimeContext<E> {
     }
 }
 
-impl<E> RuntimeContext<E> {
+impl<K: RuntimeKind, E> RuntimeContext<K, E> {
     /// Bundle the runtime's collaborators. The tool registry is taken as the
     /// registry — the runner over it is built here, so there is exactly one.
     #[must_use]
@@ -128,7 +135,7 @@ impl<E> RuntimeContext<E> {
 
     /// The one tool runner over the consumer's registry.
     #[must_use]
-    pub fn runner(&self) -> &Arc<ToolRunner<E>> {
+    pub fn runner(&self) -> &Arc<ToolRunner<K, E>> {
         &self.runner
     }
 
@@ -154,8 +161,8 @@ impl<E> RuntimeContext<E> {
 /// Mailboxes carry [`CoreEvent`]: the reactor extracts the runtime's view of
 /// each bus event once, at the routing site, so no actor ever sees a
 /// consumer's own variants.
-trait PerConversationActor<E> {
-    fn spawn(id: i64, ctx: RuntimeContext<E>) -> tokio::sync::mpsc::UnboundedSender<CoreEvent>;
+trait PerConversationActor<K: RuntimeKind, E> {
+    fn spawn(id: i64, ctx: RuntimeContext<K, E>) -> tokio::sync::mpsc::UnboundedSender<CoreEvent>;
     fn accepts(event: &CoreEvent) -> bool;
 }
 
@@ -180,14 +187,14 @@ struct ActorEntry {
 /// conversation.
 macro_rules! register_actors {
     ($($actor:ident),* $(,)?) => {
-        fn spawn_actor_set<E: RuntimeEvent + AsCoreEvent>(
+        fn spawn_actor_set<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent>(
             id: i64,
-            ctx: &RuntimeContext<E>,
+            ctx: &RuntimeContext<K, E>,
         ) -> Vec<ActorEntry> {
             vec![$(
                 ActorEntry {
-                    tx: <$actor<E> as PerConversationActor<E>>::spawn(id, ctx.clone()),
-                    accepts: <$actor<E> as PerConversationActor<E>>::accepts,
+                    tx: <$actor<K, E> as PerConversationActor<K, E>>::spawn(id, ctx.clone()),
+                    accepts: <$actor<K, E> as PerConversationActor<K, E>>::accepts,
                 },
             )*]
         }
@@ -204,9 +211,9 @@ macro_rules! register_actors {
 /// `blocks_ready` when the frontier gate owes a model turn; the actor reads
 /// the ledger, sends [`ProviderRequest::Stream`], and the ingestion reader
 /// handles responses.
-struct ConversationActor<E> {
+struct ConversationActor<K: RuntimeKind, E> {
     id: i64,
-    ctx: RuntimeContext<E>,
+    ctx: RuntimeContext<K, E>,
     mailbox: tokio::sync::mpsc::UnboundedReceiver<CoreEvent>,
     write_latched: WriteSignal<bool>,
     read_latched: ReadSignal<bool>,
@@ -222,7 +229,7 @@ struct ConversationActor<E> {
     stream_generation: u64,
 }
 
-impl<E: RuntimeEvent + AsCoreEvent> ConversationActor<E> {
+impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     async fn run(mut self) {
         tracing::info!(conversation_id = self.id, "conversation actor started");
         loop {
@@ -596,8 +603,15 @@ impl<E: RuntimeEvent + AsCoreEvent> ConversationActor<E> {
         // the turn.
         let reasoning = conv.reasoning.as_deref().and_then(ReasoningLevel::from_key);
 
+        // The projection fold runs HERE, on the caller's side of the provider
+        // boundary: the channel carries neutral messages, never blocks, so no
+        // vendor ever parses a kind — a consumer kind's visibility to the
+        // model is its own `Projection` impl's answer, made before any vendor
+        // is involved.
+        let messages = crate::providers::blocks_to_messages::<K>(&blocks);
+
         if let Err(e) = provider_tx.send(ProviderRequest::Stream {
-            blocks,
+            messages,
             model: ModelSelector::Specific(conv.model.external_id),
             tools: tool_defs,
             reasoning,
@@ -726,7 +740,7 @@ fn settle_stream_end(streaming: &mut bool, latch: &WriteSignal<bool>, errored: b
 /// but is ungated by the model-turn axis, so deferred work resumes even when
 /// no turn is owed. Returns the drive's Outcome for the state broadcaster to
 /// consume; `None` when nothing was driven.
-pub(crate) async fn scheduler_tick<E: RuntimeEvent>(
+pub(crate) async fn scheduler_tick<K: RuntimeKind, E: RuntimeEvent>(
     ctx: &AgencyCtx<E>,
     latched: bool,
     blocks_ready: &tokio::sync::mpsc::UnboundedSender<()>,
@@ -734,7 +748,7 @@ pub(crate) async fn scheduler_tick<E: RuntimeEvent>(
     if latched {
         return None;
     }
-    let outcome = match ratchet::drive(ctx).await {
+    let outcome = match ratchet::drive::<K, E>(ctx).await {
         Ok(outcome) => {
             tracing::debug!(
                 conversation_id = ctx.conversation_id,
@@ -751,7 +765,7 @@ pub(crate) async fn scheduler_tick<E: RuntimeEvent>(
             None
         }
     };
-    if let Err(e) = redispatch::walk(ctx).await {
+    if let Err(e) = redispatch::walk::<K, E>(ctx).await {
         tracing::error!(conversation_id = ctx.conversation_id, error = %e, "scheduler: redispatch walk failed");
     }
     outcome
@@ -776,9 +790,9 @@ pub(crate) async fn scheduler_tick<E: RuntimeEvent>(
 /// filter would need this loop to know which table columns are "orchestration"
 /// and which are "content", a distinction nothing else in the machinery draws,
 /// and the first new column would silently fall on the wrong side of it.
-async fn run_scheduler<E: RuntimeEvent>(
+async fn run_scheduler<K: RuntimeKind, E: RuntimeEvent>(
     conv_id: i64,
-    ctx: RuntimeContext<E>,
+    ctx: RuntimeContext<K, E>,
     read_latched: ReadSignal<bool>,
     blocks_ready: tokio::sync::mpsc::UnboundedSender<()>,
     write_outcome: WriteSignal<Option<ratchet::Outcome>>,
@@ -790,7 +804,7 @@ async fn run_scheduler<E: RuntimeEvent>(
         let latched = read_latched.get();
         db_changes.react();
 
-        if let Some(outcome) = scheduler_tick(&agency, latched, &blocks_ready).await {
+        if let Some(outcome) = scheduler_tick::<K, E>(&agency, latched, &blocks_ready).await {
             write_outcome.set_if_changed(Some(outcome));
         }
     }
@@ -802,9 +816,9 @@ async fn run_scheduler<E: RuntimeEvent>(
 /// `work_due` = the frontier owes a turn or the cursor is parked; a latched
 /// conversation is not driven, so `work_due` holds the last unlatched
 /// derivation — false until the first drive.
-async fn run_state_broadcaster<E: RuntimeEvent>(
+async fn run_state_broadcaster<K: RuntimeKind, E: RuntimeEvent>(
     conv_id: i64,
-    ctx: RuntimeContext<E>,
+    ctx: RuntimeContext<K, E>,
     read_latched: ReadSignal<bool>,
     read_outcome: ReadSignal<Option<ratchet::Outcome>>,
 ) {
@@ -832,9 +846,9 @@ async fn run_state_broadcaster<E: RuntimeEvent>(
 /// plus whatever per-conversation loops the registered handlers ask for
 /// through [`crate::tools::ToolHandler::spawn_reactor`]. Returns handles so
 /// the caller can abort on shutdown.
-fn spawn_tool_pipeline<E: RuntimeEvent + AsCoreEvent>(
+fn spawn_tool_pipeline<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent>(
     conv_id: i64,
-    ctx: &RuntimeContext<E>,
+    ctx: &RuntimeContext<K, E>,
     latched: &ReadSignal<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     // Subscribed here, before the spawn, so no wakeup can slip between the
@@ -872,9 +886,9 @@ fn spawn_tool_pipeline<E: RuntimeEvent + AsCoreEvent>(
 /// returned to the actor really do end the pipeline, bodies included. The set
 /// adds NO concurrency bound: every admitted wakeup still spawns immediately;
 /// settled bodies are merely reaped so the set holds only in-flight ones.
-async fn run_executor<E: RuntimeEvent + AsCoreEvent>(
+async fn run_executor<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent>(
     conv_id: i64,
-    ctx: RuntimeContext<E>,
+    ctx: RuntimeContext<K, E>,
     latched: ReadSignal<bool>,
     mut rx: tokio::sync::broadcast::Receiver<E>,
 ) {
@@ -915,8 +929,10 @@ async fn run_executor<E: RuntimeEvent + AsCoreEvent>(
 
 // ─── Spawning one conversation's actor set ───────────────────────────────────
 
-impl<E: RuntimeEvent + AsCoreEvent> PerConversationActor<E> for ConversationActor<E> {
-    fn spawn(id: i64, ctx: RuntimeContext<E>) -> tokio::sync::mpsc::UnboundedSender<CoreEvent> {
+impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> PerConversationActor<K, E>
+    for ConversationActor<K, E>
+{
+    fn spawn(id: i64, ctx: RuntimeContext<K, E>) -> tokio::sync::mpsc::UnboundedSender<CoreEvent> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         // Boot-latched: nothing drives a conversation until an explicit intent
         // (an append, a promotion, an unlatch) releases it, so a process
@@ -999,7 +1015,7 @@ register_actors![ConversationActor];
 /// [`CoreEvent::BlocksAppended`], an interrupt is a
 /// [`CoreEvent::InterruptRequested`], and so on. There is no second control
 /// surface.
-pub fn spawn_reactor<E: RuntimeEvent + AsCoreEvent>(ctx: RuntimeContext<E>) {
+pub fn spawn_reactor<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent>(ctx: RuntimeContext<K, E>) {
     let mut rx = ctx.bus.subscribe();
     let watcher_ctx = ctx.clone();
 
@@ -1034,7 +1050,7 @@ pub fn spawn_reactor<E: RuntimeEvent + AsCoreEvent>(ctx: RuntimeContext<E>) {
 /// Conversations watcher — emits [`CoreEvent::ConversationsChanged`] when the
 /// `conversations` table mutates. A consumer uses this as a single trigger to
 /// refetch its conversation list; no per-row payload needed.
-fn spawn_conversations_watcher<E: RuntimeEvent>(ctx: &RuntimeContext<E>) {
+fn spawn_conversations_watcher<K: RuntimeKind, E: RuntimeEvent>(ctx: &RuntimeContext<K, E>) {
     let db_changes = ctx.store.changes.consumer();
     let bus = Arc::clone(&ctx.bus);
 
@@ -1056,7 +1072,7 @@ fn spawn_conversations_watcher<E: RuntimeEvent>(ctx: &RuntimeContext<E>) {
 /// descriptors contributed by the kind itself. Until then it names the tables
 /// whose rows a consumer re-renders live — the header, the junction, and the
 /// content of the kinds that stream or resolve.
-fn spawn_block_watcher<E: RuntimeEvent>(ctx: &RuntimeContext<E>) {
+fn spawn_block_watcher<K: RuntimeKind, E: RuntimeEvent>(ctx: &RuntimeContext<K, E>) {
     let db_changes = ctx.store.changes.consumer();
     let store = ctx.store.clone();
     let bus = Arc::clone(&ctx.bus);
@@ -1129,8 +1145,8 @@ fn spawn_block_watcher<E: RuntimeEvent>(ctx: &RuntimeContext<E>) {
 /// Conversation-scoped events are dispatched by conversation id. Global
 /// events (`conversation_id() == None`) are broadcast to all actor sets.
 /// Within each set, events are filtered through each actor's `accepts` gate.
-fn route_event<E: RuntimeEvent + AsCoreEvent>(
-    ctx: &RuntimeContext<E>,
+fn route_event<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent>(
+    ctx: &RuntimeContext<K, E>,
     routes: &mut HashMap<i64, Vec<ActorEntry>>,
     event: &CoreEvent,
 ) {
@@ -1169,11 +1185,13 @@ mod tests {
 
     use serde_json::{Value, json};
 
+    use crate::agency::BlockKind;
     use crate::agency::ratchet::oracle::Oracle;
     use crate::block::Block;
     use crate::providers::types::ToolDefinition;
     use crate::providers::{
-        BoxFuture, LlmError, ModelInfo, ProviderModule, ProviderResponse, ProviderRx, StreamEvent,
+        BoxFuture, ContentPart, LlmError, Message, MessageContent, ModelInfo, ProviderModule,
+        ProviderResponse, ProviderRx, StreamEvent,
     };
     use crate::store::{ProviderInstance, StoreError};
     use crate::tools::{ToolContext, ToolHandler, ToolOutcome};
@@ -1188,7 +1206,10 @@ mod tests {
         o.call("c1").await;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        assert_eq!(scheduler_tick(&o.ctx, true, &tx).await, None);
+        assert_eq!(
+            scheduler_tick::<BlockKind, _>(&o.ctx, true, &tx).await,
+            None
+        );
 
         assert!(rx.try_recv().is_err(), "no blocks_ready while latched");
         o.expect_silence(); // ratchet not invoked — no wakeup emitted
@@ -1201,7 +1222,9 @@ mod tests {
         let user = o.user_text("hi").await;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let outcome = scheduler_tick(&o.ctx, false, &tx).await.unwrap();
+        let outcome = scheduler_tick::<BlockKind, _>(&o.ctx, false, &tx)
+            .await
+            .unwrap();
         assert!(outcome.owes_turn);
         assert_eq!(outcome.cursor, user);
         assert!(rx.try_recv().is_ok(), "the gate firing signals the actor");
@@ -1215,7 +1238,9 @@ mod tests {
         let call = o.call("c1").await;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let outcome = scheduler_tick(&o.ctx, false, &tx).await.unwrap();
+        let outcome = scheduler_tick::<BlockKind, _>(&o.ctx, false, &tx)
+            .await
+            .unwrap();
         assert!(outcome.parked);
         assert!(!outcome.owes_turn);
         assert!(
@@ -1234,11 +1259,16 @@ mod tests {
         let user = o.user_text("hi").await;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        assert_eq!(scheduler_tick(&o.ctx, true, &tx).await, None);
+        assert_eq!(
+            scheduler_tick::<BlockKind, _>(&o.ctx, true, &tx).await,
+            None
+        );
         assert!(rx.try_recv().is_err());
         assert_eq!(o.cursor().await, 0, "the latched tick appended nothing");
 
-        let outcome = scheduler_tick(&o.ctx, false, &tx).await.unwrap();
+        let outcome = scheduler_tick::<BlockKind, _>(&o.ctx, false, &tx)
+            .await
+            .unwrap();
         assert!(outcome.owes_turn, "one unlatched tick resumes");
         assert_eq!(outcome.cursor, user);
         assert!(rx.try_recv().is_ok());
@@ -1253,7 +1283,8 @@ mod tests {
         let mut o = Oracle::new().await;
         o.user_text("go").await;
 
-        let runner: ToolRunner<CoreEvent> = ToolRunner::new(Arc::new(ToolRegistry::new()));
+        let runner: ToolRunner<BlockKind, CoreEvent> =
+            ToolRunner::new(Arc::new(ToolRegistry::new()));
         let block_id = runner
             .insert_call(
                 &o.ctx,
@@ -1315,7 +1346,9 @@ mod tests {
         // The confirming tick: the drive advances the cursor onto the user
         // block, and persisting it announces a `conversations` change — the
         // wake that costs the extra tick.
-        let confirmed = scheduler_tick(&o.ctx, false, &tx).await.unwrap();
+        let confirmed = scheduler_tick::<BlockKind, _>(&o.ctx, false, &tx)
+            .await
+            .unwrap();
         assert_eq!(confirmed.cursor, user);
         assert!(
             changes
@@ -1330,7 +1363,9 @@ mod tests {
         // change announced, so nothing wakes the loop again and it rests.
         // (It re-signals the still-owed turn; the actor's streaming flag is
         // what dedupes that, which the double-turn test below proves.)
-        let echo = scheduler_tick(&o.ctx, false, &tx).await.unwrap();
+        let echo = scheduler_tick::<BlockKind, _>(&o.ctx, false, &tx)
+            .await
+            .unwrap();
         assert_eq!(echo, confirmed, "the extra tick changes nothing");
         assert!(
             changes
@@ -1385,38 +1420,39 @@ mod tests {
     fn slow_teardown_turn(
         turn: usize,
         resp_tx: &tokio::sync::mpsc::UnboundedSender<ProviderResponse>,
-    ) {
+    ) -> Scripted {
         let message_end = StreamEvent::MessageEnd {
             usage: crate::providers::Usage::default(),
             stop_reason: StopReason::EndTurn,
         };
         match turn {
             // The stall: no `Done` ever comes — torn down by the interrupt.
-            1 => {
-                let _ = resp_tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
-                    text: "half-".into(),
-                }));
-            }
+            1 => Scripted::Events(vec![StreamEvent::TextDelta {
+                text: "half-".into(),
+            }]),
             // The successor turn stays LIVE past the torn-down reader's late
             // close: its `MessageEnd` arrives from a side task, so the
             // provider task keeps serving — a spurious concurrent request
-            // must be counted, not queued behind a sleep.
+            // must be counted, not queued behind a sleep. The delayed send is
+            // the one answer `Scripted`'s ordered event list cannot express —
+            // this arm pins timing, not order — so the end alone rides a task
+            // of its own while the delta goes through the harness.
             2 => {
-                let _ = resp_tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
-                    text: "recovered".into(),
-                }));
                 let resp_tx = resp_tx.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(SLOW_TURN_END).await;
                     let _ = resp_tx.send(ProviderResponse::Event(message_end));
                 });
+                Scripted::Events(vec![StreamEvent::TextDelta {
+                    text: "recovered".into(),
+                }])
             }
-            _ => {
-                let _ = resp_tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
+            _ => Scripted::Events(vec![
+                StreamEvent::TextDelta {
                     text: "clean".into(),
-                }));
-                let _ = resp_tx.send(ProviderResponse::Event(message_end));
-            }
+                },
+                message_end,
+            ]),
         }
     }
 
@@ -1427,9 +1463,38 @@ mod tests {
     struct ScriptedProvider {
         script: Script,
         requests: Arc<AtomicUsize>,
-        /// The block-type shape of every request received, for diagnostics:
+        /// The message shape of every request received, for diagnostics:
         /// a spurious request is only debuggable by what it carried.
         shapes: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    /// Whether the request's messages already carry an answered call — the
+    /// scripted ledger-content cue for serving the closing prose.
+    fn carries_tool_result(messages: &[Message]) -> bool {
+        messages.iter().any(|m| {
+            matches!(&m.content, MessageContent::Parts(parts)
+                if parts.iter().any(|p| matches!(p, ContentPart::ToolResult { .. })))
+        })
+    }
+
+    /// One message's compact descriptor for those diagnostics: its role, and
+    /// either the text mode or the part tags in order.
+    fn message_shape(message: &Message) -> String {
+        match &message.content {
+            MessageContent::Text(_) => format!("{:?}:text", message.role),
+            MessageContent::Parts(parts) => {
+                let tags: Vec<&str> = parts
+                    .iter()
+                    .map(|part| match part {
+                        ContentPart::Text { .. } => "text",
+                        ContentPart::Reasoning { .. } => "reasoning",
+                        ContentPart::ToolUse { .. } => "tool_use",
+                        ContentPart::ToolResult { .. } => "tool_result",
+                    })
+                    .collect();
+                format!("{:?}:[{}]", message.role, tags.join(","))
+            }
+        }
     }
 
     impl ProviderModule for ScriptedProvider {
@@ -1481,7 +1546,10 @@ mod tests {
             let shapes = Arc::clone(&self.shapes);
             tokio::spawn(async move {
                 while let Some(request) = req_rx.recv().await {
-                    let ProviderRequest::Stream { blocks, tools, .. } = request else {
+                    let ProviderRequest::Stream {
+                        messages, tools, ..
+                    } = request
+                    else {
                         // The Interrupt lands here. A real provider does not
                         // vanish on it instantly — `SlowTeardown` winds down
                         // for a beat first, so the reader's channel-close exit
@@ -1505,96 +1573,111 @@ mod tests {
                     shapes
                         .lock()
                         .unwrap()
-                        .push(blocks.iter().map(|b| b.block_type.clone()).collect());
+                        .push(messages.iter().map(message_shape).collect());
                     let turn = requests.fetch_add(1, Ordering::SeqCst) + 1;
                     // Scripted by ledger content, not arrival order: a turn
-                    // whose ledger already carries the answered call gets the
+                    // whose messages already carry the answered call gets the
                     // closing prose, the opening turn gets the call.
-                    let answered = blocks.iter().any(|b| b.block_type == "tool_result");
-                    let events: Vec<StreamEvent> = match (script, answered) {
-                        (Script::CountOnly, _) => continue,
-                        (Script::SlowTeardown, _) => {
-                            slow_teardown_turn(turn, &resp_tx);
-                            continue;
-                        }
-                        (Script::StallFirstTurn, _) => {
-                            // Bare deltas, no `TextBlockStart` — the chat
-                            // stream decoder's real shape: the reader
-                            // lazy-creates the tail on the first delta, which
-                            // is exactly how a reader kept across an
-                            // interrupt appends the NEXT turn's deltas to the
-                            // swept tail's deleted id.
-                            if turn == 1 {
-                                let _ =
-                                    resp_tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
-                                        text: "half-".into(),
-                                    }));
-                                // The stall: no `Done` ever comes — the task
-                                // keeps listening until its channel drops.
-                                continue;
-                            }
-                            vec![
-                                StreamEvent::TextDelta {
-                                    text: "recovered".into(),
-                                },
-                                StreamEvent::MessageEnd {
-                                    usage: crate::providers::Usage::default(),
-                                    stop_reason: StopReason::EndTurn,
-                                },
-                            ]
-                        }
-                        (Script::DieMidStreamOnce, _) => {
-                            if turn == 1 {
-                                let _ = resp_tx
-                                    .send(ProviderResponse::Event(StreamEvent::TextBlockStart));
-                                let _ =
-                                    resp_tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
-                                        text: "half-".into(),
-                                    }));
-                                // The provider task dies mid-turn: the
-                                // response channel drops with no `Done`.
-                                return;
-                            }
-                            vec![
-                                StreamEvent::TextBlockStart,
-                                StreamEvent::TextDelta {
-                                    text: "recovered".into(),
-                                },
-                                StreamEvent::MessageEnd {
-                                    usage: crate::providers::Usage::default(),
-                                    stop_reason: StopReason::EndTurn,
-                                },
-                            ]
-                        }
-                        (Script::ToolCallThenText, false) => vec![
-                            StreamEvent::ToolUseStart {
-                                id: "call-1".into(),
-                                name: "echo".into(),
-                            },
-                            StreamEvent::ToolUseInputDelta { json: "{}".into() },
-                            StreamEvent::ToolUseEnd,
-                            StreamEvent::MessageEnd {
-                                usage: crate::providers::Usage::default(),
-                                stop_reason: StopReason::ToolUse,
-                            },
-                        ],
-                        (Script::ToolCallThenText, true) => vec![
-                            StreamEvent::TextBlockStart,
-                            StreamEvent::TextDelta {
-                                text: "done".into(),
-                            },
-                            StreamEvent::MessageEnd {
-                                usage: crate::providers::Usage::default(),
-                                stop_reason: StopReason::EndTurn,
-                            },
-                        ],
+                    let answered = carries_tool_result(&messages);
+                    let (events, dies) = match scripted_turn(script, turn, answered, &resp_tx) {
+                        Scripted::Events(events) => (events, false),
+                        Scripted::Die(events) => (events, true),
                     };
                     for event in events {
                         let _ = resp_tx.send(ProviderResponse::Event(event));
                     }
+                    // The provider task dies mid-turn: the response channel
+                    // drops with no `Done`.
+                    if dies {
+                        return;
+                    }
                 }
             });
             (req_tx, resp_rx)
+        }
+    }
+
+    /// What one scripted turn does after the counters are stamped.
+    enum Scripted {
+        /// Stream these events, in order, then keep serving. An empty list is
+        /// a turn deliberately left open.
+        Events(Vec<StreamEvent>),
+        /// Stream these events, in order, then the provider task dies
+        /// outright, dropping its channel.
+        Die(Vec<StreamEvent>),
+    }
+
+    /// One scripted turn's answer, decided from the script and what the
+    /// request carried.
+    fn scripted_turn(
+        script: Script,
+        turn: usize,
+        answered: bool,
+        resp_tx: &tokio::sync::mpsc::UnboundedSender<ProviderResponse>,
+    ) -> Scripted {
+        let message_end = StreamEvent::MessageEnd {
+            usage: crate::providers::Usage::default(),
+            stop_reason: StopReason::EndTurn,
+        };
+        match (script, answered) {
+            (Script::CountOnly, _) => Scripted::Events(Vec::new()),
+            (Script::SlowTeardown, _) => slow_teardown_turn(turn, resp_tx),
+            (Script::StallFirstTurn, _) => {
+                // Bare deltas, no `TextBlockStart` — the chat stream decoder's
+                // real shape: the reader lazy-creates the tail on the first
+                // delta, which is exactly how a reader kept across an
+                // interrupt appends the NEXT turn's deltas to the swept
+                // tail's deleted id.
+                if turn == 1 {
+                    // The stall: the delta goes out and no `Done` ever comes —
+                    // the task keeps listening until its channel drops.
+                    return Scripted::Events(vec![StreamEvent::TextDelta {
+                        text: "half-".into(),
+                    }]);
+                }
+                Scripted::Events(vec![
+                    StreamEvent::TextDelta {
+                        text: "recovered".into(),
+                    },
+                    message_end,
+                ])
+            }
+            (Script::DieMidStreamOnce, _) => {
+                if turn == 1 {
+                    return Scripted::Die(vec![
+                        StreamEvent::TextBlockStart,
+                        StreamEvent::TextDelta {
+                            text: "half-".into(),
+                        },
+                    ]);
+                }
+                Scripted::Events(vec![
+                    StreamEvent::TextBlockStart,
+                    StreamEvent::TextDelta {
+                        text: "recovered".into(),
+                    },
+                    message_end,
+                ])
+            }
+            (Script::ToolCallThenText, false) => Scripted::Events(vec![
+                StreamEvent::ToolUseStart {
+                    id: "call-1".into(),
+                    name: "echo".into(),
+                },
+                StreamEvent::ToolUseInputDelta { json: "{}".into() },
+                StreamEvent::ToolUseEnd,
+                StreamEvent::MessageEnd {
+                    usage: crate::providers::Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                },
+            ]),
+            (Script::ToolCallThenText, true) => Scripted::Events(vec![
+                StreamEvent::TextBlockStart,
+                StreamEvent::TextDelta {
+                    text: "done".into(),
+                },
+                message_end,
+            ]),
         }
     }
 
@@ -1627,7 +1710,9 @@ mod tests {
 
     /// The scripted context WITHOUT the reactor: for tests that construct or
     /// call actor internals directly rather than routing through the bus.
-    async fn scripted_context(script: Script) -> (RuntimeContext<CoreEvent>, i64, ComposedProbe) {
+    async fn scripted_context(
+        script: Script,
+    ) -> (RuntimeContext<BlockKind, CoreEvent>, i64, ComposedProbe) {
         let store = Store::in_memory().unwrap();
         store
             .save_provider_instance(ProviderInstance {
@@ -1658,7 +1743,7 @@ mod tests {
         let mut tools = ToolRegistry::new();
         tools.register("echo", EchoTool);
 
-        let ctx = RuntimeContext::new(
+        let ctx: RuntimeContext<BlockKind, CoreEvent> = RuntimeContext::new(
             store,
             Arc::new(EventBus::<CoreEvent>::new()),
             Arc::new(providers),
@@ -1667,7 +1752,9 @@ mod tests {
         (ctx, conv, ComposedProbe { requests, shapes })
     }
 
-    async fn composed_runtime(script: Script) -> (RuntimeContext<CoreEvent>, i64, ComposedProbe) {
+    async fn composed_runtime(
+        script: Script,
+    ) -> (RuntimeContext<BlockKind, CoreEvent>, i64, ComposedProbe) {
         let (ctx, conv, probe) = scripted_context(script).await;
         spawn_reactor(ctx.clone());
         (ctx, conv, probe)
@@ -1676,7 +1763,7 @@ mod tests {
     /// Poll the ledger until `accept` says it is the shape awaited, with a
     /// deadline so a stall is a named failure rather than a hung suite.
     async fn await_ledger(
-        ctx: &RuntimeContext<CoreEvent>,
+        ctx: &RuntimeContext<BlockKind, CoreEvent>,
         conv: i64,
         what: &str,
         accept: impl Fn(&[Block]) -> bool,
@@ -1872,9 +1959,9 @@ mod tests {
     /// seams under test are called directly.
     fn bare_actor(
         conv: i64,
-        ctx: RuntimeContext<CoreEvent>,
+        ctx: RuntimeContext<BlockKind, CoreEvent>,
         latched: bool,
-    ) -> ConversationActor<CoreEvent> {
+    ) -> ConversationActor<BlockKind, CoreEvent> {
         let (read_latched, write_latched) = create_signal(latched);
         let (_mail_tx, mailbox) = tokio::sync::mpsc::unbounded_channel();
         let (_ready_tx, blocks_ready) = tokio::sync::mpsc::unbounded_channel();
@@ -1930,7 +2017,9 @@ mod tests {
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let outcome = scheduler_tick(&ctx.agency(conv), false, &tx).await.unwrap();
+        let outcome = scheduler_tick::<BlockKind, _>(&ctx.agency(conv), false, &tx)
+            .await
+            .unwrap();
         assert!(!outcome.owes_turn, "the status caps the frontier");
         assert!(rx.try_recv().is_err(), "no turn signal past an interrupt");
     }
@@ -2084,7 +2173,7 @@ mod tests {
                 barrier: Arc::new(tokio::sync::Barrier::new(2)),
             },
         );
-        let ctx = RuntimeContext::new(
+        let ctx: RuntimeContext<BlockKind, CoreEvent> = RuntimeContext::new(
             store,
             Arc::new(EventBus::<CoreEvent>::new()),
             Arc::new(crate::providers::ProviderRegistry::new()),
@@ -2455,7 +2544,7 @@ mod tests {
             .unwrap();
         let mut tools = ToolRegistry::new();
         tools.register("echo", EchoTool);
-        let ctx = RuntimeContext::new(
+        let ctx: RuntimeContext<BlockKind, CoreEvent> = RuntimeContext::new(
             store,
             Arc::new(EventBus::<CoreEvent>::new()),
             Arc::new(crate::providers::ProviderRegistry::new()),
@@ -2555,7 +2644,7 @@ mod tests {
                 torn_down: Arc::clone(&torn_down),
             },
         );
-        let ctx = RuntimeContext::new(
+        let ctx: RuntimeContext<BlockKind, CoreEvent> = RuntimeContext::new(
             store,
             Arc::new(EventBus::<CoreEvent>::new()),
             Arc::new(crate::providers::ProviderRegistry::new()),

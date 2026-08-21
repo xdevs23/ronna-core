@@ -11,7 +11,7 @@
 //! of `render_quote` is how a transcript export and a model prompt end up
 //! disagreeing about what the same block said.
 
-use crate::agency::{BlockKind, Projection};
+use crate::agency::{FromBlock, Projection};
 use crate::block::{Block, Role};
 
 use super::types::{Message, MessageContent, MessageRole};
@@ -25,12 +25,19 @@ pub use crate::agency::{
 
 /// Group contiguous blocks by their kind-stated role into neutral messages.
 ///
-/// This is the conversion every vendor module starts from. Each block is parsed
-/// to its typed kind ONCE; everything after that is blind hook consultation, so
-/// adding a block kind never touches this function.
+/// This is the caller-side fold every model request starts from: it runs
+/// BEFORE the provider boundary, and the vendors consume what it produced.
+/// `K` is the kind the runtime is instantiated over — every call site in this
+/// library names [`BlockKind`](crate::agency::BlockKind). Each block is parsed
+/// to its typed kind ONCE; everything after that is blind hook consultation,
+/// so adding a block kind never touches this function.
+///
+/// The bound asks for exactly what the work reads — the parse half and the
+/// representation half — so a display-only kind renders here without carrying
+/// the whole runtime contract for sync, pure work.
 #[must_use]
-pub fn blocks_to_messages(blocks: &[Block]) -> Vec<Message> {
-    let kinds: Vec<BlockKind> = blocks.iter().map(BlockKind::from_block).collect();
+pub fn blocks_to_messages<K: FromBlock + Projection>(blocks: &[Block]) -> Vec<Message> {
+    let kinds: Vec<K> = blocks.iter().map(|block| K::from_block(block)).collect();
     let mut messages = Vec::new();
     let mut i = 0;
     while i < kinds.len() {
@@ -67,7 +74,7 @@ fn message_role(role: Role) -> MessageRole {
 /// A block whose parts have no text form switches the whole group to native
 /// parts; otherwise the text contributions join as markdown. The policy is
 /// structure. What each block contributes is the kind's own answer.
-fn group_content(group: &[BlockKind]) -> MessageContent {
+fn group_content<K: Projection>(group: &[K]) -> MessageContent {
     if group.iter().any(Projection::forces_parts) {
         MessageContent::Parts(
             group
@@ -86,7 +93,7 @@ fn group_content(group: &[BlockKind]) -> MessageContent {
 ///
 /// A kind with no text form simply answers `None` — the pinned asymmetry where
 /// a text-only group drops reasoning lives on the kinds, not here.
-fn text_content(group: &[BlockKind]) -> MessageContent {
+fn text_content<K: Projection>(group: &[K]) -> MessageContent {
     let parts: Vec<String> = group
         .iter()
         .filter_map(Projection::llm_text)
@@ -99,8 +106,13 @@ fn text_content(group: &[BlockKind]) -> MessageContent {
 /// Render a run of blocks into a single text content through each kind's
 /// text-mode contribution.
 #[must_use]
-pub fn render_blocks_to_text(blocks: &[Block]) -> MessageContent {
-    text_content(&blocks.iter().map(BlockKind::from_block).collect::<Vec<_>>())
+pub fn render_blocks_to_text<K: FromBlock + Projection>(blocks: &[Block]) -> MessageContent {
+    text_content(
+        &blocks
+            .iter()
+            .map(|block| K::from_block(block))
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// The single-group call shape, kept as a test seam so the group-policy pins
@@ -108,8 +120,13 @@ pub fn render_blocks_to_text(blocks: &[Block]) -> MessageContent {
 /// `group_content` the production pass uses, so it cannot drift away from what
 /// it claims to be testing.
 #[cfg(test)]
-fn render_group(blocks: &[Block]) -> MessageContent {
-    group_content(&blocks.iter().map(BlockKind::from_block).collect::<Vec<_>>())
+fn render_group<K: FromBlock + Projection>(blocks: &[Block]) -> MessageContent {
+    group_content(
+        &blocks
+            .iter()
+            .map(|block| K::from_block(block))
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Render an entire ledger into one copyable markdown transcript, grouped by
@@ -119,7 +136,7 @@ fn render_group(blocks: &[Block]) -> MessageContent {
 /// because a transcript is a record of who said what, not of what the model was
 /// told.
 #[must_use]
-pub fn render_conversation(blocks: &[Block]) -> String {
+pub fn render_conversation<K: FromBlock + Projection>(blocks: &[Block]) -> String {
     let mut sections = Vec::new();
     let mut i = 0;
     while i < blocks.len() {
@@ -139,7 +156,7 @@ pub fn render_conversation(blocks: &[Block]) -> String {
             // conversation.
             Role::System => continue,
         };
-        let MessageContent::Text(body) = render_blocks_to_text(&blocks[start..i]) else {
+        let MessageContent::Text(body) = render_blocks_to_text::<K>(&blocks[start..i]) else {
             continue;
         };
         if !body.is_empty() {

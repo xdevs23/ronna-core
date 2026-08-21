@@ -4,7 +4,7 @@ use crate::block::Block;
 use crate::types::Awaiting;
 
 use super::projection::Projection;
-use super::{Agency, ApprovalDecision, BlockKind};
+use super::{Agency, ApprovalDecision, BlockKind, FromBlock};
 
 /// The system's ask for a human's clearance on a tool call.
 ///

@@ -9,7 +9,7 @@ use crate::store::StoreError;
 use crate::types::Awaiting;
 
 use super::projection::{ContentPart, Projection};
-use super::{Agency, AgencyCtx, BlockKind};
+use super::{Agency, AgencyCtx, BlockKind, FromBlock};
 
 /// A model's request for tool work.
 ///

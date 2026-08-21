@@ -14,7 +14,6 @@ use crate::store::{StoreError, StoreTx};
 use super::bind::{self, OpenedTurn};
 use super::http;
 use super::http_store::{HttpProviderConfig, HttpProviderStore};
-use super::render::blocks_to_messages;
 use super::types::{
     CompletionRequest, ContentPart, LlmError, Message, MessageContent, MessageRole, ModelInfo,
     ModelSelector, OpaquePayload, ProviderRx, ProviderTx, ReasoningCapability, ReasoningLevel,
@@ -500,7 +499,7 @@ impl ProviderModule for OpenAiModule {
         tokio::spawn(bind::run_http_bind_loop_with_replay(
             req_rx,
             resp_tx,
-            move |blocks, selector, tools, reasoning, include_reasoning_payloads| {
+            move |messages, selector, tools, reasoning, include_reasoning_payloads| {
                 let model = match selector {
                     ModelSelector::Specific(m) => m,
                     ModelSelector::Lightweight => LIGHTWEIGHT_MODEL.into(),
@@ -508,7 +507,7 @@ impl ProviderModule for OpenAiModule {
                 let provider = OpenAiResponsesProvider::new(api_key.clone(), base_url.clone());
                 let request = CompletionRequest {
                     model,
-                    messages: blocks_to_messages(&blocks),
+                    messages,
                     tools,
                     max_tokens: None,
                     temperature: None,

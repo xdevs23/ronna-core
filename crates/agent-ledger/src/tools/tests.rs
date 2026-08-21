@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use serde_json::Value;
 
 use crate::agency::ratchet::oracle::Oracle;
-use crate::agency::{AgencyCtx, Awaiting, GateDecision, ratchet, redispatch};
+use crate::agency::{AgencyCtx, Awaiting, BlockKind, GateDecision, ratchet, redispatch};
 use crate::block::Block;
 use crate::event::CoreEvent;
 use crate::providers::types::ToolDefinition;
@@ -75,10 +75,12 @@ async fn tick(ctx: &AgencyCtx<CoreEvent>, latched: bool) -> Option<ratchet::Outc
     if latched {
         return None;
     }
-    let outcome = ratchet::drive(ctx)
+    let outcome = ratchet::drive::<BlockKind, _>(ctx)
         .await
         .expect("the drive reads its ledger");
-    redispatch::walk(ctx).await.expect("the walk unwinds");
+    redispatch::walk::<BlockKind, _>(ctx)
+        .await
+        .expect("the walk unwinds");
     Some(outcome)
 }
 
@@ -97,7 +99,7 @@ fn drain(rx: &mut tokio::sync::broadcast::Receiver<CoreEvent>) -> Vec<i64> {
 /// probe's execution counter.
 struct GateRig {
     o: Oracle,
-    runner: ToolRunner<CoreEvent>,
+    runner: ToolRunner<BlockKind, CoreEvent>,
     executions: Arc<AtomicUsize>,
 }
 
@@ -114,7 +116,7 @@ impl GateRig {
         );
         Self {
             o: Oracle::new().await,
-            runner: ToolRunner::new(Arc::new(registry)),
+            runner: ToolRunner::<BlockKind, _>::new(Arc::new(registry)),
             executions,
         }
     }
@@ -537,8 +539,8 @@ fn assert_model_view_ignores_approvals(ledger: &[Block]) {
         })
         .cloned()
         .collect();
-    let with = serde_json::to_value(blocks_to_messages(ledger)).unwrap();
-    let without = serde_json::to_value(blocks_to_messages(&stripped)).unwrap();
+    let with = serde_json::to_value(blocks_to_messages::<BlockKind>(ledger)).unwrap();
+    let without = serde_json::to_value(blocks_to_messages::<BlockKind>(&stripped)).unwrap();
     assert_eq!(
         with, without,
         "the model's view is identical with or without approval blocks"
@@ -605,7 +607,7 @@ async fn never_done_first_call_starves_everything_behind_it() {
 /// first sibling and would never emit the second's wakeup.
 #[tokio::test]
 async fn live_tail_siblings_emit_wakeups_before_either_resolves() {
-    let runner = ToolRunner::new(Arc::new(ToolRegistry::<CoreEvent>::new()));
+    let runner = ToolRunner::<BlockKind, _>::new(Arc::new(ToolRegistry::<CoreEvent>::new()));
     let mut o = Oracle::new().await;
     o.user_text("fan out").await;
     let mut siblings = Vec::new();
@@ -882,7 +884,7 @@ impl ToolHandler<CoreEvent> for InteractiveProbe {
 async fn interactive_stamp_lands_at_insert_from_the_registry() {
     let mut registry = ToolRegistry::new();
     registry.register("ask_human", InteractiveProbe);
-    let runner = ToolRunner::new(Arc::new(registry));
+    let runner = ToolRunner::<BlockKind, _>::new(Arc::new(registry));
     let mut o = Oracle::new().await;
     o.user_text("go").await;
     let call = runner
@@ -971,7 +973,7 @@ async fn an_interactive_call_is_admitted_by_the_human_never_a_gate() {
             gate_calls: Arc::clone(&gate_calls),
         },
     );
-    let runner = ToolRunner::new(Arc::new(registry));
+    let runner = ToolRunner::<BlockKind, _>::new(Arc::new(registry));
     let mut o = Oracle::new().await;
     o.user_text("go").await;
     runner
@@ -1114,7 +1116,7 @@ async fn an_unknown_tool_error_names_the_registered_tools() {
     for name in ["zeta", "alpha"] {
         registry.register(name, NamedProbe(name));
     }
-    let runner = ToolRunner::new(Arc::new(registry));
+    let runner = ToolRunner::<BlockKind, _>::new(Arc::new(registry));
     let o = Oracle::new().await;
     o.user_text("go").await;
     let call = runner
@@ -1205,7 +1207,7 @@ impl ToolHandler<CoreEvent> for ParkedGateProbe {
 /// probe's counters and the gate's two notifies.
 struct OverlapRig {
     o: Oracle,
-    runner: Arc<ToolRunner<CoreEvent>>,
+    runner: Arc<ToolRunner<BlockKind, CoreEvent>>,
     executions: Arc<AtomicUsize>,
     gate_entered: Arc<tokio::sync::Notify>,
     gate_release: Arc<tokio::sync::Notify>,
@@ -1231,7 +1233,7 @@ impl OverlapRig {
         o.user_text("go").await;
         Self {
             o,
-            runner: Arc::new(ToolRunner::new(Arc::new(registry))),
+            runner: Arc::new(ToolRunner::<BlockKind, _>::new(Arc::new(registry))),
             executions,
             gate_entered,
             gate_release,
@@ -1446,7 +1448,7 @@ async fn a_panicking_body_releases_its_claim_for_the_next_wakeup() {
             attempts: Arc::clone(&attempts),
         },
     );
-    let runner = Arc::new(ToolRunner::new(Arc::new(registry)));
+    let runner = Arc::new(ToolRunner::<BlockKind, _>::new(Arc::new(registry)));
     let o = Oracle::new().await;
     o.user_text("go").await;
     let call = runner

@@ -8,6 +8,7 @@
 use serde_json::{Value, json};
 
 use super::*;
+use crate::agency::BlockKind;
 use crate::block::Role;
 
 fn block(id: i64, block_type: &str, fields: serde_json::Map<String, Value>) -> Block {
@@ -65,7 +66,7 @@ fn role_block(id: i64, role: Option<Role>, block_type: &str, pairs: &[(&str, Val
 }
 
 fn neutral(blocks: &[Block]) -> Value {
-    serde_json::to_value(blocks_to_messages(blocks)).unwrap()
+    serde_json::to_value(blocks_to_messages::<BlockKind>(blocks)).unwrap()
 }
 
 // ─── The shared markdown vocabulary ──────────────────────────────────────────
@@ -107,7 +108,7 @@ fn blocks_to_text_excludes_thinking() {
         thinking_block(2, "internal reasoning"),
         text_block(3, "world"),
     ];
-    match render_blocks_to_text(&blocks) {
+    match render_blocks_to_text::<BlockKind>(&blocks) {
         MessageContent::Text(t) => assert_eq!(t, "hello\n\nworld"),
         MessageContent::Parts(_) => panic!("expected text content"),
     }
@@ -116,7 +117,7 @@ fn blocks_to_text_excludes_thinking() {
 #[test]
 fn blocks_to_text_with_quote() {
     let blocks = vec![quote_block(1, "hello"), text_block(2, "I agree")];
-    match render_blocks_to_text(&blocks) {
+    match render_blocks_to_text::<BlockKind>(&blocks) {
         MessageContent::Text(t) => assert_eq!(t, "> hello\n\nI agree"),
         MessageContent::Parts(_) => panic!("expected text content"),
     }
@@ -134,7 +135,7 @@ fn render_group_emits_reasoning_for_thinking() {
         text_block(2, "the answer"),
         tool_call_block(3, "call_1", "search", "{\"q\":\"x\"}"),
     ];
-    let MessageContent::Parts(parts) = render_group(&blocks) else {
+    let MessageContent::Parts(parts) = render_group::<BlockKind>(&blocks) else {
         panic!("expected parts (the group has tool blocks)");
     };
     assert_eq!(parts.len(), 3);
@@ -155,7 +156,7 @@ fn render_group_emits_reasoning_for_thinking() {
 #[test]
 fn text_only_group_still_drops_thinking() {
     let blocks = vec![thinking_block(1, "hidden"), text_block(2, "shown")];
-    match render_group(&blocks) {
+    match render_group::<BlockKind>(&blocks) {
         MessageContent::Text(t) => assert_eq!(t, "shown"),
         MessageContent::Parts(_) => panic!("expected text content for a tool-less group"),
     }
@@ -621,7 +622,7 @@ fn golden_transcript_of_a_mixed_conversation() {
         ),
     ];
     assert_eq!(
-        render_conversation(&blocks),
+        render_conversation::<BlockKind>(&blocks),
         "**You:**\nhello\n\n> q1\n> q2\n\n---\n\n**Assistant:**\nanswer\n\n```rust\nx()\n```\n\n---\n\n**Tool:**\nout"
     );
 }
@@ -706,7 +707,7 @@ async fn composes_over_a_store_built_ledger_byte_stably() {
     // — one of the two drifts this assertion exists to catch — would come out
     // identical either way and the check could not fail.
     let render_bytes =
-        |blocks: &[Block]| serde_json::to_string(&blocks_to_messages(blocks)).unwrap();
+        |blocks: &[Block]| serde_json::to_string(&blocks_to_messages::<BlockKind>(blocks)).unwrap();
     let first_bytes = render_bytes(&store.list_blocks(conversation).await.unwrap());
     let second_bytes = render_bytes(&store.list_blocks(conversation).await.unwrap());
     assert_eq!(

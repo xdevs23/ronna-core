@@ -33,20 +33,35 @@
 //!
 //! [`actor`] is the runtime's top: a consumer bundles the store, the bus, the
 //! provider registry and the tool registry into a [`RuntimeContext`] and calls
-//! [`spawn_reactor`] once. From then on every intent travels the bus — an
-//! append, an interrupt, an approval verdict — and per conversation one
-//! scheduler drives the ratchet, one actor owns the provider channel and the
-//! latch, the ingestion reader turns the provider's stream into blocks, and
-//! the metadata worker drives the second ledger behind the same latch.
+//! [`spawn_reactor`] once. The context is generic over the block kind the
+//! runtime is instantiated over — [`BlockKind`] for the library's own kinds, a
+//! composing enum for a consumer's — and over the consumer's event type, and
+//! naming the kind at the context is what instantiates every layer below it.
+//! From then on every intent travels the bus — an append, an interrupt, an
+//! approval verdict — and per conversation one scheduler drives the ratchet,
+//! one actor owns the provider channel and the latch, the ingestion reader
+//! turns the provider's stream into blocks, and the metadata worker drives the
+//! second ledger behind the same latch.
 //!
-//! ```
-//! use agent_ledger::{bus::EventBus, event::CoreEvent};
+//! ```no_run
+//! use std::sync::Arc;
 //!
-//! // The runtime emits its own events; the bus carries whatever type the
-//! // consumer composed them into. Here that type is `CoreEvent` itself.
-//! let bus: EventBus<CoreEvent> = EventBus::new();
-//! let seq = bus.emit(CoreEvent::ConversationsChanged {});
-//! assert_eq!(seq, 1);
+//! use agent_ledger::{
+//!     BlockKind, CoreEvent, EventBus, ProviderRegistry, RuntimeContext, Store, ToolRegistry,
+//!     spawn_reactor,
+//! };
+//!
+//! // The two type choices a consumer makes, named once, at the context:
+//! // the kind the runtime is instantiated over (here the library's own
+//! // `BlockKind`) and the event type the bus carries (here `CoreEvent`
+//! // itself, the runtime's own vocabulary).
+//! let ctx: RuntimeContext<BlockKind, CoreEvent> = RuntimeContext::new(
+//!     Store::in_memory().expect("an in-memory store"),
+//!     Arc::new(EventBus::new()),
+//!     Arc::new(ProviderRegistry::new()),
+//!     Arc::new(ToolRegistry::new()),
+//! );
+//! spawn_reactor(ctx);
 //! ```
 
 pub mod actor;
@@ -63,7 +78,9 @@ pub mod tools;
 pub mod types;
 
 pub use actor::{RuntimeContext, spawn_reactor};
-pub use agency::{Agency, AgencyCtx, BlockKind, ContentPart, GateDecision, Projection};
+pub use agency::{
+    Agency, AgencyCtx, BlockKind, ContentPart, FromBlock, GateDecision, Projection, RuntimeKind,
+};
 pub use block::{
     Block, OpaquePayload, RESERVED_FIELD_NAMES, ReasoningDetailEntry, Role, ToolCallResult,
 };

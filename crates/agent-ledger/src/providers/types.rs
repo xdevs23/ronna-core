@@ -18,8 +18,6 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::block::Block;
-
 // The behavior layer produces these; the provider layer consumes them. They are
 // re-exported at this vantage point so a vendor module has one place to import
 // the boundary language from, without the layer beneath it having to know that
@@ -407,12 +405,19 @@ pub enum ModelSelector {
 }
 
 /// What a caller asks of a bound provider.
+///
+/// Blocks never cross this boundary. The caller runs the projection fold and
+/// hands over the NEUTRAL messages it produced, so a provider module consumes
+/// exactly the vocabulary of this file and never parses a block kind — the
+/// silent failure that ruled this shape was a consumer kind reaching a stock
+/// vendor, parsing to the inert fallback inside it, and vanishing from the
+/// model request with no error.
 #[derive(Debug)]
 pub enum ProviderRequest {
     /// Begin streaming a response for this ledger.
     Stream {
-        /// The blocks that make up the conversation so far.
-        blocks: Vec<Block>,
+        /// The conversation so far, already projected into neutral messages.
+        messages: Vec<Message>,
         /// Which model.
         model: ModelSelector,
         /// The tools this turn may call.

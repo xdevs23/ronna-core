@@ -6,6 +6,7 @@ use serde_json::json;
 use super::parser::{ResponsesSseState, parse_responses_event};
 use super::*;
 use crate::block::{Block, Role};
+use crate::providers::render::blocks_to_messages;
 use crate::providers::types::{StopReason, StreamEvent, ToolDefinition};
 
 /// The request builder: the mapping from neutral messages into typed items, and
@@ -70,7 +71,7 @@ mod request_goldens {
     fn body_for(model: &str, reasoning: Option<ReasoningLevel>) -> Value {
         let request = CompletionRequest {
             model: model.into(),
-            messages: blocks_to_messages(&thinking_text_tool_blocks()),
+            messages: blocks_to_messages::<crate::agency::BlockKind>(&thinking_text_tool_blocks()),
             tools: vec![ToolDefinition {
                 name: "search".into(),
                 description: "Search the web".into(),
@@ -735,7 +736,8 @@ mod replay {
     }
 
     fn input_for(payload: &OpaquePayload, include: bool) -> (Value, bool) {
-        let messages = blocks_to_messages(&blocks_with_payload(payload));
+        let messages =
+            blocks_to_messages::<crate::agency::BlockKind>(&blocks_with_payload(payload));
         let (_, items, carried) = convert_input(&messages, include);
         (
             serde_json::to_value(&items).expect("the items serialize"),
@@ -832,7 +834,7 @@ mod replay {
                 ],
             ),
         ];
-        let messages = blocks_to_messages(&blocks);
+        let messages = blocks_to_messages::<crate::agency::BlockKind>(&blocks);
         let (_, items, carried) = convert_input(&messages, true);
         let items = serde_json::to_value(&items).unwrap();
         assert!(carried);
