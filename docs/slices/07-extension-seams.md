@@ -107,8 +107,15 @@ compared" doc becomes "one place per implementor".
 `#[derive(Agency)]` on a composing enum generates: the `Agency` delegation, the
 `Projection` delegation, the parse chain, and the descriptor concatenation (a const
 concatenation — prototyped feasible by the review). One derive, both traits, documented.
-Error behavior is pinned by `compile_fail` doctests on the error code — no compile-fail
-harness dependency. The derive crate is `crates/agent-ledger-derive`; syn, quote and
+Error behavior is pinned by `compile_fail` doctests — on the error code where rustc
+assigns one, and by a plain `compile_fail` doctest whose emitted message names the fix
+where the rejection is the derive's own `compile_error!`, which rustc gives no code.
+(Amended 2026-08-21: the original wording demanded codes for rejections that cannot carry
+one.) Amended likewise: the ephemerality attribute is DROPPED — a kind's `durable()` is
+the single source of the fact, the derive delegates it like every other hook, and
+coherence with the descriptor's ephemeral flag is the conformance check's job at test
+time. An attribute would have been a second declaration whose silent precedence discarded
+a leaf's own answer, the exact two-sources shape this library forbids. The derive crate is `crates/agent-ledger-derive`; syn, quote and
 proc-macro2 pass the dependency rule before the manifest names them; the vocabulary and
 client-constructor scans are re-rooted to walk every workspace crate, so the new crate
 cannot escape them.
