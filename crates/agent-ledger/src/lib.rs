@@ -24,6 +24,13 @@
 //! each is a feature, because choosing a model provider is the consumer's
 //! decision, not this library's.
 //!
+//! [`tools`] closes the loop the model opens: a registry of handlers a consumer
+//! writes, and the runner that is the single place a tool body executes and
+//! therefore the single place admission is enforced. It advances a call from
+//! recorded facts only — a decision that travelled in memory beside a durable
+//! record is the failure that shaped this layer. The library ships no tool of
+//! its own; a tool knows what a product does.
+//!
 //! ```
 //! use agent_ledger::{bus::EventBus, event::CoreEvent};
 //!
@@ -41,6 +48,7 @@ pub mod event;
 pub mod providers;
 pub mod reactivity;
 pub mod store;
+pub mod tools;
 pub mod types;
 
 pub use agency::{
@@ -56,4 +64,5 @@ pub use providers::{
     blocks_to_messages,
 };
 pub use store::{Store, StoreError};
+pub use tools::{ToolContext, ToolHandler, ToolOutcome, ToolRegistry, ToolRunner, submit_approval};
 pub use types::{ApprovalChoice, Awaiting, InputBlock, StopReason, StreamUsage};

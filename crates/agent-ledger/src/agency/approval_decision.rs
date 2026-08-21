@@ -12,9 +12,8 @@ use super::{Agency, BlockKind};
 ///
 /// Approved routes the walk to its request, which routes on to the call, while
 /// the underlying call still owes its body. Denied routes nowhere, ever — the
-/// submit path resolved the call with its tool error in the same step, so there
-/// is nothing left to run. That submit path is the actor slice's; nothing in
-/// this tree makes a denial arrive with its error already recorded.
+/// submit path ([`submit_approval`](crate::tools::submit_approval)) resolved the
+/// call with its tool error in the same step, so there is nothing left to run.
 #[derive(Debug, Clone)]
 pub struct ApprovalDecision {
     /// The ledger row this decision is.

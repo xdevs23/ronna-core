@@ -48,7 +48,13 @@ The registry they register into comes; they do not.
 - **AC5-6** An end-to-end test composes slices 2–5: a tool call block inserted through the
   store, the ratchet parking on it, the runner admitting and executing a test tool, the
   result block landing, and the frontier coming back model-owed.
-- **AC5-7** A gating test proves the refused path end to end: gate refuses, the error is
-  recorded atomically with the response, the body never runs, the cursor advances.
+- **AC5-7** A gating test proves the refused path end to end: gate refuses, the refusal's
+  error block is recorded, the body never runs, the cursor advances past the call.
+  Correction 2026-08-21: an earlier wording required the error "atomically with the
+  response", borrowing the admission-response block from the reference document's
+  generalized chain — a shape this source never had. The reference generalizes a second
+  implementation; the source records a refusal as the error block alone, and a denial's
+  error atomically with its decision. Three seats flagged the borrowed wording
+  independently.
 - **AC5-8** The suite passes identically under `--test-threads=1`.
 - **AC5-9** Any new dependency follows the standing recording rule. The expectation is none.

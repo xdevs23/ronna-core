@@ -143,12 +143,10 @@ pub trait Agency {
     /// the deferred body resumes through the redispatch walk.
     ///
     /// Not currently invoked by the ratchet: the active gating seam is the
-    /// tool-definition gate at the runner chokepoint, which owns the tool
-    /// registry. This hook exists for blocks whose vetting is answerable from
-    /// the store and the bus alone.
-    ///
-    /// That runner is not in this tree yet — it lands with the actor slice,
-    /// and until it does, nothing here enforces the gating it describes.
+    /// tool's own gate at the runner chokepoint
+    /// ([`tools`](crate::tools)), which owns the tool registry. This hook
+    /// exists for blocks whose vetting is answerable from the store and the bus
+    /// alone.
     async fn gate<E: RuntimeEvent>(&self, _ctx: &AgencyCtx<E>) -> GateDecision {
         GateDecision::Proceed
     }

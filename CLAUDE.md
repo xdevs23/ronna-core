@@ -47,8 +47,10 @@ workflows, and anything that knows what the product does.
 
 - Modular structure, robust failure handling, clear separation of concerns, well-chosen
   abstractions. A feature that needs bolted-on conditionals signals a refactor, not an if.
-- Every unit of work runs in a git worktree through the implement-review-verify workflow,
-  merges back on completion, and the worktree is deleted.
+- Every unit of work runs through the implement-review-verify workflow with adversarial
+  seats before merge. While the extraction is the repository's only line of work, the tree
+  itself is the unit's workspace and the commit is the merge; parallel units get worktrees
+  when they exist.
 - Tests run in parallel and fast: the store opens in memory, nothing starts a server, nothing
   reaches the network. A suite slow enough to skip is a suite that stops being run.
 - Documented decisions carry their date and the rejected alternatives.

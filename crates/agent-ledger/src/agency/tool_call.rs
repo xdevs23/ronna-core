@@ -59,9 +59,7 @@ impl ToolCall {
     /// Keyed on the specific call id, never on kind alone — an unrelated result
     /// landing later must never settle this call. This is THE resolution
     /// predicate: the approval kinds' routing and the runner's ledger
-    /// idempotency all answer through it, so they cannot drift apart. The
-    /// runner is the actor slice's; only the routing half of that claim is in
-    /// this tree.
+    /// idempotency all answer through it, so they cannot drift apart.
     ///
     /// The kinds it accepts are read through [`BlockKind`], not off the stored
     /// type string. Comparing the string here would be a second place that
@@ -119,9 +117,6 @@ impl Agency for ToolCall {
     /// the walk's unwind re-emits the same wakeup the cursor emits, so the
     /// runner chokepoint stays the only place a tool body executes. A second
     /// execution path here is a second place a call can run twice.
-    ///
-    /// That chokepoint arrives with the actor slice; this tree emits the
-    /// wakeup and nothing here enforces who consumes it.
     async fn run_post_gate<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<(), StoreError> {
         self.run(ctx).await.map(|_| ())
     }

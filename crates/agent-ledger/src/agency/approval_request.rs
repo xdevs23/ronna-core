@@ -38,9 +38,7 @@ impl ApprovalRequest {
     /// lookup, symmetric with [`decision_in`](Self::decision_in).
     ///
     /// Id-keyed on the covered call and read off the LOCAL ledger only, so the
-    /// runner's approval read and the routing predicates can never drift. That
-    /// runner belongs to the actor slice; this tree holds only the routing
-    /// side of the pair.
+    /// runner's approval read and the routing predicates can never drift.
     ///
     /// An absent `for_block_id` parses to 0, which is no row's id, so a
     /// request that names no call covers nothing rather than covering every
@@ -65,8 +63,7 @@ impl ApprovalRequest {
     /// Id-keyed on the request — the decision-reading counterpart to
     /// [`ToolCall::resolved_in`](super::ToolCall::resolved_in), and THE
     /// decision-reading discipline: this request's own routing and the runner's
-    /// approval read share it so the two cannot drift. The runner arrives with
-    /// the actor slice, so only the routing reader exists here today.
+    /// approval read share it so the two cannot drift.
     ///
     /// Reads only the ledger it is handed, which is conversation-local, so a
     /// junction-shared request is decided per conversation and never globally.
