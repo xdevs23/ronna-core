@@ -28,11 +28,15 @@ pub struct MetadataTitleRequest {
     pub id: i64,
 }
 
-impl MetadataTitleRequest {
-    pub(super) fn parse(block: &Block) -> Self {
+impl super::LeafKind for MetadataTitleRequest {
+    const KINDS: &'static [&'static str] = &["title_request"];
+
+    fn parse(block: &Block) -> Self {
         Self { id: block.id }
     }
+}
 
+impl MetadataTitleRequest {
     /// Has a response settled THIS request?
     ///
     /// The one settling predicate — the cursor's doneness and the fulfillment

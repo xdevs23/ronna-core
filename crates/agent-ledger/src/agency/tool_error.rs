@@ -21,8 +21,10 @@ pub struct ToolError {
     pub error: String,
 }
 
-impl ToolError {
-    pub(super) fn parse(block: &Block) -> Self {
+impl super::LeafKind for ToolError {
+    const KINDS: &'static [&'static str] = &["tool_error"];
+
+    fn parse(block: &Block) -> Self {
         Self {
             tool_call_id: super::string_field(block, "tool_call_id"),
             error: super::string_field(block, "error"),

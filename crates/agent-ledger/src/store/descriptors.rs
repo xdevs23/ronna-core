@@ -164,12 +164,12 @@ pub struct ContentDescriptor {
     /// Ephemeral kinds: deleted by the finalization that replaces them, never
     /// a cursor anchor. Joins the streaming teardown sweep.
     ///
-    /// **This is one fact declared twice**: the kind's
-    /// [`Agency::durable`](crate::agency::Agency::durable) must answer the
-    /// exact negation of this flag, or the cursor anchors on rows that
-    /// finalization deletes — the ephemeral-pin regression. Until the wave-3
-    /// derive generates both sides from one attribute, the obligation is
-    /// checkable:
+    /// **This flag mirrors a fact the kind itself owns**: the kind's
+    /// [`Agency::durable`](crate::agency::Agency::durable) is the single
+    /// source of the row-lifetime fact, and this flag must answer its exact
+    /// negation, or the cursor anchors on rows that finalization deletes —
+    /// the ephemeral-pin regression. The agreement is the conformance check's
+    /// job:
     /// [`check_descriptor_durability`](crate::agency::check_descriptor_durability)
     /// asserts the two agree for every kind a descriptor set declares, and a
     /// consumer's conformance tests run it over their set.
@@ -320,6 +320,62 @@ pub(super) fn descriptor_for_kind<'d>(
     kind: &str,
 ) -> Option<&'d ContentDescriptor> {
     descriptors.iter().find(|d| d.kinds.contains(&kind))
+}
+
+/// How many descriptors a set of descriptor slices holds in total — the
+/// length of what [`concat_descriptors`] produces, evaluable in a const
+/// context so the derive can size the concatenated array from the composed
+/// kinds' own declarations.
+#[must_use]
+pub const fn descriptor_count(sets: &[&[ContentDescriptor]]) -> usize {
+    let mut total = 0;
+    let mut i = 0;
+    while i < sets.len() {
+        total += sets[i].len();
+        i += 1;
+    }
+    total
+}
+
+/// Concatenate descriptor slices into one array at compile time, in order —
+/// the composing enum's descriptor set, built from each composed kind's own
+/// declaration so no second list of tables exists anywhere. `N` must be
+/// [`descriptor_count`] of the same sets; the derive infers it from the
+/// annotated array type, and a mismatch fails the build.
+///
+/// # Panics
+///
+/// At compile time, if `N` differs from the sets' total — unreachable through
+/// the derive, which computes both from the same sets.
+#[must_use]
+pub const fn concat_descriptors<const N: usize>(
+    sets: &[&[ContentDescriptor]],
+) -> [ContentDescriptor; N] {
+    let placeholder = ContentDescriptor {
+        table: "",
+        domain: "",
+        kinds: &[],
+        columns: &[],
+        reference_columns: &[],
+        ephemeral: false,
+    };
+    let mut out = [placeholder; N];
+    let mut at = 0;
+    let mut i = 0;
+    while i < sets.len() {
+        let mut j = 0;
+        while j < sets[i].len() {
+            out[at] = sets[i][j];
+            at += 1;
+            j += 1;
+        }
+        i += 1;
+    }
+    assert!(
+        at == N,
+        "concat_descriptors was given an N that is not the sets' total"
+    );
+    out
 }
 
 /// A descriptor-supplied name as a quoted SQL identifier.
@@ -1259,15 +1315,29 @@ mod tests {
     /// `CORE_KINDS` is the library's namespace claim, and this is what keeps
     /// the literal honest: every kind the core block query serves is claimed,
     /// every claimed kind resolves to a real typed kind (never the inert
-    /// fallback), and the claimed kinds the query does not serve are exactly
-    /// the metadata ledger's, which surface through the metadata read path.
-    /// Any drift between the claim and what the code serves goes red here.
+    /// fallback), the claimed kinds the query does not serve are exactly
+    /// the metadata ledger's, which surface through the metadata read path —
+    /// and the parse chain's own claim (`BlockKind::CLAIMED_KINDS`, the const
+    /// the derive checks consumer leaves against) is the same seventeen
+    /// strings. Any drift between the claims and what the code serves goes
+    /// red here.
     #[test]
     fn core_kinds_match_what_the_core_paths_actually_serve() {
         use crate::agency::{BlockKind, FromBlock};
 
         let served = kinds_served_by_the_block_query();
         let claimed: std::collections::HashSet<&str> = CORE_KINDS.iter().copied().collect();
+        let parse_claim: std::collections::HashSet<&str> =
+            BlockKind::CLAIMED_KINDS.iter().copied().collect();
+        assert_eq!(
+            parse_claim, claimed,
+            "the parse chain claims exactly the library's namespace claim"
+        );
+        assert_eq!(
+            BlockKind::CLAIMED_KINDS.len(),
+            17,
+            "one claim per core kind, no duplicates"
+        );
         for kind in &served {
             assert!(
                 claimed.contains(kind),
@@ -1402,6 +1472,8 @@ mod tests {
             }
         }
         impl crate::agency::FromBlock for NoteKind {
+            const CLAIMED_KINDS: &'static [&'static str] = &["note", "note_draft"];
+
             fn from_block(block: &Block) -> Self {
                 Self {
                     ephemeral: block.block_type == "note_draft",

@@ -106,3 +106,30 @@ exactly this: nothing a test sends can leave the machine — a connection to thi
 loopback still can be made, and the tests that assert the guard rely on that. It is a property of
 the code rather than of the runner, which is why it is recorded beside the dependency that would
 otherwise make it possible.
+
+## 2026-08-21 — the derive crate
+
+The composing-enum derive is a procedural macro, so it lives in a crate of its own with the
+three crates every procedural macro is written on. Same two questions, same sources: current
+versions from the registry API, advisories from the OSV aggregate. The resolved column is what
+the lockfile settled on after these were declared.
+
+| Crate | Resolved | Latest at check | Advisories | Why it is here |
+|---|---|---|---|---|
+| syn | 3.0.3 | 3.0.3 | none | Parsing the enum the derive is placed on |
+| quote | 1.0.47 | 1.0.47 | none | Producing the generated implementations as tokens |
+| proc-macro2 | 1.0.107 | 1.0.107 | none | The token type the other two share |
+
+All three resolved to the current latest. The parser's 3.0 line is a fresh major (2026-07-18);
+its breaking changes are confined to syntax-tree nodes for newer language forms, none of which
+the derive reads — it consumes only the derive-input surface, which is unchanged.
+
+**Where these compile.** All three are dependencies of the derive crate only, and a procedural
+macro runs at build time on the build host: nothing from these crates is linked into the
+library, into a consumer's binary, or into anything at runtime. The library depends on the
+derive crate so that one `use` brings the trait and its derive together, which is what keeps
+the composing seam a single public surface.
+
+**The one transitive dependency named.** `unicode-ident` 1.0.24 (current latest, no
+advisories) is the parser's identifier classifier — recorded because it is the one crate these
+three pull in that is not already reviewed above.

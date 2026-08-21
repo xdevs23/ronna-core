@@ -6,6 +6,7 @@ version = 4
 name = "agent-ledger"
 version = "0.1.0"
 dependencies = [
+ "agent-ledger-derive",
  "chrono",
  "eventsource-stream",
  "futures",
@@ -19,6 +20,17 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "agent-ledger-derive"
+version = "0.1.0"
+dependencies = [
+ "agent-ledger",
+ "proc-macro2",
+ "quote",
+ "serde_json",
+ "syn 3.0.3",
 ]
 
 [[package]]

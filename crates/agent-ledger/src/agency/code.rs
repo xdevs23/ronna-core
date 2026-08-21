@@ -21,8 +21,10 @@ pub struct Code {
     pub content: String,
 }
 
-impl Code {
-    pub(super) fn parse(block: &Block) -> Self {
+impl super::LeafKind for Code {
+    const KINDS: &'static [&'static str] = &["code"];
+
+    fn parse(block: &Block) -> Self {
         Self {
             role: block.role,
             language: block
@@ -33,7 +35,9 @@ impl Code {
             content: super::string_field(block, "content"),
         }
     }
+}
 
+impl Code {
     fn fenced(&self) -> String {
         render_code(self.language.as_deref(), &self.content)
     }

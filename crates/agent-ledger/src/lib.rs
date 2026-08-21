@@ -79,7 +79,8 @@ pub mod types;
 
 pub use actor::{RuntimeContext, spawn_reactor};
 pub use agency::{
-    Agency, AgencyCtx, BlockKind, ContentPart, FromBlock, GateDecision, Projection, RuntimeKind,
+    Agency, AgencyCtx, BlockKind, ContentPart, FromBlock, GateDecision, LeafKind, Projection,
+    RuntimeKind,
 };
 pub use block::{
     Block, OpaquePayload, RESERVED_FIELD_NAMES, ReasoningDetailEntry, Role, ToolCallResult,

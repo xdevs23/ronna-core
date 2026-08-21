@@ -1,7 +1,9 @@
 //! A settled title derivation in the metadata ledger.
 
-use super::Agency;
+use crate::block::Block;
+
 use super::projection::Projection;
+use super::{Agency, LeafKind};
 
 /// A settled title derivation in the metadata ledger: no ask, inert — a pure
 /// record. It settles exactly ONE request, the earliest still outstanding
@@ -12,6 +14,14 @@ use super::projection::Projection;
 /// anywhere.
 #[derive(Debug, Clone, Copy)]
 pub struct MetadataTitleResponse;
+
+impl LeafKind for MetadataTitleResponse {
+    const KINDS: &'static [&'static str] = &["title_response"];
+
+    fn parse(_: &Block) -> Self {
+        Self
+    }
+}
 
 impl Agency for MetadataTitleResponse {}
 

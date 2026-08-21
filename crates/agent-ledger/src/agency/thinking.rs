@@ -33,8 +33,10 @@ pub struct Thinking {
     pub opaque: Option<OpaquePayload>,
 }
 
-impl Thinking {
-    pub(super) fn parse(block: &Block) -> Self {
+impl super::LeafKind for Thinking {
+    const KINDS: &'static [&'static str] = &["thinking"];
+
+    fn parse(block: &Block) -> Self {
         Self {
             role: block.role,
             content: super::string_field(block, "content"),

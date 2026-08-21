@@ -21,8 +21,10 @@ pub struct Quote {
     pub text: String,
 }
 
-impl Quote {
-    pub(super) fn parse(block: &Block) -> Self {
+impl super::LeafKind for Quote {
+    const KINDS: &'static [&'static str] = &["quote"];
+
+    fn parse(block: &Block) -> Self {
         Self {
             role: block.role,
             text: super::string_field(block, "text"),

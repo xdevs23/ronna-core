@@ -23,8 +23,10 @@ pub struct ToolResult {
     pub content: String,
 }
 
-impl ToolResult {
-    pub(super) fn parse(block: &Block) -> Self {
+impl super::LeafKind for ToolResult {
+    const KINDS: &'static [&'static str] = &["tool_result"];
+
+    fn parse(block: &Block) -> Self {
         Self {
             tool_call_id: super::string_field(block, "tool_call_id"),
             content: super::string_field(block, "content"),

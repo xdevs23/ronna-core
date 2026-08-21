@@ -1,0 +1,30 @@
+[package]
+name = "agent-ledger-derive"
+description = "The composing-enum derive for agent-ledger: one derive, both traits."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+# The three crates every procedural macro is written on, and nothing else.
+# They compile on the build host only: nothing from here is linked into the
+# library or into a consumer's binary. Reviewed in docs/dependency-review.md
+# before being named here, like every dependency.
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = "3"
+
+# Test-only, and deliberately circular: the doctests exercise the derive
+# against the real library, which is the only way a compile_fail doctest can
+# pin the real error a consumer would see. Cargo permits the cycle because
+# dev-dependencies never enter the build of the crate itself.
+[dev-dependencies]
+agent-ledger = { path = "../agent-ledger" }
+serde_json = "1"

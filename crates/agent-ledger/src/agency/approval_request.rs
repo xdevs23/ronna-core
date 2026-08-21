@@ -26,14 +26,18 @@ pub struct ApprovalRequest {
     pub for_block_id: i64,
 }
 
-impl ApprovalRequest {
-    pub(super) fn parse(block: &Block) -> Self {
+impl super::LeafKind for ApprovalRequest {
+    const KINDS: &'static [&'static str] = &["approval_request"];
+
+    fn parse(block: &Block) -> Self {
         Self {
             id: block.id,
             for_block_id: super::i64_field(block, "for_block_id"),
         }
     }
+}
 
+impl ApprovalRequest {
     /// The request covering `call_block_id`, if one has landed — the reverse
     /// lookup, symmetric with [`decision_in`](Self::decision_in).
     ///

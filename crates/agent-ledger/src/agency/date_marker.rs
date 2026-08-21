@@ -21,13 +21,17 @@ pub struct DateMarker {
     pub date: String,
 }
 
-impl DateMarker {
-    pub(super) fn parse(block: &Block) -> Self {
+impl super::LeafKind for DateMarker {
+    const KINDS: &'static [&'static str] = &["date_marker"];
+
+    fn parse(block: &Block) -> Self {
         Self {
             date: super::string_field(block, "date"),
         }
     }
+}
 
+impl DateMarker {
     /// Exactly `Current date: {YYYY-MM-DD} ({Weekday})`. A stored date that
     /// does not parse degrades to the bare date — never a panic, because a
     /// ledger row is data and a reader that panics on data cannot replay.

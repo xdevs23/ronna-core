@@ -94,6 +94,35 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Every Rust source of every workspace crate — sources and integration tests
+/// alike, rooted at the workspace's crate directory so a crate added beside
+/// this one joins the scans the moment it exists instead of escaping them.
+///
+/// The crate count is asserted so a re-rooting that silently narrowed the walk
+/// (a moved directory, a renamed root) fails as itself instead of passing on
+/// an empty set.
+fn workspace_sources() -> Vec<PathBuf> {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crate sits directly below the workspace's crate directory")
+        .to_path_buf();
+    let mut files = Vec::new();
+    rust_sources(&crates, &mut files);
+
+    let crates_seen: std::collections::HashSet<PathBuf> = files
+        .iter()
+        .filter_map(|p| p.strip_prefix(&crates).ok())
+        .filter_map(|p| p.components().next().map(|c| PathBuf::from(c.as_os_str())))
+        .collect();
+    assert!(
+        crates_seen.len() > 1,
+        "the workspace scan saw {} crate(s), which means it is not walking every \
+         workspace crate",
+        crates_seen.len()
+    );
+    files
+}
+
 /// No file outside a vendor module names a vendor's wire.
 ///
 /// This is the check that the neutral layer really is neutral. A failure here
@@ -128,7 +157,7 @@ fn no_wire_shape_is_built_outside_a_vendor_module() {
     );
 }
 
-/// Every HTTP client in this crate is built through the one guarded
+/// Every HTTP client in this workspace is built through the one guarded
 /// constructor.
 ///
 /// The guard lives in that constructor, so it covers a client built through it
@@ -152,9 +181,7 @@ fn no_file_outside_the_guarded_constructor_builds_a_client() {
         "ClientBuilder::new",
     ];
 
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    rust_sources(&src, &mut files);
+    let files = workspace_sources();
 
     let mut hits = Vec::new();
     for path in &files {
@@ -197,9 +224,7 @@ fn no_source_file_speaks_a_product_vocabulary() {
         .collect();
     assert!(terms.len() > 10, "the vocabulary list did not parse");
 
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    rust_sources(&src, &mut files);
+    let files = workspace_sources();
 
     // This file is checked like every other, and holds no term of its own: the
     // list arrives by reading it. An exemption here would be the one place a

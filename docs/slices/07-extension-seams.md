@@ -101,6 +101,11 @@ Each leaf kind carries its stored type strings as an associated const; a composi
 parse tries its own kinds and delegates inward. `BlockKind::from_block` stays the core
 enum's one literal site, now reading the consts. The "one place a stored string is
 compared" doc becomes "one place per implementor".
+Amended 2026-08-21, wave 3: `FromBlock` additionally carries a required `CLAIMED_KINDS`
+const — the implementor's full claim, its own strings and its delegate's union. Broader
+than this ruling's original wording, and kept deliberately: the union claim is what lets
+the derive refuse a stored-string collision at compile time at every nesting depth, and it
+has no default because an empty default would make every disjointness check vacuous.
 
 ### R8 — the derive
 

@@ -16,8 +16,10 @@ pub struct Text {
     pub content: String,
 }
 
-impl Text {
-    pub(super) fn parse(block: &Block) -> Self {
+impl super::LeafKind for Text {
+    const KINDS: &'static [&'static str] = &["text"];
+
+    fn parse(block: &Block) -> Self {
         Self {
             role: block.role,
             content: super::string_field(block, "content"),

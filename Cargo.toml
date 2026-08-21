@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/agent-ledger"]
+members = ["crates/agent-ledger", "crates/agent-ledger-derive"]
 
 # Version, edition and license live here so every member inherits one answer.
 # A member that needs a different one is a member that belongs in its own

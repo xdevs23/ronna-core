@@ -40,6 +40,11 @@ mod tool_call;
 mod tool_error;
 mod tool_result;
 
+// The composing-enum derive, under the same name as the trait it implements —
+// macro and trait live in different namespaces, so `use agent_ledger::Agency`
+// brings both, exactly as a consumer expects of a derivable trait.
+pub use agent_ledger_derive::Agency;
+
 pub use approval_decision::ApprovalDecision;
 pub use approval_request::ApprovalRequest;
 pub use code::Code;
@@ -212,14 +217,67 @@ pub trait Agency {
 /// [`BlockKind`] for the library's own kinds, and a consumer's composing enum,
 /// whose parse tries its own kinds and delegates anything unrecognised down to
 /// the inner implementor — so the library's kinds resolve through the library
-/// and only a genuinely unknown type reaches the inert fallback. The
-/// implementation is the ONE place per implementor a stored type string is
-/// compared to a literal.
+/// and only a genuinely unknown type reaches the inert fallback. The stored
+/// type strings themselves are written in ONE place per kind: the
+/// [`LeafKind::KINDS`] const, which the implementation reads.
 pub trait FromBlock {
+    /// The content-table descriptors of every kind this implementor composes —
+    /// what a consumer hands [`StoreConfig`](crate::store::StoreConfig) as its
+    /// descriptor set. The derive builds it by concatenating the composed
+    /// kinds' [`LeafKind::DESCRIPTORS`] with the inner implementor's, so the
+    /// set the store validates and the set the parse chain resolves are the
+    /// same declaration. Empty by default: the library's own kinds live in the
+    /// library's own tables and contribute nothing here.
+    const DESCRIPTORS: &'static [crate::store::ContentDescriptor] = &[];
+
+    /// Every stored type string this implementor resolves to a typed kind —
+    /// its claim on the stored-string namespace. [`BlockKind`]'s lists the
+    /// library's seventeen; a composing enum's is the union of its leaves'
+    /// [`LeafKind::KINDS`] and its delegate's claim, which is what lets the
+    /// derive refuse a collision at compile time at every nesting depth: a
+    /// leaf whose string is already claimed would silently shadow the earlier
+    /// owner in the first-match parse chain, and the shadowed rows would parse
+    /// as the wrong kind with no error anywhere.
+    ///
+    /// Deliberately without a default: an implementor that claimed nothing
+    /// would make every disjointness check against it vacuously true, so the
+    /// claim is stated or the impl does not compile. Stating it is the most
+    /// the compiler can force — the derive is the only path on which the
+    /// claim is machine-checked against the parse chain, and a hand-written
+    /// implementor vouches for its own honesty: an empty or partial claim
+    /// silently weakens every disjointness check a downstream composer runs
+    /// against it.
+    const CLAIMED_KINDS: &'static [&'static str];
+
     /// Resolve a stored row to its typed kind. Total: an unrecognised type
     /// resolves to the implementor's inert fallback, never an error — an old
     /// build reading a newer ledger fails safe instead of misinterpreting it.
     fn from_block(block: &Block) -> Self;
+}
+
+/// One leaf kind's parse contract: which stored type strings are its, how a
+/// row of one of them becomes the typed kind, and which content tables it
+/// brings along.
+///
+/// [`FromBlock`] is the composing half — total, with an inert fallback — and
+/// this is the leaf half: partial by design, called only for a row whose type
+/// string is in [`KINDS`](Self::KINDS). Every kind, the library's own and a
+/// consumer's alike, implements it the same way; a composing enum (or the
+/// derive) tries each leaf's `KINDS` and delegates anything unrecognised to
+/// its inner [`FromBlock`] implementor. `KINDS` is the ONE place an
+/// implementor writes its stored type strings — [`BlockKind::from_block`]
+/// reads these consts instead of carrying a second table of names.
+pub trait LeafKind: Sized {
+    /// The stored type strings this kind parses from.
+    const KINDS: &'static [&'static str];
+
+    /// The content-table descriptors this kind contributes. Empty for kinds
+    /// stored in the library's own tables; a consumer kind with a table of its
+    /// own declares it here, beside the strings that resolve to it.
+    const DESCRIPTORS: &'static [crate::store::ContentDescriptor] = &[];
+
+    /// Parse a stored row whose type string is one of [`KINDS`](Self::KINDS).
+    fn parse(block: &Block) -> Self;
 }
 
 /// The coherence check for one fact declared twice: a descriptor's
@@ -236,8 +294,11 @@ pub trait FromBlock {
 /// overrides `durable()` (the inert fallback included) answers durable — so a
 /// consumer that declares only the store's side ships the cursor-anchor
 /// regression silently. Run this from the conformance tests over the full
-/// descriptor set and the composing kind; the wave-3 derive will generate
-/// both sides from one attribute and make the disagreement unrepresentable.
+/// descriptor set and the composing kind — derived and hand-written
+/// compositions alike: the kind's `durable()` is the ONE source of the
+/// row-lifetime fact (the derive delegates it to the leaf like every other
+/// hook), and this check is where its agreement with the store's flag is
+/// proven.
 ///
 /// # Errors
 ///
@@ -272,6 +333,130 @@ pub fn check_descriptor_durability<K: Agency + FromBlock>(
     Ok(())
 }
 
+// ─── The compile-time kind algebra the derive evaluates ──────────────────
+//
+// Everything below is `const` because the derive's coherence checks run in
+// constant evaluation: a collision or a mismatch is a build error, never a
+// runtime surprise. `str` equality is spelled out byte by byte for the same
+// reason — `==` on `str` is not callable in a const context.
+
+/// Compile-time string equality, byte by byte.
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Whether a stored type string is in a kind list — const, so the derive's
+/// coherence checks can ask it during constant evaluation.
+const fn contains_kind(kinds: &[&str], kind: &str) -> bool {
+    let mut i = 0;
+    while i < kinds.len() {
+        if str_eq(kinds[i], kind) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether two kind lists share no stored type string. The derive asserts
+/// this for every leaf against its delegate's [`FromBlock::CLAIMED_KINDS`]
+/// and against every sibling leaf's [`LeafKind::KINDS`], so a stored string
+/// with two owners — which the first-match parse chain would resolve silently
+/// to whichever comes first — cannot compile.
+#[must_use]
+pub const fn kinds_disjoint(a: &[&str], b: &[&str]) -> bool {
+    let mut i = 0;
+    while i < a.len() {
+        if contains_kind(b, a[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Whether every stored type string a descriptor set claims is in `kinds`.
+/// The write path keys off a descriptor's `kinds` and the read path keys off
+/// the leaf's [`LeafKind::KINDS`]; the derive asserts this over both consts
+/// of every leaf, so a descriptor whose kind the parse chain cannot resolve —
+/// a row the store would write and the read would hand to the inert fallback —
+/// cannot compile.
+#[must_use]
+pub const fn descriptor_kinds_claimed(
+    descriptors: &[crate::store::ContentDescriptor],
+    kinds: &[&str],
+) -> bool {
+    let mut i = 0;
+    while i < descriptors.len() {
+        let mut j = 0;
+        while j < descriptors[i].kinds.len() {
+            if !contains_kind(kinds, descriptors[i].kinds[j]) {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// How many stored type strings a set of kind lists holds in total — the
+/// length of what [`concat_kinds`] produces, evaluable in a const context so
+/// the derive can size the concatenated claim from the composed kinds' own
+/// declarations.
+#[must_use]
+pub const fn kind_count(sets: &[&[&'static str]]) -> usize {
+    let mut total = 0;
+    let mut i = 0;
+    while i < sets.len() {
+        total += sets[i].len();
+        i += 1;
+    }
+    total
+}
+
+/// Concatenate kind lists into one array at compile time, in order — a
+/// composing enum's [`FromBlock::CLAIMED_KINDS`], built from each composed
+/// kind's own declaration so no second list of stored strings exists
+/// anywhere. `N` must be [`kind_count`] of the same sets; the derive infers
+/// it from the annotated array type, and a mismatch fails the build.
+///
+/// # Panics
+///
+/// At compile time, if `N` differs from the sets' total — unreachable through
+/// the derive, which computes both from the same sets.
+#[must_use]
+pub const fn concat_kinds<const N: usize>(sets: &[&[&'static str]]) -> [&'static str; N] {
+    let mut out = [""; N];
+    let mut at = 0;
+    let mut i = 0;
+    while i < sets.len() {
+        let mut j = 0;
+        while j < sets[i].len() {
+            out[at] = sets[i][j];
+            at += 1;
+            j += 1;
+        }
+        i += 1;
+    }
+    assert!(
+        at == N,
+        "concat_kinds was given an N that is not the sets' total"
+    );
+    out
+}
+
 /// What the machinery requires of the kind it is instantiated over: behavior,
 /// representation, parse, and futures that can cross a task boundary.
 ///
@@ -289,10 +474,10 @@ impl<K: Agency + Projection + FromBlock + Send + Sync + 'static> RuntimeKind for
 /// its agency reads.
 ///
 /// Adding a kind is adding a variant and a module, and the compiler enforces
-/// completeness. The enum is closed today, which is why an unregistered type
-/// resolves to [`Unknown`] and goes silent; opening it to out-of-library kinds
-/// is what the extension mechanism is for, and [`Unknown`] documents where that
-/// gap currently lands.
+/// completeness. The enum is closed on purpose: out-of-library kinds compose
+/// AROUND it — a consumer's enum, derived with the same `Agency` derive,
+/// tries its own kinds first and delegates everything else here — so
+/// [`Unknown`] is reached only by a genuinely unrecognised type.
 #[derive(Debug, Clone)]
 pub enum BlockKind {
     /// Prose.
@@ -334,41 +519,83 @@ pub enum BlockKind {
     Unknown(Unknown),
 }
 
+/// One arm of the core parse chain: does the leaf's [`LeafKind::KINDS`] claim
+/// this stored string, and if so, which variant does its parse feed?
+///
+/// A macro instead of seventeen hand-written if-returns so the shape cannot
+/// drift per kind — the same reason the dispatch below is one macro. The type
+/// strings themselves live on the leaf kinds as consts; nothing here names
+/// one.
+macro_rules! try_leaf {
+    ($block:ident, $stored:ident, $leaf:ty => $variant:ident) => {
+        if <$leaf>::KINDS.contains(&$stored) {
+            return Self::$variant(<$leaf>::parse($block));
+        }
+    };
+}
+
 impl FromBlock for BlockKind {
+    /// The library's seventeen stored type strings, concatenated at compile
+    /// time from the leaf kinds' own `KINDS` consts — the same "one place per
+    /// kind" rule the parse chain below reads by, so the claim cannot drift
+    /// from what the chain resolves. [`Unknown`] claims nothing: it is the
+    /// fallback, not an owner.
+    const CLAIMED_KINDS: &'static [&'static str] = {
+        const SETS: &[&[&str]] = &[
+            Text::KINDS,
+            Quote::KINDS,
+            Code::KINDS,
+            Thinking::KINDS,
+            ToolCall::KINDS,
+            ToolResult::KINDS,
+            ToolError::KINDS,
+            Status::KINDS,
+            SystemPrompt::KINDS,
+            Streaming::KINDS,
+            StreamingThinking::KINDS,
+            StreamingToolCall::KINDS,
+            ApprovalRequest::KINDS,
+            ApprovalDecision::KINDS,
+            DateMarker::KINDS,
+            MetadataTitleRequest::KINDS,
+            MetadataTitleResponse::KINDS,
+        ];
+        const CONCATENATED: [&str; kind_count(SETS)] = concat_kinds(SETS);
+        &CONCATENATED
+    };
+
     /// Resolve a stored row to its typed kind.
     ///
-    /// This is the ONE place in the library a stored type string is compared
-    /// to a literal. Every other comparison would be a second table of type
-    /// names, and two tables of the same names is how a kind ends up behaving
-    /// one way in the drive and another way in a query.
+    /// The chain reads each leaf kind's [`LeafKind::KINDS`] const, so the one
+    /// place a stored type string is written is the leaf kind that owns it —
+    /// one place per implementor. A second table of the same names is how a
+    /// kind ends up behaving one way in the drive and another way in a query,
+    /// which is why this function carries no literal of its own.
     fn from_block(block: &Block) -> Self {
-        match block.block_type.as_str() {
-            "text" => Self::Text(Text::parse(block)),
-            "quote" => Self::Quote(Quote::parse(block)),
-            "code" => Self::Code(Code::parse(block)),
-            "thinking" => Self::Thinking(Thinking::parse(block)),
-            "tool_call" => Self::ToolCall(ToolCall::parse(block)),
-            "tool_result" => Self::ToolResult(ToolResult::parse(block)),
-            "tool_error" => Self::ToolError(ToolError::parse(block)),
-            "status" => Self::Status(Status::parse(block)),
-            "system_prompt" => Self::SystemPrompt(SystemPrompt::parse(block)),
-            "streaming" => Self::Streaming(Streaming),
-            "streaming_thinking" => Self::StreamingThinking(StreamingThinking),
-            "streaming_tool_call" => Self::StreamingToolCall(StreamingToolCall),
-            "approval_request" => Self::ApprovalRequest(ApprovalRequest::parse(block)),
-            "approval_decision" => Self::ApprovalDecision(ApprovalDecision::parse(block)),
-            "date_marker" => Self::DateMarker(DateMarker::parse(block)),
-            "title_request" => Self::MetadataTitleRequest(MetadataTitleRequest::parse(block)),
-            "title_response" => Self::MetadataTitleResponse(MetadataTitleResponse),
-            other => {
-                tracing::warn!(
-                    block_id = block.id,
-                    block_type = other,
-                    "unknown block type — inert agency"
-                );
-                Self::Unknown(Unknown::parse(block))
-            }
-        }
+        let stored = block.block_type.as_str();
+        try_leaf!(block, stored, Text => Text);
+        try_leaf!(block, stored, Quote => Quote);
+        try_leaf!(block, stored, Code => Code);
+        try_leaf!(block, stored, Thinking => Thinking);
+        try_leaf!(block, stored, ToolCall => ToolCall);
+        try_leaf!(block, stored, ToolResult => ToolResult);
+        try_leaf!(block, stored, ToolError => ToolError);
+        try_leaf!(block, stored, Status => Status);
+        try_leaf!(block, stored, SystemPrompt => SystemPrompt);
+        try_leaf!(block, stored, Streaming => Streaming);
+        try_leaf!(block, stored, StreamingThinking => StreamingThinking);
+        try_leaf!(block, stored, StreamingToolCall => StreamingToolCall);
+        try_leaf!(block, stored, ApprovalRequest => ApprovalRequest);
+        try_leaf!(block, stored, ApprovalDecision => ApprovalDecision);
+        try_leaf!(block, stored, DateMarker => DateMarker);
+        try_leaf!(block, stored, MetadataTitleRequest => MetadataTitleRequest);
+        try_leaf!(block, stored, MetadataTitleResponse => MetadataTitleResponse);
+        tracing::warn!(
+            block_id = block.id,
+            block_type = stored,
+            "unknown block type — inert agency"
+        );
+        Self::Unknown(Unknown::parse(block))
     }
 }
 

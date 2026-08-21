@@ -20,8 +20,10 @@ pub struct SystemPrompt {
     pub content: String,
 }
 
-impl SystemPrompt {
-    pub(super) fn parse(block: &Block) -> Self {
+impl super::LeafKind for SystemPrompt {
+    const KINDS: &'static [&'static str] = &["system_prompt"];
+
+    fn parse(block: &Block) -> Self {
         Self {
             role: block.role,
             content: super::string_field(block, "content"),

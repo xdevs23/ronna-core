@@ -42,6 +42,10 @@ _sse = ["dep:eventsource-stream"]
 # is stored in, and — since the provider layer — the HTTP and stream machinery
 # the model boundary is made of.
 [dependencies]
+# The composing-enum derive, re-exported so one `use agent_ledger::Agency`
+# brings the trait and its derive together. A build-host dependency in effect:
+# a procedural macro is never linked into a consumer's binary.
+agent-ledger-derive = { path = "../agent-ledger-derive", version = "0.1.0" }
 chrono = "0.4"
 # The wire an event stream arrives on. Only a vendor module reads one, so it
 # rides in with the first vendor a consumer enables.

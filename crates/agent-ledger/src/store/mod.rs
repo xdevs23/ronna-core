@@ -54,6 +54,7 @@ pub use conversations::{
 };
 pub use descriptors::{
     Column, ColumnRef, ColumnType, ContentDescriptor, DomainMigrations, StoreConfig,
+    concat_descriptors, descriptor_count,
 };
 pub use drafts::DraftBlock;
 pub use messages::ToolCallInsert;

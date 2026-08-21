@@ -11,7 +11,7 @@
 
 use crate::block::{Block, Role};
 
-use super::{Agency, Projection};
+use super::{Agency, LeafKind, Projection};
 
 /// Caps the frontier by HAVING no ask — no turn fires past an interrupt.
 #[derive(Debug, Clone)]
@@ -20,8 +20,10 @@ pub struct Status {
     pub role: Option<Role>,
 }
 
-impl Status {
-    pub(super) fn parse(block: &Block) -> Self {
+impl LeafKind for Status {
+    const KINDS: &'static [&'static str] = &["status"];
+
+    fn parse(block: &Block) -> Self {
         Self { role: block.role }
     }
 }
@@ -42,6 +44,14 @@ impl Projection for Status {
 #[derive(Debug, Clone, Copy)]
 pub struct Streaming;
 
+impl LeafKind for Streaming {
+    const KINDS: &'static [&'static str] = &["streaming"];
+
+    fn parse(_: &Block) -> Self {
+        Self
+    }
+}
+
 impl Agency for Streaming {
     fn durable(&self) -> bool {
         false
@@ -54,6 +64,14 @@ impl Projection for Streaming {}
 /// the cursor never rests on it.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamingThinking;
+
+impl LeafKind for StreamingThinking {
+    const KINDS: &'static [&'static str] = &["streaming_thinking"];
+
+    fn parse(_: &Block) -> Self {
+        Self
+    }
+}
 
 impl Agency for StreamingThinking {
     fn durable(&self) -> bool {
@@ -72,6 +90,14 @@ impl Projection for StreamingThinking {}
 #[derive(Debug, Clone, Copy)]
 pub struct StreamingToolCall;
 
+impl LeafKind for StreamingToolCall {
+    const KINDS: &'static [&'static str] = &["streaming_tool_call"];
+
+    fn parse(_: &Block) -> Self {
+        Self
+    }
+}
+
 impl Agency for StreamingToolCall {
     fn durable(&self) -> bool {
         false
@@ -88,12 +114,11 @@ impl Projection for StreamingToolCall {}
 /// groups under its stored role, so an unknown record between two same-role
 /// blocks does not split their message.
 ///
-/// This is also where an unregistered consumer kind lands today: the typed
-/// layer is a closed enum, so a consumer's own type string resolves here and
-/// goes silent, with no way for the consumer to give it behavior. Stage 3's
-/// extension mechanism replaces that silence with registration — a registered
-/// kind resolves through its own implementation, and only a genuinely
-/// unrecognised type reaches this fallback.
+/// A consumer kind that was never composed into the runtime's kind set lands
+/// here too, and the conformance kit's parse check is what catches that
+/// mistake. A composed kind — a variant of a consumer's derived enum — resolves
+/// through its own implementation, so only a genuinely unrecognised type
+/// reaches this fallback.
 #[derive(Debug, Clone)]
 pub struct Unknown {
     /// The role the row carries, under which the record groups.

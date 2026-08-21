@@ -38,8 +38,10 @@ pub struct ToolCall {
     pub interactive: bool,
 }
 
-impl ToolCall {
-    pub(super) fn parse(block: &Block) -> Self {
+impl super::LeafKind for ToolCall {
+    const KINDS: &'static [&'static str] = &["tool_call"];
+
+    fn parse(block: &Block) -> Self {
         Self {
             id: block.id,
             role: block.role,
@@ -53,7 +55,9 @@ impl ToolCall {
                 .unwrap_or(false),
         }
     }
+}
 
+impl ToolCall {
     /// Does a result or an error for this call follow it in the ledger?
     ///
     /// Keyed on the specific call id, never on kind alone — an unrelated result

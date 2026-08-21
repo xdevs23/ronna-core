@@ -24,8 +24,10 @@ pub struct ApprovalDecision {
     pub approved: bool,
 }
 
-impl ApprovalDecision {
-    pub(super) fn parse(block: &Block) -> Self {
+impl super::LeafKind for ApprovalDecision {
+    const KINDS: &'static [&'static str] = &["approval_decision"];
+
+    fn parse(block: &Block) -> Self {
         Self {
             id: block.id,
             for_block_id: super::i64_field(block, "for_block_id"),
