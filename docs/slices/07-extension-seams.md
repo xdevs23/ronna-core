@@ -137,9 +137,20 @@ the vocabulary list bans the plural.
 
 ## Acceptance criteria
 
-- **AC7-1** Wave 1 ends green at current counts (392 all-features / 289 default) with
-  behavior unchanged; edits to tests are type-annotation plumbing, enumerated in the
-  report. Clippy (all-features and mistral-only), fmt, doc clean.
+- **AC7-1** Wave 1 ends green at current counts with behavior unchanged; edits to tests
+  are mechanical, enumerated in the report.
+  Amended 2026-08-21 after the wave: two clauses were over-strict for a wave that moves a
+  boundary, and the review correctly failed them as written. (1) "Behavior unchanged" is
+  scoped: moving the last vendor onto the shared projection changes that vendor's replay
+  wire where its private builder disagreed with the recorded fold policy. Three kimi wire
+  changes are accepted and pinned by test: a text-only turn replays an empty reasoning
+  field (the shared policy drops completed turns' reasoning, as every other vendor already
+  did); streaming tails are not replayed (coherent with the interrupt teardown, which
+  deletes those rows — the old fallback replayed rows that no longer survive an interrupt);
+  and multi-line quotes take the shared per-line prefix. (2) "Type-annotation plumbing"
+  becomes: mechanical edits enumerated, and any re-pin that records a boundary consequence
+  names the traded behavior in its own doc — a trade must read as a trade, never as a
+  rename.
 - **AC7-2** Wave 2: the core kinds' statements are byte-identical to before (asserted by
   test against the literals); a test descriptor's table is created by its domain migration,
   validated at open, loaded, woken on, forked, collected and torn down — each pinned.
