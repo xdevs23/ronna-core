@@ -31,6 +31,14 @@
 //! record is the failure that shaped this layer. The library ships no tool of
 //! its own; a tool knows what a product does.
 //!
+//! [`actor`] is the runtime's top: a consumer bundles the store, the bus, the
+//! provider registry and the tool registry into a [`RuntimeContext`] and calls
+//! [`spawn_reactor`] once. From then on every intent travels the bus — an
+//! append, an interrupt, an approval verdict — and per conversation one
+//! scheduler drives the ratchet, one actor owns the provider channel and the
+//! latch, the ingestion reader turns the provider's stream into blocks, and
+//! the metadata worker drives the second ledger behind the same latch.
+//!
 //! ```
 //! use agent_ledger::{bus::EventBus, event::CoreEvent};
 //!
@@ -41,22 +49,26 @@
 //! assert_eq!(seq, 1);
 //! ```
 
+pub mod actor;
 pub mod agency;
 pub mod block;
 pub mod bus;
 pub mod event;
+mod ingestion;
+mod metadata;
 pub mod providers;
 pub mod reactivity;
 pub mod store;
 pub mod tools;
 pub mod types;
 
+pub use actor::{RuntimeContext, spawn_reactor};
 pub use agency::{Agency, AgencyCtx, BlockKind, ContentPart, GateDecision, Projection};
 pub use block::{
     Block, OpaquePayload, RESERVED_FIELD_NAMES, ReasoningDetailEntry, Role, ToolCallResult,
 };
 pub use bus::{AttachOutcome, EventBus, PushEnvelope, PushSink, RuntimeEvent};
-pub use event::CoreEvent;
+pub use event::{AsCoreEvent, CoreEvent};
 pub use providers::{
     LlmError, ProviderModule, ProviderRegistry, ProviderRequest, ProviderResponse, StreamEvent,
     blocks_to_messages,

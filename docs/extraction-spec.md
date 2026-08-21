@@ -200,10 +200,19 @@ executions.
 | `store/migrations.rs` (902) | One flat array under one pragma counter, whose individual steps create framework and product tables in single indivisible statements | Cannot be split by partitioning. Rewrite as a library-owned sequence plus a consumer-owned one, with a stated upgrade path for an existing installed database |
 | `store/mod.rs` | The constructor runs a product-specific import on open | The library constructor takes a database path and nothing else |
 
-### Not classified, deliberately
+### Not classified, deliberately — dispositioned 2026-08-21
 
-`deferred.rs` (74) and `lattice/` (262) were unclassified in revision 1. They are read and
-dispositioned before Stage 2, not assumed.
+`deferred.rs` (74) and `lattice/` (262) were unclassified in revision 1. Read and
+dispositioned at the close of Stage 2:
+
+- `deferred.rs` — **stays.** An async-initialized state cell whose own doc names the source
+  application's desktop shell as the reason it exists (a sibling handle managed as shell
+  state). The library's context is constructed complete; nothing here initializes late. If a
+  consumer needs the pattern, it is four lines over a `OnceCell`.
+- `lattice/` — **stays.** The source application's internal agent-to-agent message router,
+  keyed on its own agent identity type from a module that stays. The runtime's bus already
+  carries every event this library emits; a second in-process router would be a second kind
+  of the same thing.
 
 ## Proving the move changed nothing
 

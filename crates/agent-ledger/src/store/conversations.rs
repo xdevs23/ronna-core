@@ -246,15 +246,21 @@ impl Store {
     /// conversation's orchestration state; block storage stays append-only and
     /// immutable.
     ///
-    /// # This write wakes the loop that made it
+    /// # This write wakes the loop that made it — ruled, 2026-08-21
     ///
     /// The row lives in `conversations`, which the change hook names, so
     /// confirming progress announces a change and the drive loop ticks again.
-    /// The cost is one extra no-op tick per confirm, bounded: a drive with
-    /// nothing to do goes back to sleep. It is left in place here because
-    /// severing the edge means changing what the scheduler treats as a wakeup,
-    /// and the actor slice owns that decision — this is where it will find the
-    /// edge when it makes it.
+    /// The ruling, made with the actor slice as promised here: the scheduler
+    /// TOLERATES the edge rather than filtering the wake. The cost is one
+    /// extra no-op tick per confirm and it is bounded — the extra tick
+    /// re-reads, confirms nothing new, writes nothing, and therefore announces
+    /// nothing, so the edge feeds back exactly once and rests. The test
+    /// `actor::tests::cursor_confirm_wakes_once_and_converges_to_rest` pins
+    /// that convergence. Filtering was rejected because the wake path is
+    /// deliberately kind- and column-blind: a filter would need the scheduler
+    /// to sort table columns into "orchestration" and "content", a
+    /// distinction nothing else in the machinery draws, and the first new
+    /// column would silently fall on the wrong side of it.
     ///
     /// # Errors
     ///

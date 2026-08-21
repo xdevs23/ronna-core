@@ -228,6 +228,62 @@ pub enum CoreEvent {
     ConversationsChanged {},
 }
 
+/// The reverse of the `From<CoreEvent>` conversion the bus is built on: give
+/// the runtime back its own event, when this one is one.
+///
+/// The bus carries the CONSUMER'S event type, and the runtime publishes into it
+/// through `From<CoreEvent>`. That covers the outbound direction only. The
+/// runtime also has in-process loops of its own — the reactor that routes
+/// intents to a conversation actor, the executor that consumes tool wakeups,
+/// the metadata fulfillment actor — and those subscribe to the same bus, so
+/// what they receive is the consumer's type. This trait is how they recognise
+/// the runtime's events inside it without the library ever matching on a
+/// consumer's variants.
+///
+/// A consumer's composed enum implements it in one line per direction:
+///
+/// ```
+/// use agent_ledger::event::{AsCoreEvent, CoreEvent};
+///
+/// #[derive(Clone)]
+/// enum AppEvent {
+///     Core(CoreEvent),
+///     SearchProvidersChanged,
+/// }
+///
+/// impl From<CoreEvent> for AppEvent {
+///     fn from(event: CoreEvent) -> Self {
+///         Self::Core(event)
+///     }
+/// }
+///
+/// impl AsCoreEvent for AppEvent {
+///     fn as_core(&self) -> Option<&CoreEvent> {
+///         match self {
+///             Self::Core(event) => Some(event),
+///             Self::SearchProvidersChanged => None,
+///         }
+///     }
+/// }
+/// ```
+///
+/// The pairing is deliberately NOT part of the bus's own bound: publishing
+/// needs only `From<CoreEvent>`, and a consumer that never runs the session
+/// actor should not owe an implementation to a seam it does not use. The two
+/// traits describe one event type travelling in two directions — not two kinds
+/// of event.
+pub trait AsCoreEvent {
+    /// The runtime's own view of this event, or `None` when it is a variant
+    /// the consumer added and the runtime has no business reading.
+    fn as_core(&self) -> Option<&CoreEvent>;
+}
+
+impl AsCoreEvent for CoreEvent {
+    fn as_core(&self) -> Option<&CoreEvent> {
+        Some(self)
+    }
+}
+
 impl CoreEvent {
     /// Extract the `conversation_id` for routing. Returns `None` for global
     /// events.
