@@ -699,16 +699,22 @@ async fn composes_over_a_store_built_ledger_byte_stably() {
         .await
         .unwrap();
 
-    let first = neutral(&store.list_blocks(conversation).await.unwrap());
-    let second = neutral(&store.list_blocks(conversation).await.unwrap());
+    // Two loads and two renders, compared as the BYTES each render writes.
+    // Serializing a `Value` instead would compare a normalized round trip: its
+    // maps are sorted on the way in, so a field order that changed between runs
+    // — one of the two drifts this assertion exists to catch — would come out
+    // identical either way and the check could not fail.
+    let render_bytes =
+        |blocks: &[Block]| serde_json::to_string(&blocks_to_messages(blocks)).unwrap();
+    let first_bytes = render_bytes(&store.list_blocks(conversation).await.unwrap());
+    let second_bytes = render_bytes(&store.list_blocks(conversation).await.unwrap());
     assert_eq!(
-        serde_json::to_string(&first).unwrap(),
-        serde_json::to_string(&second).unwrap(),
+        first_bytes, second_bytes,
         "the same ledger renders to the same bytes"
     );
 
     assert_eq!(
-        first,
+        serde_json::from_str::<Value>(&first_bytes).unwrap(),
         json!([
             { "role": "system", "content": "be terse" },
             { "role": "user", "content": "what is x?" },

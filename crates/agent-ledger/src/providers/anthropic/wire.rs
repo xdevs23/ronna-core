@@ -257,6 +257,17 @@ pub(super) struct AnthropicSseState {
     /// `Some` while a thinking block is open, holding the accumulated
     /// signature — possibly empty, since not every stream signs.
     thinking: Option<String>,
+    /// Whether the content block currently open is a tool call.
+    ///
+    /// The stop event names no kind, so the kind is remembered from the start.
+    /// Without it every stop that was not a thinking block ended a tool call
+    /// that never began, and a text-only answer closed with an unmatched tool
+    /// end — an event whoever writes the stream down has no call to attach to.
+    tool_open: bool,
+    /// The input count from the start of the message, held until the end of the
+    /// turn carries it out. This vendor reports it once, at the start, and
+    /// nowhere else.
+    input_tokens: u32,
 }
 
 pub(super) fn parse_sse_event(
@@ -274,6 +285,12 @@ pub(super) fn parse_sse_event(
 
     match event_type {
         "content_block_delta" => content_block_delta(&value, state),
+        // The only event carrying what the request cost, so it is the one place
+        // that count can be read.
+        "message_start" => {
+            state.input_tokens = count(&value["message"]["usage"]["input_tokens"]);
+            vec![]
+        }
         "content_block_start" => {
             match value["content_block"]["type"].as_str().unwrap_or("") {
                 "tool_use" => {
@@ -285,6 +302,7 @@ pub(super) fn parse_sse_event(
                         .as_str()
                         .unwrap_or("")
                         .to_string();
+                    state.tool_open = true;
                     state
                         .tool_buffer
                         .push(StreamEvent::ToolUseStart { id, name });
@@ -304,7 +322,12 @@ pub(super) fn parse_sse_event(
                     (!signature.is_empty()).then_some(OpaquePayload::Anthropic { signature });
                 return vec![Ok(StreamEvent::ThinkingEnd { opaque })];
             }
-            state.tool_buffer.push(StreamEvent::ToolUseEnd);
+            // Only a block that started as a tool call ends as one. A text
+            // block's stop closes nothing: text is finalized by the end of the
+            // turn, and a tool end here would name a call that never started.
+            if std::mem::take(&mut state.tool_open) {
+                state.tool_buffer.push(StreamEvent::ToolUseEnd);
+            }
             vec![]
         }
         "message_delta" => {
@@ -314,7 +337,11 @@ pub(super) fn parse_sse_event(
                 _ => StopReason::EndTurn,
             };
             let usage = Usage {
-                input_tokens: 0,
+                // The end of the turn restates the input count on some
+                // versions of this wire and omits it on others; the count from
+                // the start of the message is the fallback, never a zero.
+                input_tokens: count_opt(&value["usage"]["input_tokens"])
+                    .unwrap_or(state.input_tokens),
                 output_tokens: count(&value["usage"]["output_tokens"]),
                 reasoning_tokens: None,
             };
@@ -361,11 +388,15 @@ fn content_block_delta(
                 .push_str(fragment);
             vec![]
         }
+        // An argument fragment belongs to a tool block, so it also marks one
+        // open: a fragment that arrives without its block start still ends
+        // with a matching tool end.
         "input_json_delta" => {
             let json = value["delta"]["partial_json"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            state.tool_open = true;
             state
                 .tool_buffer
                 .push(StreamEvent::ToolUseInputDelta { json });
@@ -375,11 +406,14 @@ fn content_block_delta(
     }
 }
 
-/// A token count, read defensively. An absent or oversized value reads as the
-/// nearest honest number rather than panicking on a field a vendor changed.
+/// A token count where the vendor stated one, read defensively: an absent or
+/// oversized value is no count at all rather than a panic on a field a vendor
+/// changed.
+fn count_opt(value: &Value) -> Option<u32> {
+    value.as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
+/// A token count, with an unstated one read as zero.
 fn count(value: &Value) -> u32 {
-    value
-        .as_u64()
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0)
+    count_opt(value).unwrap_or(0)
 }

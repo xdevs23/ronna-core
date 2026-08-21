@@ -73,7 +73,7 @@ pub mod types;
 
 #[cfg(feature = "anthropic")]
 pub mod anthropic;
-#[cfg(feature = "_chat")]
+#[cfg(feature = "_chat_stream")]
 mod chat;
 #[cfg(feature = "kimi")]
 pub mod kimi;

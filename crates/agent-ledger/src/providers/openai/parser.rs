@@ -452,19 +452,18 @@ fn terminal_event(
         ResponseStatus::Failed => {
             // A server verdict delivered inside a successful stream. Terminal:
             // reconnecting would re-run a request the server has already judged.
+            // It is NOT an API error — the request was answered, with a 200 —
+            // so it carries the provider's own code and message and no status
+            // at all, rather than a 200 that would read as a success.
             let code = response["error"]["code"].as_str().unwrap_or("unknown");
             let message = response["error"]["message"]
                 .as_str()
                 .unwrap_or("response failed");
-            vec![Err(LlmError::Api {
-                status: 200,
-                message: format!("{code}: {message}"),
-            })]
+            vec![Err(LlmError::ProviderFailure(format!("{code}: {message}")))]
         }
-        ResponseStatus::Cancelled => vec![Err(LlmError::Api {
-            status: 200,
-            message: "response cancelled by server".into(),
-        })],
+        ResponseStatus::Cancelled => vec![Err(LlmError::ProviderFailure(
+            "response cancelled by server".into(),
+        ))],
         // A non-terminal status on a terminal-named event is a protocol
         // violation. Ignore it rather than fabricating an end of turn that
         // would commit a half-written answer.

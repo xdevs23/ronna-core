@@ -18,18 +18,21 @@ workspace = true
 # contract, the render pass and the registries are always present — a vendor
 # feature adds a wire, never a capability the rest of the layer depends on.
 #
-# The two underscore-prefixed features are internal wiring, not a public
-# surface: `_sse` carries the event-stream reader every vendor needs, and
-# `_chat` carries the shared OpenAI-compatible chat base that two vendors are
-# built on. Naming them directly buys a consumer nothing.
+# The underscore-prefixed features are internal wiring, not a public surface:
+# `_sse` carries the event-stream reader every vendor needs, `_chat_stream`
+# carries the shared chat-completions stream decoder — read by every vendor
+# whose RESPONSES take that shape, including one that builds its own requests —
+# and `_chat` carries the request base on top of it, which two vendors compose
+# with. Naming any of them directly buys a consumer nothing.
 [features]
 default = []
 anthropic = ["_sse"]
-kimi = ["_sse", "dep:uuid"]
+kimi = ["_chat_stream", "dep:uuid"]
 mistral = ["_chat"]
 openai = ["_sse"]
 openrouter = ["_chat"]
-_chat = ["_sse"]
+_chat = ["_chat_stream"]
+_chat_stream = ["_sse"]
 _sse = ["dep:eventsource-stream"]
 
 # The dependency set is deliberately small and stays that way: a library that

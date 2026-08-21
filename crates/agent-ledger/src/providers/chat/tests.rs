@@ -1,10 +1,13 @@
 //! The chat base's own pins: the reasoning ingest and the deferred end of turn.
 
-use serde_json::json;
+use reqwest::header::HeaderMap;
+use serde_json::{Value, json};
 
+use super::base::*;
 use super::sse::{SseState, finish_stream, parse_sse_chunk};
-use super::*;
-use crate::providers::types::{ReasoningDetailEntry, StopReason, StreamEvent};
+use crate::providers::types::{
+    CompletionRequest, OpaquePayload, ReasoningDetailEntry, ReasoningLevel, StopReason, StreamEvent,
+};
 
 // The fixtures read better built inline at each call site, so these helpers
 // take the value rather than a reference to one.
@@ -621,6 +624,131 @@ mod usage_tests {
                 ] if a_id == "call_a" && b_id == "call_b"
             ),
             "two starts, one terminal close: {events:?}"
+        );
+    }
+
+    /// Two calls on a stream that never sends an index stay two calls. The
+    /// index fix originally keyed every index-less fragment to the most recent
+    /// call, which collapsed two distinct index-less calls into one and
+    /// concatenated their argument JSON into garbage — a regression on exactly
+    /// the vendor path (the shared decoder's second consumer) whose wire sends
+    /// no index at all. Identity without an index comes from the fragment's
+    /// shape: id or name opens a call, a bare argument fragment extends one.
+    #[test]
+    fn index_less_calls_stay_distinct() {
+        let mut state = SseState::default();
+        for fragment in [
+            json!({ "id": "call_a", "function": { "name": "one", "arguments": "" } }),
+            json!({ "function": { "arguments": "{\"x\":0}" } }),
+            json!({ "id": "call_b", "function": { "name": "two", "arguments": "" } }),
+            json!({ "function": { "arguments": "{\"y\":1}" } }),
+        ] {
+            parse(
+                json!({ "choices": [{ "delta": { "tool_calls": [fragment] } }] }),
+                &mut state,
+            );
+        }
+        parse(
+            json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] }),
+            &mut state,
+        );
+        let events = parse(
+            json!({ "choices": [], "usage": { "prompt_tokens": 1, "completion_tokens": 2 } }),
+            &mut state,
+        );
+        let [
+            StreamEvent::MessageEnd { .. },
+            StreamEvent::ToolUseStart {
+                id: a_id,
+                name: a_name,
+            },
+            StreamEvent::ToolUseInputDelta { json: a_args },
+            StreamEvent::ToolUseStart {
+                id: b_id,
+                name: b_name,
+            },
+            StreamEvent::ToolUseInputDelta { json: b_args },
+            StreamEvent::ToolUseEnd,
+        ] = events.as_slice()
+        else {
+            panic!("expected two distinct calls, got {events:?}");
+        };
+        assert_eq!(
+            (a_id.as_str(), a_name.as_str(), a_args.as_str()),
+            ("call_a", "one", "{\"x\":0}")
+        );
+        assert_eq!(
+            (b_id.as_str(), b_name.as_str(), b_args.as_str()),
+            ("call_b", "two", "{\"y\":1}")
+        );
+    }
+
+    /// Interleaved fragments belong to the call their INDEX names, not to
+    /// whichever call spoke last. The wire streams two calls as index 0's name,
+    /// index 1's name, index 0's arguments, index 1's arguments — an
+    /// arrival-ordered buffer splices each call's arguments onto the other, and
+    /// the model is recorded as having asked for something it never asked for.
+    #[test]
+    fn interleaved_fragments_stay_with_their_own_call() {
+        let mut state = SseState::default();
+        parse(
+            json!({ "choices": [{ "delta": { "tool_calls": [
+                { "index": 0, "id": "call_a", "function": { "name": "search", "arguments": "" } }
+            ] } }] }),
+            &mut state,
+        );
+        parse(
+            json!({ "choices": [{ "delta": { "tool_calls": [
+                { "index": 1, "id": "call_b", "function": { "name": "fetch", "arguments": "" } }
+            ] } }] }),
+            &mut state,
+        );
+        // From here the two calls' argument fragments alternate.
+        for (index, fragment) in [
+            (0, "{\"q\":"),
+            (1, "{\"u\":"),
+            (0, "\"rust\"}"),
+            (1, "\"https://x\"}"),
+        ] {
+            parse(
+                json!({ "choices": [{ "delta": { "tool_calls": [
+                    { "index": index, "function": { "arguments": fragment } }
+                ] } }] }),
+                &mut state,
+            );
+        }
+        parse(
+            json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] }),
+            &mut state,
+        );
+
+        let events = parse(
+            json!({ "choices": [], "usage": { "prompt_tokens": 1, "completion_tokens": 2 } }),
+            &mut state,
+        );
+        let [
+            StreamEvent::MessageEnd { .. },
+            StreamEvent::ToolUseStart {
+                id: a_id,
+                name: a_name,
+            },
+            StreamEvent::ToolUseInputDelta { json: a_args },
+            StreamEvent::ToolUseStart {
+                id: b_id,
+                name: b_name,
+            },
+            StreamEvent::ToolUseInputDelta { json: b_args },
+            StreamEvent::ToolUseEnd,
+        ] = events.as_slice()
+        else {
+            panic!("expected two complete calls and one close, got {events:?}");
+        };
+        assert_eq!((a_id.as_str(), a_name.as_str()), ("call_a", "search"));
+        assert_eq!(a_args, "{\"q\":\"rust\"}", "the first call's own arguments");
+        assert_eq!((b_id.as_str(), b_name.as_str()), ("call_b", "fetch"));
+        assert_eq!(
+            b_args, "{\"u\":\"https://x\"}",
+            "the second call's own arguments"
         );
     }
 

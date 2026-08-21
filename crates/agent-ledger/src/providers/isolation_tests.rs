@@ -128,6 +128,54 @@ fn no_wire_shape_is_built_outside_a_vendor_module() {
     );
 }
 
+/// Every HTTP client in this crate is built through the one guarded
+/// constructor.
+///
+/// The guard lives in that constructor, so it covers a client built through it
+/// and nothing else — which makes "every client comes from there" the whole of
+/// what the guard guarantees, and an unenforced claim about it worthless. One
+/// test had already built its own client directly, against a comment saying
+/// none could.
+///
+/// The scan is textual for the same reason the wire scan is: the bypass is a
+/// call that compiles perfectly well, and no type a test could reflect over
+/// records which constructor a client came from.
+#[test]
+fn no_file_outside_the_guarded_constructor_builds_a_client() {
+    // Every reqwest construction form: the plain constructor, the default,
+    // and both spellings of the builder. A scan that knew only one form let a
+    // builder-built client through while the prose claimed none could exist.
+    const BYPASS: [&str; 4] = [
+        "Client::new",
+        "Client::default",
+        "Client::builder",
+        "ClientBuilder::new",
+    ];
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_sources(&src, &mut files);
+
+    let mut hits = Vec::new();
+    for path in &files {
+        let name = path.to_string_lossy().replace('\\', "/");
+        // The constructor itself, and this file, which holds the marker.
+        if name.ends_with("/providers/http.rs") || name.ends_with("/providers/isolation_tests.rs") {
+            continue;
+        }
+        let body = std::fs::read_to_string(path).expect("a readable source file");
+        if BYPASS.iter().any(|form| body.contains(form)) {
+            hits.push(format!("{} builds a client of its own", path.display()));
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "a client escaped the guarded constructor:\n{}",
+        hits.join("\n")
+    );
+}
+
 /// The vocabulary this library must not speak, checked where it would appear.
 ///
 /// The list is committed beside the extraction spec so the check has a referent

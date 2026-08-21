@@ -380,20 +380,34 @@ fn openai_reasoning_for_slug(external_id: &str) -> ReasoningCapability {
 }
 
 /// Strip a trailing dated snapshot suffix so a dated pin resolves to its family.
+///
+/// The cut point is checked against character boundaries before anything is
+/// sliced. A model id is text a provider chose, this library only passes it
+/// through, and a byte index landing inside a multi-byte character panics —
+/// which would crash the model list over an id nobody here controls. A suffix
+/// this function recognises is ASCII by construction, so a boundary that does
+/// not hold means there is no dated suffix to strip.
 fn normalize_openai_slug(external_id: &str) -> &str {
+    /// The length of `-YYYY-MM-DD`.
     const DATED_LEN: usize = 11;
-    if external_id.len() > DATED_LEN {
-        let tail = &external_id[external_id.len() - DATED_LEN..];
-        let t = tail.as_bytes();
-        if t[0] == b'-'
-            && t[1..5].iter().all(u8::is_ascii_digit)
-            && t[5] == b'-'
-            && t[6..8].iter().all(u8::is_ascii_digit)
-            && t[8] == b'-'
-            && t[9..11].iter().all(u8::is_ascii_digit)
-        {
-            return &external_id[..external_id.len() - DATED_LEN];
-        }
+
+    let Some(cut) = external_id
+        .len()
+        .checked_sub(DATED_LEN)
+        .filter(|cut| *cut > 0 && external_id.is_char_boundary(*cut))
+    else {
+        return external_id;
+    };
+
+    let t = &external_id.as_bytes()[cut..];
+    if t[0] == b'-'
+        && t[1..5].iter().all(u8::is_ascii_digit)
+        && t[5] == b'-'
+        && t[6..8].iter().all(u8::is_ascii_digit)
+        && t[8] == b'-'
+        && t[9..11].iter().all(u8::is_ascii_digit)
+    {
+        return &external_id[..cut];
     }
     external_id
 }

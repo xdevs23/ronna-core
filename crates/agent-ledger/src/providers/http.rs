@@ -3,14 +3,18 @@
 //! Every client in this library is built here, and that is the point rather
 //! than a convenience: the idle window, the connect timeout and the identity
 //! this library presents are single answers, and a vendor module that built its
-//! own client would be a second answer nobody would notice had drifted.
+//! own client would be a second answer nobody would notice had drifted. "Every"
+//! is checked rather than asserted — a source scan in `isolation_tests.rs`
+//! fails on any file outside this one that constructs a client — because the
+//! guarantee below is only as good as that word.
 //!
-//! It is also what makes "no test reaches a vendor" a property of the code. In
-//! test builds this constructor binds every client's socket to the loopback
-//! interface, so a connection to anything else cannot be established and no
-//! packet leaves the machine. A guard that lives in one constructor covers a
-//! vendor module written next year; a guard that lives in the test runner
-//! covers only the tests someone remembered to run under it.
+//! It is what makes "no test reaches a vendor" a property of the code. In test
+//! builds this constructor binds every client's socket to the loopback
+//! interface, so the operating system refuses a connection to any other
+//! address: a request from a client built here can reach nothing beyond this
+//! machine's own loopback, and no packet leaves it. A guard that lives in one
+//! constructor covers a vendor module written next year; a guard that lives in
+//! the test runner covers only the tests someone remembered to run under it.
 
 use std::time::Duration;
 

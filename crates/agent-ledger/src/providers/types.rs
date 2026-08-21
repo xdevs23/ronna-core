@@ -467,6 +467,17 @@ pub enum LlmError {
         message: String,
     },
 
+    /// The provider declared the turn failed, or cancelled it, from INSIDE a
+    /// stream that had already opened successfully.
+    ///
+    /// It carries no status on purpose. The request succeeded — the verdict
+    /// arrived as an event, not as a response code — and reporting it as a 200
+    /// says the turn failed with the status that means it did not, which is a
+    /// lie both to whoever reads the error and to the classification that
+    /// decides whether retrying could help.
+    #[error("provider failed the turn: {0}")]
+    ProviderFailure(String),
+
     /// The provider is refusing requests for now.
     #[error("rate limited")]
     RateLimited {
@@ -504,12 +515,18 @@ impl LlmError {
     /// Recoverable: dropped and half-open connections, an idle stall, and
     /// transport-level failures — a connect or read timeout, a reset, an early
     /// EOF — that carry no HTTP status. Terminal: a real server response, a
-    /// parse failure, a missing credential, a config error.
+    /// verdict the provider delivered inside a stream, a parse failure, a
+    /// missing credential, a config error.
     ///
-    /// A rate limit is deliberately *not* recoverable here. It is handled by
-    /// the stream-open retry loop, which honours the server's own backoff hint;
-    /// treating it as a mid-stream reconnect would retry it on the wrong
-    /// schedule and against the wrong budget.
+    /// A rate limit is deliberately *not* recoverable here, and that is not the
+    /// same as saying it is never retried. It has a path of its own in the bind
+    /// loop — one that honours the server's own backoff hint and spends a
+    /// budget of its own — which answers it wherever it arrives: as the
+    /// opener's error, or as the first item of a stream that opened fine.
+    /// Classifying it as a reconnect would retry it on the wrong schedule and
+    /// against the wrong budget. That path is offered only while nothing of the
+    /// turn has been written down; after that the bind loop treats it as
+    /// terminal, since replaying a half-delivered turn writes it down twice.
     #[must_use]
     pub fn is_recoverable(&self) -> bool {
         match self {
@@ -518,6 +535,7 @@ impl LlmError {
             // transport drop — terminal. Anything else is the transport.
             Self::Http(e) => e.status().is_none(),
             Self::Api { .. }
+            | Self::ProviderFailure(_)
             | Self::RateLimited { .. }
             | Self::Json(_)
             | Self::MissingKey(_)
@@ -560,6 +578,14 @@ mod recoverable_tests {
             }
             .is_recoverable()
         );
+        // A verdict delivered inside a successful stream: terminal, and it
+        // reports no status, because the request itself did not fail.
+        let verdict = LlmError::ProviderFailure("server_error: the model failed".into());
+        assert!(!verdict.is_recoverable());
+        assert!(
+            !verdict.to_string().contains("200"),
+            "an in-stream verdict never claims a response code: {verdict}"
+        );
         assert!(!LlmError::MissingKey("a-provider".into()).is_recoverable());
         assert!(!LlmError::Config("nope".into()).is_recoverable());
 
@@ -574,11 +600,14 @@ mod recoverable_tests {
     /// by the bind-loop tests against the API arm, which is how a
     /// status-bearing response actually surfaces.
     ///
-    /// The address is loopback with no listener, so this reaches no network:
-    /// the connection is refused by the kernel before a packet leaves.
+    /// The client comes from the one guarded constructor, like every other
+    /// client in this library — a client built here directly would be the one
+    /// unguarded socket in the crate. The address is loopback with no listener,
+    /// so this reaches no network: the connection is refused by the kernel
+    /// before a packet leaves.
     #[tokio::test]
     async fn http_transport_error_is_recoverable() {
-        let err = reqwest::Client::new()
+        let err = crate::providers::http::client()
             .get("http://127.0.0.1:1")
             .send()
             .await

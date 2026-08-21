@@ -95,10 +95,37 @@ pub enum OAuthError {
     Json(#[from] serde_json::Error),
 }
 
+/// Percent-encode one key or value for a form body.
+///
+/// Everything outside the unreserved set is escaped, and a space becomes `+`,
+/// which is what `application/x-www-form-urlencoded` means by a space. The
+/// characters that matter most here are `+`, `&` and `=`: a token carrying one
+/// of them, pasted verbatim into the body, ends the value early or invents a
+/// pair — and the server answers about a parameter nobody sent.
+fn encode_form_component(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            // Writing into a string cannot fail, so the result is discarded
+            // rather than propagated through a function that cannot report it.
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
 fn form_body(params: &[(&str, &str)]) -> String {
     params
         .iter()
-        .map(|(k, v)| format!("{k}={v}"))
+        .map(|(k, v)| format!("{}={}", encode_form_component(k), encode_form_component(v)))
         .collect::<Vec<_>>()
         .join("&")
 }
@@ -288,4 +315,42 @@ pub async fn ensure_fresh_token(
         Some(tokens.refresh_token),
         Some(new_expires_at),
     ))
+}
+
+#[cfg(test)]
+mod form_body_tests {
+    use super::*;
+
+    /// A refresh token is opaque text the vendor chose, and these three
+    /// characters are the ones that corrupt a form body: `+` decodes as a
+    /// space, `&` starts a new pair, `=` splits a key from a value. Encoded,
+    /// the pair survives the round trip exactly.
+    #[test]
+    fn a_token_with_plus_ampersand_and_equals_survives_encoding() {
+        let body = form_body(&[
+            ("client_id", OAUTH_CLIENT_ID),
+            ("refresh_token", "a+b&c=d/e"),
+            ("grant_type", OAUTH_REFRESH_GRANT),
+        ]);
+
+        assert_eq!(
+            body,
+            format!(
+                "client_id={OAUTH_CLIENT_ID}&refresh_token=a%2Bb%26c%3Dd%2Fe&grant_type=refresh_token"
+            )
+        );
+
+        // The pairs still parse as three, and the token comes back whole.
+        let pairs: Vec<&str> = body.split('&').collect();
+        assert_eq!(pairs.len(), 3, "no character invented a fourth pair");
+        assert_eq!(pairs[1], "refresh_token=a%2Bb%26c%3Dd%2Fe");
+    }
+
+    /// Spaces and non-ASCII text encode too, so no byte reaches the wire raw.
+    #[test]
+    fn spaces_and_non_ascii_are_escaped() {
+        assert_eq!(encode_form_component("a b"), "a+b");
+        assert_eq!(encode_form_component("ü"), "%C3%BC");
+        assert_eq!(encode_form_component("safe-._~09AZ"), "safe-._~09AZ");
+    }
 }

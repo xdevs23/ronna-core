@@ -133,6 +133,69 @@ mod thinking_ingest_fixtures {
         ));
     }
 
+    /// A text-only answer ends with no tool event at all. The stop event names
+    /// no block kind, so the kind is remembered from the start; ending a tool
+    /// call here would hand the reader a close for a call that never opened.
+    #[test]
+    fn text_block_stop_emits_no_tool_end() {
+        let mut state = AnthropicSseState::default();
+        parse(
+            &mut state,
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        );
+        parse(
+            &mut state,
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "hello" } }),
+        );
+        assert!(
+            parse(
+                &mut state,
+                json!({ "type": "content_block_stop", "index": 0 })
+            )
+            .is_empty()
+        );
+
+        let end = parse(
+            &mut state,
+            json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 3 } }),
+        );
+        assert!(
+            matches!(
+                end.as_slice(),
+                [StreamEvent::MessageEnd {
+                    stop_reason: StopReason::EndTurn,
+                    ..
+                }]
+            ),
+            "the turn ends with nothing trailing it, got {end:?}"
+        );
+    }
+
+    /// The input count comes from the start of the message, which is the only
+    /// event that carries it. A hardcoded zero would be a fabricated
+    /// measurement — a claim that the request cost nothing.
+    #[test]
+    fn input_tokens_come_from_the_message_start() {
+        let mut state = AnthropicSseState::default();
+        parse(
+            &mut state,
+            json!({
+                "type": "message_start",
+                "message": { "usage": { "input_tokens": 1234, "output_tokens": 1 } }
+            }),
+        );
+        let end = parse(
+            &mut state,
+            json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 57 } }),
+        );
+        let [StreamEvent::MessageEnd { usage, .. }] = end.as_slice() else {
+            panic!("expected one end of turn, got {end:?}");
+        };
+        assert_eq!(usage.input_tokens, 1234, "the counted request cost");
+        assert_eq!(usage.output_tokens, 57);
+        assert_eq!(usage.reasoning_tokens, None, "this vendor states none");
+    }
+
     /// A reasoning turn followed by a tool call: the reasoning end fires live at
     /// the thinking block's own stop, never buffered past the end of the turn,
     /// while the tool lifecycle stays buffered.
@@ -282,6 +345,72 @@ mod replay_tests {
         assert_eq!(
             actual[0]["content"][0],
             json!({ "type": "text", "text": "let me think" })
+        );
+    }
+}
+
+/// The BIND path's golden: the exact bytes a bound turn opens with.
+///
+/// The other goldens pin the translation from neutral messages onward, which
+/// left the request the bind path itself assembles unpinned — and that is where
+/// a ceiling of `u32::MAX` rode out on every turn, rejected by the API with a
+/// 400 for exceeding the model's own limit.
+mod bind_request_golden {
+    use super::*;
+
+    fn user_block(id: i64, role: Role, block_type: &str, content: &str) -> Block {
+        let mut fields = serde_json::Map::new();
+        fields.insert("content".into(), Value::String(content.into()));
+        Block {
+            id,
+            role: Some(role),
+            block_type: block_type.into(),
+            created_at: String::new(),
+            fields,
+        }
+    }
+
+    #[test]
+    fn a_bound_turn_sends_the_builder_default_ceiling() {
+        let blocks = vec![
+            user_block(1, Role::System, "system_prompt", "be terse"),
+            user_block(2, Role::User, "text", "what is x?"),
+        ];
+        let tools = vec![ToolDefinition {
+            name: "search".into(),
+            description: "Search the web".into(),
+            parameters: json!({ "type": "object" }),
+        }];
+
+        let request = turn_request(
+            ModelSelector::Lightweight,
+            &blocks,
+            tools,
+            Some(ReasoningLevel::High),
+        );
+        assert_eq!(
+            request.max_tokens, None,
+            "the bind path names no ceiling of its own"
+        );
+
+        let (body, carried) = AnthropicProvider::build_request_body(&request, true, true);
+        assert!(!carried, "no stored payload means nothing replayed");
+        assert_eq!(
+            serde_json::to_value(&body).expect("the wire serializes"),
+            json!({
+                "model": LIGHTWEIGHT_MODEL,
+                "max_tokens": 32768,
+                "system": "be terse",
+                "messages": [
+                    { "role": "user", "content": [{ "type": "text", "text": "what is x?" }] }
+                ],
+                "tools": [
+                    { "name": "search", "description": "Search the web", "input_schema": { "type": "object" } }
+                ],
+                "stream": true,
+                "thinking": { "type": "adaptive" },
+                "effort": "high"
+            })
         );
     }
 }

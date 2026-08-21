@@ -8,6 +8,7 @@
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use crate::block::Block;
 use crate::store::{StoreError, StoreTx};
 
 use super::bind::{self, OpenedTurn};
@@ -17,6 +18,7 @@ use super::render::blocks_to_messages;
 use super::types::{
     CompletionRequest, ContentPart, LlmError, Message, MessageContent, MessageRole, ModelInfo,
     ModelSelector, OpaquePayload, ProviderRx, ProviderTx, ReasoningCapability, ReasoningLevel,
+    ToolDefinition,
 };
 use super::{BoxFuture, ProviderModule};
 
@@ -203,6 +205,34 @@ impl AnthropicProvider {
             ),
             carried_payloads,
         })
+    }
+}
+
+/// The neutral request one bound turn is opened with.
+///
+/// It lives here, named, rather than inline in the bind closure, because what
+/// the bind path actually sends is exactly what a golden has to be able to pin.
+///
+/// `max_tokens` is deliberately `None`: the request builder's own default is
+/// this vendor's ceiling, and a caller-supplied number above the model's limit
+/// is rejected outright with a 400 — the whole turn, for a field nobody chose.
+fn turn_request(
+    selector: ModelSelector,
+    blocks: &[Block],
+    tools: Vec<ToolDefinition>,
+    reasoning: Option<ReasoningLevel>,
+) -> CompletionRequest {
+    CompletionRequest {
+        model: match selector {
+            ModelSelector::Specific(m) => m,
+            ModelSelector::Lightweight => LIGHTWEIGHT_MODEL.into(),
+        },
+        messages: blocks_to_messages(blocks),
+        tools,
+        max_tokens: None,
+        temperature: None,
+        stream: true,
+        reasoning,
     }
 }
 
@@ -452,20 +482,8 @@ impl ProviderModule for AnthropicModule {
             req_rx,
             resp_tx,
             move |blocks, selector, tools, reasoning, include_reasoning_payloads| {
-                let model = match selector {
-                    ModelSelector::Specific(m) => m,
-                    ModelSelector::Lightweight => LIGHTWEIGHT_MODEL.into(),
-                };
                 let provider = AnthropicProvider::new(api_key.clone(), base_url.clone());
-                let request = CompletionRequest {
-                    model,
-                    messages: blocks_to_messages(&blocks),
-                    tools,
-                    max_tokens: Some(u32::MAX),
-                    temperature: None,
-                    stream: true,
-                    reasoning,
-                };
+                let request = turn_request(selector, &blocks, tools, reasoning);
                 async move {
                     provider
                         .open_turn(request, include_reasoning_payloads)

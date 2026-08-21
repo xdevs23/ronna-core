@@ -42,8 +42,9 @@ async fn drive_replay(
             reasoning: None,
         })
         .unwrap();
-    drop(req_tx);
 
+    // Held until the turn closes: dropping the sender cancels the active turn,
+    // which is a teardown rather than a way to end the request stream early.
     let mut out = Vec::new();
     while let Some(resp) = resp_rx.recv().await {
         let done = matches!(resp, ProviderResponse::Done);
@@ -52,6 +53,7 @@ async fn drive_replay(
             break;
         }
     }
+    drop(req_tx);
     loop_handle.abort();
     let knobs = knobs.lock().unwrap().clone();
     (out, knobs)

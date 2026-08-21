@@ -97,7 +97,12 @@ not the stack under it would be checking the wrong artifact.
 | rustls | 0.23.43 | none | The TLS implementation, arriving with the client's default |
 | aws-lc-sys | 0.44.0 | none | The C cryptography that backs it, compiled from vendored source |
 
-**No test here opens a socket.** Every HTTP client is built through one constructor, and in test
-builds that constructor pins the client to a dead loopback proxy, so an outbound request fails at
-connect instead of reaching a vendor. That is a property of the code rather than of the runner,
-which is why it is recorded beside the dependency that would otherwise make it possible.
+**No test here reaches a vendor.** Every HTTP client is built through one constructor, and in
+test builds that constructor binds the client's socket to the loopback interface, so the
+operating system refuses a connection to any other address and an outbound request fails at
+connect. A client built anywhere else would not carry the guard, so a source scan fails the suite
+on any file outside that constructor that builds one. What the mechanism guarantees is therefore
+exactly this: nothing a test sends can leave the machine — a connection to this machine's own
+loopback still can be made, and the tests that assert the guard rely on that. It is a property of
+the code rather than of the runner, which is why it is recorded beside the dependency that would
+otherwise make it possible.

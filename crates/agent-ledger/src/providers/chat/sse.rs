@@ -1,4 +1,9 @@
-//! Decoding one chat-completions stream.
+//! Decoding one chat-completions stream, from the open response down to the
+//! neutral events.
+//!
+//! Every vendor whose responses take this shape reads them here — including one
+//! whose REQUESTS are built elsewhere, because the two directions are separate
+//! questions and only the request side of that vendor genuinely differs.
 //!
 //! Two things here are load-bearing and neither is obvious from the wire.
 //!
@@ -12,12 +17,17 @@
 //! that ended at the finish reason would report zero tokens for every request on
 //! this surface.
 
+use eventsource_stream::Eventsource;
+use futures::stream::{self, StreamExt};
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::providers::types::{
-    LlmError, OpaquePayload, ReasoningDetailEntry, StopReason, StreamEvent, Usage,
+    EventStream, LlmError, OpaquePayload, ReasoningDetailEntry, StopReason, StreamEvent, Usage,
 };
+
+/// The line a chat-completions stream ends on.
+const SSE_DONE: &str = "[DONE]";
 
 /// Vendor seam: decode one delta's content field into stream events.
 ///
@@ -33,11 +43,24 @@ pub(crate) type ContentDecoder = fn(&Value, &mut SseState) -> Vec<StreamEvent>;
 /// whose payload is the stored reasoning text itself overrides with its own tag.
 pub(crate) type ThinkingEndPayload = fn(&mut SseState) -> Option<OpaquePayload>;
 
+/// One tool call being assembled from its streamed fragments.
+///
+/// The wire keys a call's fragments by INDEX, and interleaves them: two calls
+/// stream as index 0's name, index 1's name, index 0's arguments, index 1's
+/// arguments. A buffer that appended in arrival order spliced each call's
+/// arguments onto the other one — a request the model never made, made anyway.
+struct ToolCallInFlight {
+    index: u64,
+    id: String,
+    name: String,
+    arguments: String,
+}
+
 /// Cross-chunk decoding state, threaded through the whole stream.
 pub(crate) struct SseState {
-    /// Tool events are buffered until the deferred end of turn, so they emit
-    /// after it.
-    tool_buffer: Vec<StreamEvent>,
+    /// Calls in flight, keyed by their wire index. They are assembled here and
+    /// released as complete lifecycles after the deferred end of turn.
+    tool_calls: Vec<ToolCallInFlight>,
     /// A streaming reasoning block is open and not yet finalized.
     pub(crate) reasoning_open: bool,
     /// Every reasoning entry streamed so far: all types, order-preserving,
@@ -68,7 +91,7 @@ impl SseState {
     /// Fresh state for one stream, with a vendor's two decoding seams.
     pub(crate) fn new(decoder: ContentDecoder, thinking_payload: ThinkingEndPayload) -> Self {
         Self {
-            tool_buffer: Vec::new(),
+            tool_calls: Vec::new(),
             reasoning_open: false,
             reasoning_details: Vec::new(),
             last_summary_index: None,
@@ -222,6 +245,60 @@ pub(crate) fn decode_string_content(content: &Value, state: &mut SseState) -> Ve
     events
 }
 
+/// Fold one fragment into the call it belongs to.
+///
+/// A fragment carries the identity fields only on the call's first chunk and
+/// arguments on the rest, so each field is taken where it appears and never
+/// overwritten by a later blank. With an index present, the index is the
+/// identity. Without one, the wire gives no key, so identity comes from the
+/// fragment's shape: a fragment carrying an id or a name is a call's FIRST
+/// chunk and opens a new call, while a bare argument fragment extends the most
+/// recent one. Keying every index-less fragment to the most recent call
+/// collapsed two distinct index-less calls into one, concatenating their
+/// argument JSON into garbage — the same corruption the index key exists to
+/// prevent, reintroduced on the path without an index.
+fn ingest_tool_call_fragment(state: &mut SseState, fragment: &Value) {
+    let carries_identity = fragment["id"].as_str().is_some_and(|s| !s.is_empty())
+        || fragment["function"]["name"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty());
+    let index = fragment["index"].as_u64().unwrap_or_else(|| {
+        let last = state.tool_calls.last().map_or(0, |call| call.index);
+        if carries_identity && !state.tool_calls.is_empty() {
+            last + 1
+        } else {
+            last
+        }
+    });
+
+    if !state.tool_calls.iter().any(|call| call.index == index) {
+        state.tool_calls.push(ToolCallInFlight {
+            index,
+            id: String::new(),
+            name: String::new(),
+            arguments: String::new(),
+        });
+    }
+    let call = state
+        .tool_calls
+        .iter_mut()
+        .find(|call| call.index == index)
+        .expect("the call for this index exists, having just been ensured");
+
+    if let Some(id) = fragment["id"].as_str().filter(|s| !s.is_empty()) {
+        call.id = id.to_string();
+    }
+    if let Some(name) = fragment["function"]["name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        call.name = name.to_string();
+    }
+    if let Some(args) = fragment["function"]["arguments"].as_str() {
+        call.arguments.push_str(args);
+    }
+}
+
 /// Read a terminal usage object defensively: an absent or null object is no
 /// counts at all, absent fields are zero, and reasoning tokens stay optional —
 /// absent means absent, never a fabricated zero.
@@ -244,8 +321,30 @@ fn parse_usage(value: &Value) -> Option<Usage> {
     })
 }
 
+/// Drain the calls in flight as complete lifecycles, each one's arguments its
+/// own, in the order the wire numbered them.
+fn drain_tool_calls(state: &mut SseState) -> Vec<StreamEvent> {
+    let mut calls: Vec<ToolCallInFlight> = state.tool_calls.drain(..).collect();
+    calls.sort_by_key(|call| call.index);
+
+    let mut events = Vec::new();
+    for call in calls {
+        events.push(StreamEvent::ToolUseStart {
+            id: call.id,
+            name: call.name,
+        });
+        if !call.arguments.is_empty() {
+            events.push(StreamEvent::ToolUseInputDelta {
+                json: call.arguments,
+            });
+        }
+    }
+    events
+}
+
 /// Release the deferred end of turn with the given counts, preserving the
-/// terminal order: the end, then the buffered tool events, then the tool close.
+/// terminal order: the end, then the assembled tool calls, then the SINGLE tool
+/// close that covers all of them.
 ///
 /// Inert while no finish reason has been captured, so a stray usage chunk
 /// cannot conjure an end of turn and a double release is impossible.
@@ -254,7 +353,7 @@ fn release_message_end(state: &mut SseState, usage: Usage) -> Vec<Result<StreamE
         return vec![];
     };
     let mut events = vec![Ok(StreamEvent::MessageEnd { usage, stop_reason })];
-    events.extend(state.tool_buffer.drain(..).map(Ok));
+    events.extend(drain_tool_calls(state).into_iter().map(Ok));
     if stop_reason == StopReason::ToolUse {
         events.push(Ok(StreamEvent::ToolUseEnd));
     }
@@ -266,9 +365,15 @@ fn release_message_end(state: &mut SseState, usage: Usage) -> Vec<Result<StreamE
 /// A vendor that never sent counts still gets its end of turn here, with zeroed
 /// counts: the stream terminates rather than hanging, which is the trade — a
 /// missing number costs a statistic, a missing end costs the whole answer.
+///
+/// A reasoning block still open at the end closes too: a stream that stopped
+/// speaking mid-thought would otherwise leave the block dangling, never
+/// finalized and never persisted.
 pub(crate) fn finish_stream(state: &mut SseState) -> Vec<Result<StreamEvent, LlmError>> {
-    let mut events = release_message_end(state, Usage::default());
-    events.extend(state.tool_buffer.drain(..).map(Ok));
+    let mut events: Vec<Result<StreamEvent, LlmError>> =
+        state.close_reasoning().map(Ok).into_iter().collect();
+    events.extend(release_message_end(state, Usage::default()));
+    events.extend(drain_tool_calls(state).into_iter().map(Ok));
     events
 }
 
@@ -307,26 +412,13 @@ pub(crate) fn parse_sse_chunk(
     let decode = state.decoder;
     events.extend(decode(&delta["content"], state).into_iter().map(Ok));
 
-    // Tool calls buffer until the end of turn. Their arrival also ends
-    // reasoning.
+    // Tool calls accumulate per index until the end of turn. Their arrival also
+    // ends reasoning.
     if let Some(tool_calls) = delta["tool_calls"].as_array() {
         events.extend(state.close_reasoning().map(Ok));
         for tc in tool_calls {
             debug!(tool_call = ?tc, "chat tool call chunk");
-            if let Some(name) = tc["function"]["name"].as_str() {
-                let id = tc["id"].as_str().unwrap_or("").to_string();
-                state.tool_buffer.push(StreamEvent::ToolUseStart {
-                    id,
-                    name: name.to_string(),
-                });
-            }
-            if let Some(args) = tc["function"]["arguments"].as_str()
-                && !args.is_empty()
-            {
-                state.tool_buffer.push(StreamEvent::ToolUseInputDelta {
-                    json: args.to_string(),
-                });
-            }
+            ingest_tool_call_fragment(state, tc);
         }
     }
 
@@ -349,4 +441,47 @@ pub(crate) fn parse_sse_chunk(
     }
 
     events
+}
+
+/// Read one open response as this surface's event stream, decoded into neutral
+/// events.
+///
+/// Every vendor whose responses take this shape reads them here, whatever its
+/// requests look like: the end-of-stream line, the terminal drain and the
+/// stall-free close are one behavior, and a vendor that reimplemented them got
+/// a different subset of them right.
+///
+/// The transport ending WITHOUT the end-of-stream line drains just the same. A
+/// turn that completed and then lost its connection before the sentinel would
+/// otherwise never end: no close, no counts, and a streaming block left
+/// uncommitted.
+pub(crate) fn decode_stream(response: reqwest::Response, state: SseState) -> EventStream {
+    let source = Box::pin(response.bytes_stream().eventsource());
+
+    Box::pin(
+        stream::unfold(
+            (source, state, false),
+            |(mut source, mut state, terminated)| async move {
+                if terminated {
+                    return None;
+                }
+                let events = match source.next().await {
+                    Some(Ok(event)) if event.data == SSE_DONE => finish_stream(&mut state),
+                    Some(Ok(event)) => parse_sse_chunk(&event.data, &mut state),
+                    Some(Err(e)) => {
+                        warn!("SSE stream error: {e}");
+                        vec![Err(LlmError::Stream(e.to_string()))]
+                    }
+                    // The drain is inert if the end-of-stream line already
+                    // released the turn, so this cannot double-emit.
+                    None => {
+                        let drained = finish_stream(&mut state);
+                        return (!drained.is_empty()).then_some((drained, (source, state, true)));
+                    }
+                };
+                Some((events, (source, state, terminated)))
+            },
+        )
+        .flat_map(stream::iter),
+    )
 }

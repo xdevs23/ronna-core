@@ -1,9 +1,16 @@
-//! This vendor's wire, its client-identifying headers, and its event parser.
+//! This vendor's wire and its client-identifying headers.
+//!
+//! Its REQUESTS are built here, because this endpoint rejects the shared base's
+//! shape. Its RESPONSES are not: they are chat-completions events like any
+//! other on that surface, so they are decoded by the shared decoder rather than
+//! by a second parser of this module's own. The second parser is what lost
+//! events — a chunk carrying both content and a finish reason kept only the
+//! first field, a stream that ended without the sentinel never ended at all,
+//! and no reasoning block was ever closed.
 
 use std::env;
 use std::path::PathBuf;
 
-use eventsource_stream::Eventsource;
 use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -11,11 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::providers::chat::sse::{self, SseState};
 use crate::providers::http;
-use crate::providers::types::{EventStream, LlmError, StopReason, StreamEvent, Usage};
-
-/// The line this vendor's stream ends on.
-const SSE_DONE: &str = "[DONE]";
+use crate::providers::types::{EventStream, LlmError, StreamEvent};
 
 /// The client version this module identifies itself as. This endpoint is the
 /// vendor's own coding surface and expects its own client's identification, so
@@ -31,6 +36,12 @@ pub(super) struct KimiThinking {
     pub(super) r#type: String,
 }
 
+/// The usage opt-in on a streamed request.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct KimiStreamOptions {
+    pub(super) include_usage: bool,
+}
+
 #[derive(Serialize)]
 pub(super) struct WireRequest {
     pub(super) model: String,
@@ -42,6 +53,12 @@ pub(super) struct WireRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) temperature: Option<f32>,
     pub(super) stream: bool,
+    /// The usage opt-in, mirrored from the shared chat request: without it the
+    /// endpoint only volunteers counts, and the decoder can only report what
+    /// arrived. This vendor's endpoint speaks the chat-completions dialect, so
+    /// the opt-in is the same shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) stream_options: Option<KimiStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -295,27 +312,9 @@ pub(super) fn open_stream(
 
                     info!("kimi stream connected");
 
-                    let sse = response
-                        .bytes_stream()
-                        .eventsource()
-                        .scan(Vec::<StreamEvent>::new(), |buffer, result| {
-                            let events = match result {
-                                Ok(event) if event.data == SSE_DONE => {
-                                    buffer.drain(..).map(Ok).collect()
-                                }
-                                Ok(event) => parse_sse_chunk(&event.data, buffer),
-                                Err(e) => {
-                                    warn!("SSE stream error: {e}");
-                                    vec![Err(LlmError::Stream(e.to_string()))]
-                                }
-                            };
-                            futures::future::ready(Some(events))
-                        })
-                        .flat_map(stream::iter);
-
                     Some((
                         Ok(StreamEvent::Connected),
-                        Phase::Streaming(Box::pin(sse) as EventStream),
+                        Phase::Streaming(sse::decode_stream(response, SseState::default())),
                     ))
                 }
                 Phase::Streaming(mut inner) => inner
@@ -325,84 +324,4 @@ pub(super) fn open_stream(
             }
         },
     ))
-}
-
-/// Decode one chunk. Tool events buffer until the end of the turn, so a
-/// complete lifecycle follows it rather than straddling it.
-fn parse_sse_chunk(
-    data: &str,
-    tool_buffer: &mut Vec<StreamEvent>,
-) -> Vec<Result<StreamEvent, LlmError>> {
-    let Ok(value) = serde_json::from_str::<Value>(data) else {
-        return vec![];
-    };
-
-    let Some(choice) = value["choices"].get(0) else {
-        return vec![];
-    };
-    let delta = &choice["delta"];
-
-    // Reasoning precedes content in this stream; a single chunk may carry both,
-    // in which case both events come out in that order.
-    let mut events = vec![];
-
-    if let Some(reasoning) = delta["reasoning_content"].as_str()
-        && !reasoning.is_empty()
-    {
-        events.push(Ok(StreamEvent::ThinkingDelta {
-            text: reasoning.to_string(),
-        }));
-    }
-
-    if let Some(content) = delta["content"].as_str()
-        && !content.is_empty()
-    {
-        events.push(Ok(StreamEvent::TextDelta {
-            text: content.to_string(),
-        }));
-    }
-
-    if !events.is_empty() {
-        return events;
-    }
-
-    if let Some(tool_calls) = delta["tool_calls"].as_array() {
-        for tc in tool_calls {
-            if let Some(name) = tc["function"]["name"].as_str() {
-                let id = tc["id"].as_str().unwrap_or("").to_string();
-                tool_buffer.push(StreamEvent::ToolUseStart {
-                    id,
-                    name: name.to_string(),
-                });
-            }
-            if let Some(args) = tc["function"]["arguments"].as_str()
-                && !args.is_empty()
-            {
-                tool_buffer.push(StreamEvent::ToolUseInputDelta {
-                    json: args.to_string(),
-                });
-            }
-        }
-        return vec![];
-    }
-
-    if let Some(reason) = choice["finish_reason"].as_str() {
-        let stop_reason = match reason {
-            "tool_calls" => StopReason::ToolUse,
-            "length" => StopReason::MaxTokens,
-            _ => StopReason::EndTurn,
-        };
-
-        let mut events = vec![Ok(StreamEvent::MessageEnd {
-            usage: Usage::default(),
-            stop_reason,
-        })];
-        events.extend(tool_buffer.drain(..).map(Ok));
-        if stop_reason == StopReason::ToolUse {
-            events.push(Ok(StreamEvent::ToolUseEnd));
-        }
-        return events;
-    }
-
-    vec![]
 }

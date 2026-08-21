@@ -1,16 +1,25 @@
 //! The Kimi provider: this vendor's own coding endpoint, reached with a
 //! device-flow authorization rather than a static credential.
 //!
-//! It speaks a chat-completions-shaped wire but does **not** compose with the
-//! shared base, and the reason is one field. This vendor carries reasoning in a
-//! sibling field of its own and requires that field on every assistant message
-//! once reasoning is enabled — the shared base folds reasoning into the content
-//! instead, which this endpoint rejects. So this module builds its messages from
-//! blocks directly.
+//! It speaks a chat-completions-shaped wire, and the split runs between the two
+//! directions.
+//!
+//! Its **requests** do not compose with the shared base, and the reason is one
+//! field. This vendor carries reasoning in a sibling field of its own and
+//! requires that field on every assistant message once reasoning is enabled —
+//! the shared base folds reasoning into the content instead, which this
+//! endpoint rejects. So this module builds its messages from blocks directly.
+//!
+//! Its **responses** are ordinary chat-completions events, so they are read by
+//! the shared decoder. A parser of its own is what silently lost events: the
+//! two decoders drifted, and every fix made for the other vendors stopped at
+//! the module boundary.
 //!
 //! That direct build is the one place in this library where a module reads block
 //! types by name. It is a deliberate, contained exception with a cost: a block
 //! kind added elsewhere is invisible to this vendor until it is named here.
+
+use std::future::Future;
 
 use serde_json::Value;
 use tracing::{info, warn};
@@ -133,6 +142,11 @@ impl KimiProvider {
             tools: Self::wire_tools(tools),
             temperature: None,
             stream,
+            // Counts only arrive when asked for on this dialect; a request
+            // that never opts in leaves the decoder honestly reporting absent.
+            stream_options: stream.then_some(wire::KimiStreamOptions {
+                include_usage: true,
+            }),
             prompt_cache_key: self.prompt_cache_key.clone(),
             thinking: self.thinking.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
@@ -696,13 +710,58 @@ impl ProviderModule for KimiModule {
 async fn refresh_and_persist(
     store: &KimiStore,
     provider_id: &str,
-    config: &Value,
+    bind_config: &Value,
 ) -> Result<String, LlmError> {
-    let original_refresh = config["refresh_token"].as_str().map(String::from);
-    let original_expires = config["expires_at"].as_i64();
+    refresh_and_persist_with(store, provider_id, bind_config, ensure_fresh_token).await
+}
 
-    let (token, new_refresh, new_expires) = ensure_fresh_token(
-        config["access_token"].as_str().map(String::from),
+/// The body of [`refresh_and_persist`], with the refresh itself as a seam.
+///
+/// Two things are load-bearing here.
+///
+/// **The credentials are read from the STORE**, not from the copy the binding
+/// captured when it was created. That copy is frozen: it still holds the
+/// refresh token this binding already spent, so a second refresh over the same
+/// binding would replay a dead one — and the session would expire for no
+/// visible reason, hours after the turn that actually consumed it. The
+/// bind-time copy is the fallback for an instance with no stored row.
+///
+/// **The new access token is persisted too**, not just the rotated refresh
+/// token and the expiry. Storing a fresh expiry beside a stale access token
+/// would tell the next turn its dead token is good for another hour.
+///
+/// The seam exists because the refresh itself is a network call, and what needs
+/// pinning is which token the SECOND refresh is handed.
+async fn refresh_and_persist_with<F, Fut>(
+    store: &KimiStore,
+    provider_id: &str,
+    bind_config: &Value,
+    refresh: F,
+) -> Result<String, LlmError>
+where
+    F: FnOnce(Option<String>, Option<String>, Option<i64>) -> Fut,
+    Fut: Future<Output = Result<(String, Option<String>, Option<i64>), OAuthError>>,
+{
+    let stored = match store.get_config(provider_id.to_string()).await {
+        Ok(stored) => stored,
+        Err(e) => {
+            warn!(error = %e, "could not read the stored authorization, using the bound copy");
+            None
+        }
+    };
+
+    let mut config = stored.unwrap_or_else(|| KimiConfig {
+        base_url: bind_config["base_url"].as_str().map(String::from),
+        access_token: bind_config["access_token"].as_str().map(String::from),
+        refresh_token: bind_config["refresh_token"].as_str().map(String::from),
+        expires_at: bind_config["expires_at"].as_i64(),
+    });
+
+    let original_refresh = config.refresh_token.clone();
+    let original_expires = config.expires_at;
+
+    let (token, new_refresh, new_expires) = refresh(
+        config.access_token.clone(),
         original_refresh.clone(),
         original_expires,
     )
@@ -710,22 +769,15 @@ async fn refresh_and_persist(
     .map_err(|e| config_error(&e))?;
 
     if new_refresh != original_refresh || new_expires != original_expires {
-        let mut updated = config.clone();
-        if let Some(ref rt) = new_refresh {
-            updated["refresh_token"] = Value::String(rt.clone());
+        config.access_token = Some(token.clone());
+        if let Some(rotated) = new_refresh {
+            config.refresh_token = Some(rotated);
         }
-        if let Some(exp) = new_expires {
-            updated["expires_at"] = Value::Number(exp.into());
+        if let Some(expires_at) = new_expires {
+            config.expires_at = Some(expires_at);
         }
-        match serde_json::from_value::<KimiConfig>(updated) {
-            Ok(typed) => {
-                if let Err(e) = store.save_config(provider_id.to_string(), typed).await {
-                    warn!(error = %e, "failed to persist the rotated tokens");
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "the updated config did not parse, so it was not persisted");
-            }
+        if let Err(e) = store.save_config(provider_id.to_string(), config).await {
+            warn!(error = %e, "failed to persist the rotated tokens");
         }
     }
 

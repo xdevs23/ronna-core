@@ -1,7 +1,6 @@
 //! The chat-completions wire: request shapes, model-listing shapes, and the
 //! lazy stream that carries them.
 
-use eventsource_stream::Eventsource;
 use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use reqwest::header::HeaderMap;
@@ -12,10 +11,7 @@ use tracing::{info, warn};
 use crate::providers::http;
 use crate::providers::types::{EventStream, LlmError, StreamEvent};
 
-use super::sse::{SseState, finish_stream, parse_sse_chunk};
-
-/// The line a chat-completions stream ends on.
-const SSE_DONE: &str = "[DONE]";
+use super::sse::{self, SseState};
 
 #[derive(Serialize)]
 pub(crate) struct WireRequest {
@@ -138,7 +134,13 @@ pub(crate) struct WireModel {
     /// Absent on endpoints whose model list carries no capability data, which
     /// is why each vendor supplies its own capability mapper rather than the
     /// base assuming this field exists.
+    ///
+    /// Whether anything READS it depends on which vendors are compiled: a
+    /// vendor whose list carries no descriptor maps capability from a slug
+    /// instead. The field is still parsed, because it is part of the surface
+    /// this base speaks rather than of whichever caller happens to be enabled.
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) reasoning: Option<WireModelReasoning>,
 }
 
@@ -146,7 +148,9 @@ pub(crate) struct WireModel {
 /// `supported_efforts`, when populated, lists the exact levels it exposes.
 #[derive(Deserialize)]
 pub(crate) struct WireModelReasoning {
+    /// Read by the vendors whose endpoint publishes it; see [`WireModel`].
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) supported_efforts: Option<Vec<String>>,
 }
 
@@ -247,42 +251,9 @@ pub(super) fn open_stream(
 
                     info!("chat stream connected");
 
-                    let source = Box::pin(response.bytes_stream().eventsource());
-                    let sse = stream::unfold(
-                        (source, state, false),
-                        |(mut source, mut state, terminated)| async move {
-                            if terminated {
-                                return None;
-                            }
-                            let events = match source.next().await {
-                                Some(Ok(event)) if event.data == SSE_DONE => {
-                                    finish_stream(&mut state)
-                                }
-                                Some(Ok(event)) => parse_sse_chunk(&event.data, &mut state),
-                                Some(Err(e)) => {
-                                    warn!("SSE stream error: {e}");
-                                    vec![Err(LlmError::Stream(e.to_string()))]
-                                }
-                                // The transport ended without the end-of-stream
-                                // line: release any deferred end-of-turn so a
-                                // completed turn is committed rather than left
-                                // stranded as an uncommitted streaming block.
-                                // The drain is inert if the line already
-                                // released it, so this cannot double-emit.
-                                None => {
-                                    let drained = finish_stream(&mut state);
-                                    return (!drained.is_empty())
-                                        .then_some((drained, (source, state, true)));
-                                }
-                            };
-                            Some((events, (source, state, terminated)))
-                        },
-                    )
-                    .flat_map(stream::iter);
-
                     Some((
                         Ok(StreamEvent::Connected),
-                        Phase::Streaming(Box::pin(sse) as EventStream),
+                        Phase::Streaming(sse::decode_stream(response, state)),
                     ))
                 }
                 Phase::Streaming(mut inner) => inner

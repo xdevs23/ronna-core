@@ -152,6 +152,26 @@ mod request_goldens {
             json!({ "summary": "auto", "effort": "low" })
         );
     }
+
+    /// A model id carrying multi-byte characters is normalized without
+    /// panicking. The cut point for the dated suffix is eleven bytes from the
+    /// end, which lands INSIDE a character here — slicing there aborts the
+    /// process over an id this library only passes through.
+    #[test]
+    fn multibyte_model_id_normalizes_without_panicking() {
+        // Twelve bytes, four characters: the cut point is not a boundary.
+        assert_eq!(normalize_openai_slug("模型模型"), "模型模型");
+        // Long enough to reach the check, with the boundary mid-character.
+        assert_eq!(
+            normalize_openai_slug("gpt-5-модель-preview"),
+            "gpt-5-модель-preview"
+        );
+        // A multi-byte name with a real dated suffix still resolves to its
+        // family: the suffix itself is ASCII, so the boundary holds.
+        assert_eq!(normalize_openai_slug("gpt-5-模型-2026-04-23"), "gpt-5-模型");
+        // And the capability gate reads it as its family does.
+        assert!(!openai_reasoning_for_slug("gpt-5-模型-2026-04-23").is_empty());
+    }
 }
 
 /// Parser fixtures: event sequences in, exact neutral sequences out.
@@ -261,9 +281,10 @@ mod parser_fixtures {
     }
 
     /// A failure becomes a terminal error built from the server's own code and
-    /// message — non-recoverable, so no reconnect re-runs a judged request.
+    /// message — non-recoverable, so no reconnect re-runs a judged request, and
+    /// carrying no HTTP status, because the request itself was answered.
     #[test]
-    fn failed_maps_to_terminal_api_error() {
+    fn failed_maps_to_a_terminal_in_stream_verdict() {
         let mut state = ResponsesSseState::default();
         let out = parse(
             &mut state,
@@ -275,12 +296,16 @@ mod parser_fixtures {
         );
         assert_eq!(out.len(), 1);
         match &out[0] {
-            Err(e @ LlmError::Api { message, .. }) => {
+            Err(e @ LlmError::ProviderFailure(message)) => {
                 assert!(message.contains("server_error"));
                 assert!(message.contains("The model failed to respond"));
                 assert!(!e.is_recoverable(), "a server verdict is terminal");
+                assert!(
+                    !e.to_string().contains("200"),
+                    "the error states no status it did not receive: {e}"
+                );
             }
-            other => panic!("expected a terminal error, got {other:?}"),
+            other => panic!("expected a terminal in-stream verdict, got {other:?}"),
         }
     }
 
@@ -570,7 +595,7 @@ mod parser_fixtures {
             matches!(&out[0], Ok(StreamEvent::TextDelta { text }) if text == "partial pre-failure")
         );
         assert!(
-            matches!(&out[1], Err(e @ LlmError::Api { .. }) if !e.is_recoverable()),
+            matches!(&out[1], Err(e @ LlmError::ProviderFailure(_)) if !e.is_recoverable()),
             "terminal, with no end of turn fabricated over the failure"
         );
         assert_eq!(out.len(), 2);
@@ -657,7 +682,7 @@ mod parser_fixtures {
             json!({ "type": "response.failed", "response": { "status": "cancelled" } }),
         );
         assert!(
-            matches!(&out[0], Err(LlmError::Api { message, .. }) if message.contains("cancelled")),
+            matches!(&out[0], Err(LlmError::ProviderFailure(message)) if message.contains("cancelled")),
             "a terminal cancellation is an error"
         );
     }
