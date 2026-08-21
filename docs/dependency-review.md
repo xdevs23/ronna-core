@@ -56,3 +56,48 @@ scheduler's heartbeat is that callback, so it is not optional here.
 **The one transitive dependency named.** `libsqlite3-sys` is not declared in any manifest; it
 is recorded because it is where the C engine actually comes from, and a review that checked the
 wrapper but not the thing it wraps would be checking the wrong artifact.
+
+## 2026-08-21 — the provider layer
+
+The model boundary is the first part of this library that speaks to the outside world, so it is
+the first that needs an HTTP client, a server-sent-events reader and stream combinators. Same
+two questions, same sources: current versions from the registry API, advisories from the OSV
+aggregate. The resolved column is what the lockfile settled on after these were declared.
+
+| Crate | Resolved | Latest at check | Advisories | Why it is here |
+|---|---|---|---|---|
+| reqwest | 0.13.4 | 0.13.4 | none | The HTTP client every vendor module streams over |
+| futures | 0.3.34 | 0.3.34 | none | The stream contract itself — an event stream is a `Stream` |
+| eventsource-stream | 0.2.3 | 0.2.3 | none | Server-sent events, the wire every vendor's stream arrives on |
+| tokio-util | 0.7.19 | 0.7.19 | none | The cancellation token a turn is interrupted through |
+| uuid | 1.24.1 | 1.24.1 | none | One vendor's client identifier, behind that vendor's feature |
+
+All five resolved to the current latest.
+
+**Which of these are optional.** `uuid` and `eventsource-stream` arrive by feature only: `uuid`
+with the one vendor that needs a client identifier, `eventsource-stream` with any vendor at all,
+since nothing but a vendor module reads a wire. The other three are unconditional because the
+always-present layer names them — the stream type is a `futures::Stream`, the error type
+classifies a `reqwest::Error` by whether it carries an HTTP status, and a turn is cancelled
+through a `tokio_util` token. Gating them would make the error vocabulary depend on which
+vendors a consumer compiled, which is the one thing a uniform stream contract cannot afford.
+
+**The TLS question, answered by not answering it.** This manifest names no TLS feature. The HTTP
+crate's own default is rustls with a vendored provider, so a consumer needs no system library and
+every build gets the same stack — the reasoning that put `bundled` on the database crate. Taking
+the default is what keeps this library out of a consumer's TLS decision.
+
+**The transitive dependencies named.** None of these is declared in any manifest; they are
+recorded because they are where the bytes actually go, and a review that checked the client but
+not the stack under it would be checking the wrong artifact.
+
+| Crate | Resolved | Advisories | What it is |
+|---|---|---|---|
+| hyper | 1.11.0 | none | The HTTP implementation the client is a facade over |
+| rustls | 0.23.43 | none | The TLS implementation, arriving with the client's default |
+| aws-lc-sys | 0.44.0 | none | The C cryptography that backs it, compiled from vendored source |
+
+**No test here opens a socket.** Every HTTP client is built through one constructor, and in test
+builds that constructor pins the client to a dead loopback proxy, so an outbound request fails at
+connect instead of reaching a vendor. That is a property of the code rather than of the runner,
+which is why it is recorded beside the dependency that would otherwise make it possible.

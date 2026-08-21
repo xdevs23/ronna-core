@@ -1,0 +1,706 @@
+//! The chat base's own pins: the reasoning ingest and the deferred end of turn.
+
+use serde_json::json;
+
+use super::sse::{SseState, finish_stream, parse_sse_chunk};
+use super::*;
+use crate::providers::types::{ReasoningDetailEntry, StopReason, StreamEvent};
+
+// The fixtures read better built inline at each call site, so these helpers
+// take the value rather than a reference to one.
+#[allow(clippy::needless_pass_by_value)]
+fn parse(chunk: Value, state: &mut SseState) -> Vec<StreamEvent> {
+    parse_sse_chunk(&chunk.to_string(), state)
+        .into_iter()
+        .map(|r| r.expect("the chunk parses cleanly"))
+        .collect()
+}
+
+/// A provider on this base with no vendor seams filled, for the request-shape
+/// pins. The credential is never sent anywhere: no test here opens a stream.
+fn plain_provider() -> ChatProvider {
+    ChatProvider::with_headers(
+        "test-key".into(),
+        None,
+        "https://a-chat-endpoint.example/v1",
+        HeaderMap::new(),
+    )
+}
+
+mod reasoning_ingest {
+    use super::*;
+
+    /// The flattened reasoning string becomes a reasoning delta.
+    #[test]
+    fn reasoning_string_becomes_thinking_delta() {
+        let mut state = SseState::default();
+        let events = parse(
+            json!({ "choices": [{ "delta": { "reasoning": "pondering" } }] }),
+            &mut state,
+        );
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::ThinkingDelta { text }] if text == "pondering")
+        );
+        assert!(state.reasoning_open);
+    }
+
+    /// The typed array routes each entry's text by its structural type:
+    /// verbatim reasoning to one channel, the lossy summary to the other. An
+    /// empty entry emits nothing. Both channels open the reasoning block.
+    #[test]
+    fn reasoning_details_route_text_and_summary_to_distinct_channels() {
+        let mut state = SseState::default();
+        let events = parse(
+            json!({ "choices": [{ "delta": { "reasoning_details": [
+                { "type": "reasoning.text", "text": "step one " },
+                { "type": "reasoning.summary", "summary": "step two" },
+                { "type": "reasoning.text", "text": "" },
+            ] } }] }),
+            &mut state,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                StreamEvent::ThinkingDelta { text: verbatim },
+                StreamEvent::ThinkingSummaryDelta { text: summary },
+            ] if verbatim == "step one " && summary == "step two"
+        ));
+        assert!(
+            state.reasoning_open,
+            "either channel opens the reasoning block"
+        );
+    }
+
+    /// Reasoning then content emits exactly one reasoning end, at the boundary,
+    /// before the text.
+    #[test]
+    fn reasoning_to_content_transition_emits_one_thinking_end() {
+        let mut state = SseState::default();
+        let first = parse(
+            json!({ "choices": [{ "delta": { "reasoning": "thinking" } }] }),
+            &mut state,
+        );
+        assert!(matches!(
+            first.as_slice(),
+            [StreamEvent::ThinkingDelta { .. }]
+        ));
+
+        let second = parse(
+            json!({ "choices": [{ "delta": { "content": "answer" } }] }),
+            &mut state,
+        );
+        assert!(matches!(
+            second.as_slice(),
+            [StreamEvent::ThinkingEnd { .. }, StreamEvent::TextDelta { text }] if text == "answer"
+        ));
+        assert!(!state.reasoning_open);
+
+        // A later content chunk must not emit a second end.
+        let third = parse(
+            json!({ "choices": [{ "delta": { "content": " more" } }] }),
+            &mut state,
+        );
+        assert!(matches!(third.as_slice(), [StreamEvent::TextDelta { text }] if text == " more"));
+    }
+
+    /// Plain content with no preceding reasoning is a bare text delta.
+    #[test]
+    fn content_without_reasoning_is_plain_text_delta() {
+        let mut state = SseState::default();
+        let events = parse(
+            json!({ "choices": [{ "delta": { "content": "hello" } }] }),
+            &mut state,
+        );
+        assert!(matches!(events.as_slice(), [StreamEvent::TextDelta { text }] if text == "hello"));
+    }
+
+    /// A finish after streamed reasoning finalizes the reasoning block
+    /// immediately; the end of turn waits for the counts.
+    #[test]
+    fn finish_after_reasoning_emits_thinking_end_then_deferred_message_end() {
+        let mut state = SseState::default();
+        parse(
+            json!({ "choices": [{ "delta": { "reasoning": "thinking" } }] }),
+            &mut state,
+        );
+        let events = parse(
+            json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }),
+            &mut state,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::ThinkingEnd { .. }]
+        ));
+
+        let done: Vec<StreamEvent> = finish_stream(&mut state)
+            .into_iter()
+            .map(|r| r.expect("the terminal drain is clean"))
+            .collect();
+        assert!(matches!(done.as_slice(), [StreamEvent::MessageEnd { .. }]));
+    }
+
+    /// The second probe leg: the bare reasoning-content string, the vocabulary
+    /// of the vendors that publish no typed array.
+    #[test]
+    fn reasoning_content_string_becomes_thinking_delta() {
+        let mut state = SseState::default();
+        let events = parse(
+            json!({ "choices": [{ "delta": { "reasoning_content": "mulling" } }] }),
+            &mut state,
+        );
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::ThinkingDelta { text }] if text == "mulling")
+        );
+    }
+
+    /// The first entry of a turn may be metadata only — the content fields are
+    /// optional. No event, no open block, and no spurious end on the next
+    /// content chunk.
+    #[test]
+    fn metadata_only_reasoning_details_chunk_is_inert() {
+        let mut state = SseState::default();
+        let events = parse(
+            json!({ "choices": [{ "delta": { "reasoning_details": [
+                { "type": "reasoning.encrypted", "id": "rd_1", "format": "google-gemini-v1" }
+            ] } }] }),
+            &mut state,
+        );
+        assert!(events.is_empty());
+
+        let next = parse(
+            json!({ "choices": [{ "delta": { "content": "answer" } }] }),
+            &mut state,
+        );
+        assert!(matches!(next.as_slice(), [StreamEvent::TextDelta { text }] if text == "answer"));
+    }
+
+    /// A delta with none of the probe fields is inert, which is why the probe
+    /// can run unconditionally on every vendor.
+    #[test]
+    fn delta_without_reasoning_fields_is_inert() {
+        let mut state = SseState::default();
+        let events = parse(
+            json!({ "choices": [{ "delta": { "role": "assistant" } }] }),
+            &mut state,
+        );
+        assert!(events.is_empty());
+    }
+
+    /// Every streamed entry — all three types, metadata-only chunks included —
+    /// is decomposed in order onto the boundary end's payload, with content
+    /// slotted per type and the signature preserved.
+    #[test]
+    fn reasoning_details_entries_are_captured_onto_thinking_end() {
+        let mut state = SseState::default();
+        parse(
+            json!({ "choices": [{ "delta": { "reasoning_details": [
+                { "type": "reasoning.text", "id": "rd_1", "format": "anthropic-claude-v1",
+                  "index": 0, "text": "step one", "signature": "sig-1" },
+                { "type": "reasoning.summary", "format": "openai-responses-v1", "summary": "a summary" },
+            ] } }] }),
+            &mut state,
+        );
+        parse(
+            json!({ "choices": [{ "delta": { "reasoning_details": [
+                { "type": "reasoning.encrypted", "id": "rd_3", "format": "google-gemini-v1", "data": "AAAA" }
+            ] } }] }),
+            &mut state,
+        );
+
+        let events = parse(
+            json!({ "choices": [{ "delta": { "content": "answer" } }] }),
+            &mut state,
+        );
+        let [
+            StreamEvent::ThinkingEnd {
+                opaque: Some(OpaquePayload::OpenRouter { entries }),
+            },
+            StreamEvent::TextDelta { .. },
+        ] = events.as_slice()
+        else {
+            panic!("expected a payload-carrying end, got {events:?}");
+        };
+
+        assert_eq!(entries.len(), 3, "all entries captured, encrypted included");
+        assert_eq!(
+            entries[0],
+            ReasoningDetailEntry {
+                position: 0,
+                entry_type: "reasoning.text".into(),
+                entry_id: Some("rd_1".into()),
+                upstream_format: "anthropic-claude-v1".into(),
+                index: Some(0),
+                content: "step one".into(),
+                signature: Some("sig-1".into()),
+            }
+        );
+        assert_eq!(entries[1].entry_type, "reasoning.summary");
+        assert_eq!(entries[1].content, "a summary");
+        assert_eq!(entries[1].entry_id, None);
+        assert_eq!(entries[2].entry_type, "reasoning.encrypted");
+        assert_eq!(entries[2].content, "AAAA");
+        assert_eq!(
+            entries[2].position, 2,
+            "array order is preserved across chunks"
+        );
+    }
+
+    /// A stream with only the flat reasoning string closes with NO payload: a
+    /// plain chat surface has no echo mechanism, and a fabricated payload would
+    /// be rejected on the next turn.
+    #[test]
+    fn flat_reasoning_string_closes_with_no_payload() {
+        let mut state = SseState::default();
+        parse(
+            json!({ "choices": [{ "delta": { "reasoning": "pondering" } }] }),
+            &mut state,
+        );
+        let events = parse(
+            json!({ "choices": [{ "delta": { "content": "answer" } }] }),
+            &mut state,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                StreamEvent::ThinkingEnd { opaque: None },
+                StreamEvent::TextDelta { .. }
+            ]
+        ));
+    }
+
+    /// The live shape from a gateway fronting a summary-only model: MANY
+    /// summary deltas, one token per chunk. Each routes to the display-only
+    /// channel — never the verbatim one — so a summary can NEVER land in block
+    /// content. The trailing encrypted entry contributes no display text but is
+    /// captured, and the content boundary closes with every entry verbatim.
+    #[test]
+    fn summary_deltas_stream_the_summary_channel_only() {
+        let mut state = SseState::default();
+
+        let first = parse(
+            json!({ "choices": [{ "delta": { "reasoning_details": [
+                { "type": "reasoning.summary", "format": "azure-openai-responses-v1",
+                  "index": 0, "summary": "**Weighing options**\n\nI" }
+            ] } }] }),
+            &mut state,
+        );
+        assert!(matches!(
+            first.as_slice(),
+            [StreamEvent::ThinkingSummaryDelta { text }] if text == "**Weighing options**\n\nI"
+        ));
+        assert!(
+            state.reasoning_open,
+            "the summary channel opens the reasoning block"
+        );
+
+        let second = parse(
+            json!({ "choices": [{ "delta": { "reasoning_details": [
+                { "type": "reasoning.summary", "format": "azure-openai-responses-v1",
+                  "index": 0, "summary": " compare." }
+            ] } }] }),
+            &mut state,
+        );
+        assert!(matches!(
+            second.as_slice(),
+            [StreamEvent::ThinkingSummaryDelta { text }] if text == " compare."
+        ));
+
+        let encrypted = parse(
+            json!({ "choices": [{ "delta": { "reasoning_details": [
+                { "type": "reasoning.encrypted", "id": "rs_1",
+                  "format": "azure-openai-responses-v1", "index": 0, "data": "BLOB" }
+            ] } }] }),
+            &mut state,
+        );
+        assert!(
+            encrypted.is_empty(),
+            "encrypted entries carry no display text"
+        );
+
+        let content = parse(
+            json!({ "choices": [{ "delta": { "content": "answer" } }] }),
+            &mut state,
+        );
+        let [
+            StreamEvent::ThinkingEnd {
+                opaque: Some(OpaquePayload::OpenRouter { entries }),
+            },
+            StreamEvent::TextDelta { .. },
+        ] = content.as_slice()
+        else {
+            panic!("expected a payload-carrying end, got {content:?}");
+        };
+        assert_eq!(entries.len(), 3, "all entries captured, encrypted included");
+        assert_eq!(entries[0].entry_type, "reasoning.summary");
+        assert_eq!(entries[0].content, "**Weighing options**\n\nI");
+        assert_eq!(entries[2].entry_type, "reasoning.encrypted");
+        assert_eq!(entries[2].content, "BLOB");
+    }
+
+    /// Signature-bearing text entries stay VERBATIM — routed to the reasoning
+    /// channel, landing in block content — and the signature rides the captured
+    /// payload unchanged.
+    #[test]
+    fn signed_text_deltas_stay_verbatim() {
+        let mut state = SseState::default();
+        let events = parse(
+            json!({ "choices": [{ "delta": { "reasoning_details": [
+                { "type": "reasoning.text", "format": "anthropic-claude-v1",
+                  "index": 0, "text": "let me reason", "signature": "sig-1" }
+            ] } }] }),
+            &mut state,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::ThinkingDelta { text }] if text == "let me reason"
+        ));
+    }
+
+    /// A MIXED turn — verbatim and summary entries in the same wire array —
+    /// fills BOTH channels in order.
+    #[test]
+    fn mixed_text_and_summary_details_fill_both_channels() {
+        let mut state = SseState::default();
+        let events = parse(
+            json!({ "choices": [{ "delta": { "reasoning_details": [
+                { "type": "reasoning.text", "index": 0, "text": "verbatim chain" },
+                { "type": "reasoning.summary", "index": 0, "summary": "the gist" }
+            ] } }] }),
+            &mut state,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                StreamEvent::ThinkingDelta { text: verbatim },
+                StreamEvent::ThinkingSummaryDelta { text: summary },
+            ] if verbatim == "verbatim chain" && summary == "the gist"
+        ));
+    }
+
+    /// A summary index bump marks a new section, so the first delta of the new
+    /// section gets a blank line prefixed. Deltas within one section join
+    /// verbatim.
+    #[test]
+    fn summary_index_bump_prefixes_a_blank_line() {
+        let mut state = SseState::default();
+
+        let sec0 = parse(
+            json!({ "choices": [{ "delta": { "reasoning_details": [
+                { "type": "reasoning.summary", "index": 0, "summary": "**First**" }
+            ] } }] }),
+            &mut state,
+        );
+        assert!(
+            matches!(
+                sec0.as_slice(),
+                [StreamEvent::ThinkingSummaryDelta { text }] if text == "**First**"
+            ),
+            "the opening section is not prefixed"
+        );
+
+        let sec0_more = parse(
+            json!({ "choices": [{ "delta": { "reasoning_details": [
+                { "type": "reasoning.summary", "index": 0, "summary": " continues" }
+            ] } }] }),
+            &mut state,
+        );
+        assert!(matches!(
+            sec0_more.as_slice(),
+            [StreamEvent::ThinkingSummaryDelta { text }] if text == " continues"
+        ));
+
+        let sec1 = parse(
+            json!({ "choices": [{ "delta": { "reasoning_details": [
+                { "type": "reasoning.summary", "index": 1, "summary": "**Second**" }
+            ] } }] }),
+            &mut state,
+        );
+        assert!(
+            matches!(
+                sec1.as_slice(),
+                [StreamEvent::ThinkingSummaryDelta { text }] if text == "\n\n**Second**"
+            ),
+            "a new summary section is separated by a blank line"
+        );
+
+        // The joiner's prefix is a DISPLAY concern. The captured echo must
+        // record each entry's RAW wire text, so the boundary-crossing section's
+        // stored content stays free of the prefix — otherwise a replayed turn
+        // would carry text the vendor never sent.
+        let content = parse(
+            json!({ "choices": [{ "delta": { "content": "answer" } }] }),
+            &mut state,
+        );
+        let [
+            StreamEvent::ThinkingEnd {
+                opaque: Some(OpaquePayload::OpenRouter { entries }),
+            },
+            StreamEvent::TextDelta { .. },
+        ] = content.as_slice()
+        else {
+            panic!("expected a payload-carrying end, got {content:?}");
+        };
+        assert_eq!(entries.len(), 3, "all three summary entries captured");
+        assert_eq!(entries[0].content, "**First**");
+        assert_eq!(entries[1].content, " continues");
+        assert_eq!(
+            entries[2].content, "**Second**",
+            "the boundary-crossing entry's captured content has no joiner prefix"
+        );
+    }
+}
+
+/// The usage opt-in, and the end of turn it defers.
+mod usage_tests {
+    use super::*;
+
+    fn drain(state: &mut SseState) -> Vec<StreamEvent> {
+        finish_stream(state)
+            .into_iter()
+            .map(|r| r.expect("the terminal drain is clean"))
+            .collect()
+    }
+
+    fn request(reasoning: Option<ReasoningLevel>) -> CompletionRequest {
+        CompletionRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: true,
+            reasoning,
+        }
+    }
+
+    /// Every streaming request opts into the terminal counts; a non-streaming
+    /// body carries no streaming options at all.
+    #[test]
+    fn streaming_request_sends_include_usage() {
+        let provider = plain_provider();
+        let streaming =
+            serde_json::to_value(provider.build_request_body(&request(None), true, true).0)
+                .expect("the request serializes");
+        assert_eq!(
+            streaming["stream_options"],
+            json!({ "include_usage": true })
+        );
+
+        let blocking =
+            serde_json::to_value(provider.build_request_body(&request(None), false, true).0)
+                .expect("the request serializes");
+        assert!(blocking.get("stream_options").is_none());
+    }
+
+    /// The finish defers the end of turn; the empty-choices chunk releases it
+    /// carrying real counts. The end-of-stream line afterwards releases nothing
+    /// twice.
+    #[test]
+    fn usage_chunk_releases_deferred_message_end() {
+        let mut state = SseState::default();
+        parse(
+            json!({ "choices": [{ "delta": { "content": "hi" } }] }),
+            &mut state,
+        );
+
+        let finish = parse(
+            json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }], "usage": null }),
+            &mut state,
+        );
+        assert!(
+            finish.is_empty(),
+            "the end of turn is deferred past the finish"
+        );
+
+        let events = parse(
+            json!({ "choices": [], "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 34,
+                "completion_tokens_details": { "reasoning_tokens": 7 }
+            } }),
+            &mut state,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::MessageEnd { usage, stop_reason: StopReason::EndTurn }]
+                if usage.input_tokens == 12
+                    && usage.output_tokens == 34
+                    && usage.reasoning_tokens == Some(7)
+        ));
+
+        assert!(
+            drain(&mut state).is_empty(),
+            "no second end at the end-of-stream line"
+        );
+    }
+
+    /// The terminal order is pinned across the deferral: the end of turn, then
+    /// the buffered tool events, then the tool close. An absent details object
+    /// yields no reasoning count, never a zero.
+    #[test]
+    fn tool_event_order_preserved_across_deferral() {
+        let mut state = SseState::default();
+        parse(
+            json!({ "choices": [{ "delta": { "tool_calls": [
+                { "id": "call_1", "function": { "name": "search", "arguments": "" } }
+            ] } }] }),
+            &mut state,
+        );
+        parse(
+            json!({ "choices": [{ "delta": { "tool_calls": [
+                { "function": { "arguments": "{\"q\":1}" } }
+            ] } }] }),
+            &mut state,
+        );
+
+        let finish = parse(
+            json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] }),
+            &mut state,
+        );
+        assert!(
+            finish.is_empty(),
+            "tool events stay buffered until the end of turn releases"
+        );
+
+        let events = parse(
+            json!({ "choices": [], "usage": { "prompt_tokens": 1, "completion_tokens": 2 } }),
+            &mut state,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                StreamEvent::MessageEnd { usage, stop_reason: StopReason::ToolUse },
+                StreamEvent::ToolUseStart { id, name },
+                StreamEvent::ToolUseInputDelta { json },
+                StreamEvent::ToolUseEnd,
+            ] if usage.input_tokens == 1
+                && usage.reasoning_tokens.is_none()
+                && id == "call_1"
+                && name == "search"
+                && json == "{\"q\":1}"
+        ));
+    }
+
+    /// Parallel calls: N buffered start-and-arguments pairs are released by a
+    /// SINGLE terminal close. That cardinality is what a multi-call finalizer
+    /// relies on to tell a sibling call from a duplicate.
+    #[test]
+    fn parallel_tool_calls_share_one_terminal_end() {
+        let mut state = SseState::default();
+        parse(
+            json!({ "choices": [{ "delta": { "tool_calls": [
+                { "index": 0, "id": "call_a", "function": { "name": "search", "arguments": "{\"q\":1}" } }
+            ] } }] }),
+            &mut state,
+        );
+        parse(
+            json!({ "choices": [{ "delta": { "tool_calls": [
+                { "index": 1, "id": "call_b", "function": { "name": "fetch", "arguments": "{\"u\":2}" } }
+            ] } }] }),
+            &mut state,
+        );
+        parse(
+            json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] }),
+            &mut state,
+        );
+
+        let events = parse(
+            json!({ "choices": [], "usage": { "prompt_tokens": 1, "completion_tokens": 2 } }),
+            &mut state,
+        );
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    StreamEvent::MessageEnd { stop_reason: StopReason::ToolUse, .. },
+                    StreamEvent::ToolUseStart { id: a_id, .. },
+                    StreamEvent::ToolUseInputDelta { .. },
+                    StreamEvent::ToolUseStart { id: b_id, .. },
+                    StreamEvent::ToolUseInputDelta { .. },
+                    StreamEvent::ToolUseEnd,
+                ] if a_id == "call_a" && b_id == "call_b"
+            ),
+            "two starts, one terminal close: {events:?}"
+        );
+    }
+
+    /// A vendor that never sends the counts chunk: the end-of-stream line still
+    /// releases the end of turn, with zeroed counts. Never a hang.
+    #[test]
+    fn done_without_usage_chunk_still_terminates() {
+        let mut state = SseState::default();
+        parse(
+            json!({ "choices": [{ "delta": { "content": "hi" } }] }),
+            &mut state,
+        );
+        let finish = parse(
+            json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }),
+            &mut state,
+        );
+        assert!(finish.is_empty());
+
+        let done = drain(&mut state);
+        assert!(matches!(
+            done.as_slice(),
+            [StreamEvent::MessageEnd { usage, stop_reason: StopReason::EndTurn }]
+                if usage.input_tokens == 0
+                    && usage.output_tokens == 0
+                    && usage.reasoning_tokens.is_none()
+        ));
+    }
+
+    /// A transport drop after a deferred finish: the natural end of the event
+    /// stream invokes the same terminal drain, so a completed turn's content is
+    /// committed rather than stranded as an uncommitted streaming block.
+    #[test]
+    fn transport_end_without_done_releases_deferred_message_end() {
+        let mut state = SseState::default();
+        parse(
+            json!({ "choices": [{ "delta": { "content": "hi" } }] }),
+            &mut state,
+        );
+        let finish = parse(
+            json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }),
+            &mut state,
+        );
+        assert!(finish.is_empty(), "deferred past the finish");
+
+        let drained = drain(&mut state);
+        assert!(matches!(
+            drained.as_slice(),
+            [StreamEvent::MessageEnd {
+                stop_reason: StopReason::EndTurn,
+                ..
+            }]
+        ));
+
+        // A stream that already released drains to nothing, so the wiring's
+        // second call cannot double-emit.
+        assert!(
+            drain(&mut state).is_empty(),
+            "no double end on transport end"
+        );
+    }
+
+    /// A vendor that carries the counts on the finish chunk itself releases
+    /// immediately — no wait for a chunk that will never come.
+    #[test]
+    fn usage_on_finish_chunk_releases_immediately() {
+        let mut state = SseState::default();
+        let events = parse(
+            json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }], "usage": {
+                "prompt_tokens": 5, "completion_tokens": 9
+            } }),
+            &mut state,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::MessageEnd { usage, stop_reason: StopReason::EndTurn }]
+                if usage.input_tokens == 5 && usage.output_tokens == 9
+        ));
+        assert!(
+            drain(&mut state).is_empty(),
+            "no second end at the end-of-stream line"
+        );
+    }
+}

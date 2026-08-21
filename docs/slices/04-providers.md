@@ -44,7 +44,7 @@ crate `crates/ronna-server`, directory `src/llm` (11,497 lines) plus `src/http.r
   close. Their tests come across.
 - **No network in tests.** The source's vendor tests run against recorded fixtures and local
   mocks; every ported test must too, and the suite must pass with the network-blocking
-  discipline the testing reference describes.
+  discipline described in the testing reference under docs/reference.
 
 ## Test accounting
 

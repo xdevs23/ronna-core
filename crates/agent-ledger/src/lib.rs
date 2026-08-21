@@ -17,6 +17,13 @@
 //! drives those hooks forward from the persisted cursor without ever learning
 //! which kind it just ran.
 //!
+//! [`providers`] is the model boundary on top of that: one trait per provider
+//! type, one neutral vocabulary every vendor is translated into and out of, and
+//! one streaming contract that carries the retry, watchdog and reconnect
+//! behavior so no vendor module writes its own. **No vendor ships enabled** —
+//! each is a feature, because choosing a model provider is the consumer's
+//! decision, not this library's.
+//!
 //! ```
 //! use agent_ledger::{bus::EventBus, event::CoreEvent};
 //!
@@ -31,6 +38,7 @@ pub mod agency;
 pub mod block;
 pub mod bus;
 pub mod event;
+pub mod providers;
 pub mod reactivity;
 pub mod store;
 pub mod types;
@@ -43,5 +51,9 @@ pub use block::{
 };
 pub use bus::{AttachOutcome, EventBus, PushEnvelope, PushSink, RuntimeEvent};
 pub use event::CoreEvent;
+pub use providers::{
+    LlmError, ProviderModule, ProviderRegistry, ProviderRequest, ProviderResponse, StreamEvent,
+    blocks_to_messages,
+};
 pub use store::{Store, StoreError};
 pub use types::{ApprovalChoice, Awaiting, InputBlock, StopReason, StreamUsage};

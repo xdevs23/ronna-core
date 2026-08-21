@@ -4,14 +4,10 @@
 use rusqlite::Connection;
 
 use super::{Store, StoreError};
+use crate::providers::ReasoningCapability;
 
 /// A model as the picker sees it: the row's identity plus the provider instance
-/// it is reached through.
-///
-/// A persisted entry carries no capability data — what a model can do is live
-/// data, and a consumer enriches an entry from its own catalog by
-/// `external_id`. Storing it here would go stale the moment a provider changes
-/// it.
+/// it is reached through, and room for the capability a live listing knows.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelEntry {
     /// The model row's id, absent for a model that has never been resolved.
@@ -26,6 +22,18 @@ pub struct ModelEntry {
     pub provider_id: String,
     /// That instance's name, falling back to its id.
     pub provider_name: String,
+    /// The reasoning levels this model accepts.
+    ///
+    /// Transport-only, and empty on every read in this module: what a model can
+    /// do is live, version-dependent data, so no column holds it and a stored
+    /// copy would be wrong the first time its provider changed it. The field is
+    /// here so a caller holding a fresh listing — where
+    /// [`ModelInfo::reasoning`](crate::providers::ModelInfo) carries the same
+    /// value — can enrich an entry by `external_id` and pass on this one type.
+    /// A second entry type differing by one field is how the enriched and the
+    /// bare form start disagreeing.
+    #[serde(default, skip_serializing_if = "ReasoningCapability::is_empty")]
+    pub reasoning: ReasoningCapability,
 }
 
 /// Resolve (upsert) a model row and return its id.
@@ -165,12 +173,16 @@ fn row_to_model_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelEntry> {
         vendor: row.get(3)?,
         provider_id: row.get(4)?,
         provider_name: row.get(5)?,
+        // No column holds capability, so a picker read reports none rather
+        // than guessing. A caller enriches from its own listing.
+        reasoning: ReasoningCapability::default(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use crate::block::Role;
+    use crate::providers::{ReasoningCapability, ReasoningLevel};
     use crate::store::Store;
 
     /// Recency orders by the newest conversation, frequency by how many blocks
@@ -214,5 +226,40 @@ mod tests {
         let rest = store.frequent_models(10, vec![busiest_id]).await.unwrap();
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].external_id, "quiet");
+    }
+
+    /// The capability field is a transport slot, not a column: a picker read
+    /// leaves it empty and it stays off the wire, and a caller that enriches an
+    /// entry from a live listing carries the same value on the same type.
+    #[tokio::test]
+    async fn a_picker_read_carries_no_capability_until_a_caller_enriches_it() {
+        let store = Store::in_memory().unwrap();
+        let conversation = store
+            .create_conversation("p".into(), "m".into(), "M".into(), String::new())
+            .await
+            .unwrap();
+        store
+            .insert_text_block(conversation, Role::User, "one".into())
+            .await
+            .unwrap();
+
+        let mut entry = store.recent_models(10).await.unwrap().remove(0);
+        assert!(
+            entry.reasoning.is_empty(),
+            "no column holds capability, so a read reports none"
+        );
+        let bare = serde_json::to_value(&entry).unwrap();
+        assert!(
+            bare.get("reasoning").is_none(),
+            "an empty capability stays off the wire entirely"
+        );
+
+        entry.reasoning = ReasoningCapability::new(vec![ReasoningLevel::Off, ReasoningLevel::High]);
+        let enriched = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            enriched["reasoning"],
+            serde_json::json!({ "levels": ["off", "high"], "default": null }),
+            "the enriched entry carries the listing's own capability shape"
+        );
     }
 }
