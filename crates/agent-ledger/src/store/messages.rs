@@ -531,53 +531,11 @@ impl Store {
         .await
     }
 
-    /// Append a tool result block carrying a call's output.
-    ///
-    /// # Errors
-    ///
-    /// If the insert fails or the store's actor has stopped.
-    pub async fn insert_tool_result_block(
-        &self,
-        conversation_id: i64,
-        tool_call_id: String,
-        content: String,
-    ) -> Result<i64, StoreError> {
-        self.run(move |conn| {
-            transact(conn, |tx| {
-                let block_id = insert_block(tx, conversation_id, "tool_result")?;
-                tx.execute(
-                    "INSERT INTO block_tool_result (block_id, tool_call_id, content) VALUES (?1, ?2, ?3)",
-                    params![block_id, tool_call_id, content],
-                )?;
-                Ok(block_id)
-            })
-        })
-        .await
-    }
-
-    /// Append a tool error block resolving a call that failed.
-    ///
-    /// # Errors
-    ///
-    /// If the insert fails or the store's actor has stopped.
-    pub async fn insert_tool_error_block(
-        &self,
-        conversation_id: i64,
-        tool_call_id: String,
-        error: String,
-    ) -> Result<i64, StoreError> {
-        self.run(move |conn| {
-            transact(conn, |tx| {
-                let block_id = insert_block(tx, conversation_id, "tool_error")?;
-                tx.execute(
-                    "INSERT INTO block_tool_error (block_id, tool_call_id, error) VALUES (?1, ?2, ?3)",
-                    params![block_id, tool_call_id, error],
-                )?;
-                Ok(block_id)
-            })
-        })
-        .await
-    }
+    // A tool result or error enters the ledger through exactly one door each:
+    // the conditional resolution writes in the tool-call module
+    // (`complete_tool_call_block`, `fail_tool_call_block`), keyed on the call
+    // block id. An unconditional insert here would be a second door past the
+    // one-outcome-per-call condition.
 
     /// Append a status block.
     ///

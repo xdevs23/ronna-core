@@ -39,7 +39,7 @@ mod tool_call;
 mod tool_error;
 mod tool_result;
 
-pub use approval_decision::{ApprovalDecision, denial_error_text};
+pub use approval_decision::ApprovalDecision;
 pub use approval_request::ApprovalRequest;
 pub use code::Code;
 pub use date_marker::DateMarker;

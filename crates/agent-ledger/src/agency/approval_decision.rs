@@ -69,23 +69,3 @@ impl Agency for ApprovalDecision {
 /// System-only: the model must never learn permission was decided — no
 /// content, no message boundary. Every hook stays at the invisible default.
 impl Projection for ApprovalDecision {}
-
-/// The tool error a denial records on the originating call.
-///
-/// Built so the model learns WHO denied and why: a system reason means the
-/// runtime auto-rejected, a user reason means the human typed it. Who denied is
-/// structural — it is the presence of one field or the other, never a flag on
-/// the verdict — and this one function is where that structure becomes the
-/// sentence the model reads. Every caller composing the text itself would be a
-/// second vocabulary for the same fact.
-#[must_use]
-pub fn denial_error_text(system_reason: Option<&str>, user_reason: Option<&str>) -> String {
-    match (system_reason, user_reason) {
-        (Some(system), Some(user)) => {
-            format!("The system denied this action automatically: {system} The user added: {user}")
-        }
-        (Some(system), None) => format!("The system denied this action automatically: {system}"),
-        (None, Some(user)) => format!("The user denied this action. Reason: {user}"),
-        (None, None) => "The user denied this action.".to_string(),
-    }
-}

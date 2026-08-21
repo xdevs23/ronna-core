@@ -108,7 +108,7 @@ impl Agency for ToolCall {
         }
         ctx.bus.emit(CoreEvent::ToolCallReady {
             conversation_id: ctx.conversation_id,
-            tool_call_id: self.tool_call_id.clone(),
+            call_block_id: self.id,
         });
         Ok(false)
     }

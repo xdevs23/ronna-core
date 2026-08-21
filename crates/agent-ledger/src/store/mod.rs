@@ -720,9 +720,15 @@ mod tests {
             .await
             .unwrap();
         let tool_result = s
-            .insert_tool_result_block(c1, "call_1".into(), "result text".into())
+            .complete_tool_call_block(
+                c1,
+                "call_1".into(),
+                "result text".into(),
+                committed_tool_call,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("the call is unresolved");
 
         // Uncommitted streaming partials left by a dropped stream.
         let _streaming_text = s.insert_streaming_block(c1, Role::Assistant).await.unwrap();
@@ -1267,14 +1273,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let request = s.insert_approval_request_block(source, call).await.unwrap();
+        let request = s
+            .insert_approval_request_block(source, call)
+            .await
+            .unwrap()
+            .expect("the first request writes");
         s.insert_approval_decision_block(
             source,
             request,
             ApprovalChoice::Approved,
             None,
             Some("go ahead".into()),
-            None,
         )
         .await
         .unwrap();
@@ -1361,17 +1370,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let request = s.insert_approval_request_block(source, call).await.unwrap();
-        s.insert_approval_decision_block(
-            source,
-            request,
-            ApprovalChoice::Approved,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let request = s
+            .insert_approval_request_block(source, call)
+            .await
+            .unwrap()
+            .expect("the first request writes");
+        s.insert_approval_decision_block(source, request, ApprovalChoice::Approved, None, None)
+            .await
+            .unwrap();
         s.insert_text_block(source, Role::User, "carry on".into())
             .await
             .unwrap();
@@ -2460,8 +2466,12 @@ mod tests {
         let consumer = s.changes.consumer();
         let _ = consumer.drain();
 
-        let request = s.insert_approval_request_block(conv, call).await.unwrap();
-        s.insert_approval_decision_block(conv, request, ApprovalChoice::Approved, None, None, None)
+        let request = s
+            .insert_approval_request_block(conv, call)
+            .await
+            .unwrap()
+            .expect("the first request writes");
+        s.insert_approval_decision_block(conv, request, ApprovalChoice::Approved, None, None)
             .await
             .unwrap();
         s.insert_user_blocks(

@@ -1,9 +1,11 @@
-//! Conversation-level value types: the composer input, the approval verdict,
-//! the ask vocabulary, the stop reason and the usage summary.
+//! Conversation-level value types: the composer input, the approval verdict
+//! and the sentence a denial records, the ask vocabulary, the stop reason and
+//! the usage summary.
 //!
 //! These are the words every later layer speaks. They carry no behavior beyond
-//! intrinsic accessors, and they know nothing about any application built on
-//! this library.
+//! intrinsic accessors and the one sentence constructor
+//! ([`denial_error_text`]), and they know nothing about any application built
+//! on this library.
 //!
 //! They arrived here from a wire crate that also generated frontend bindings.
 //! The binding derive did not come with them: generating bindings is one
@@ -62,6 +64,30 @@ impl ApprovalChoice {
     }
 }
 
+/// The tool error a denial records on the originating call.
+///
+/// Built so the model learns WHO denied and why: a system reason means the
+/// runtime auto-rejected, a user reason means the human typed it. Who denied is
+/// structural — it is the presence of one field or the other, never a flag on
+/// the verdict — and this one function is where that structure becomes the
+/// sentence the model reads. Every caller composing the text itself would be a
+/// second vocabulary for the same fact.
+///
+/// It lives here, in the leaf both the agency and store layers already import,
+/// because the store's denial write is the single construction site and the
+/// store never imports the agency layer.
+#[must_use]
+pub fn denial_error_text(system_reason: Option<&str>, user_reason: Option<&str>) -> String {
+    match (system_reason, user_reason) {
+        (Some(system), Some(user)) => {
+            format!("The system denied this action automatically: {system} The user added: {user}")
+        }
+        (Some(system), None) => format!("The system denied this action automatically: {system}"),
+        (None, Some(user)) => format!("The user denied this action. Reason: {user}"),
+        (None, None) => "The user denied this action.".to_string(),
+    }
+}
+
 /// Who owes a block's next move. "No ask at all" is `Option::None` from the
 /// block's own `awaiting` hook — that makes the block invisible to every gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -103,4 +129,32 @@ pub struct StreamUsage {
     pub input_tokens: u32,
     /// Tokens the response produced.
     pub output_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::denial_error_text;
+
+    /// All four authorship shapes of the denial text, asserted THROUGH the
+    /// function — who denied is structural, and every caller builds the error
+    /// via this one seam.
+    #[test]
+    fn denial_error_text_covers_all_four_authorship_shapes() {
+        assert_eq!(
+            denial_error_text(None, None),
+            "The user denied this action."
+        );
+        assert_eq!(
+            denial_error_text(None, Some("too risky")),
+            "The user denied this action. Reason: too risky"
+        );
+        assert_eq!(
+            denial_error_text(Some("policy"), None),
+            "The system denied this action automatically: policy"
+        );
+        assert_eq!(
+            denial_error_text(Some("policy"), Some("agreed")),
+            "The system denied this action automatically: policy The user added: agreed"
+        );
+    }
 }

@@ -390,16 +390,43 @@ pub(crate) mod oracle {
                 .unwrap()
         }
 
+        /// Resolve the call recorded under this provider id with a result,
+        /// through the one conditional door — keyed on the call's BLOCK id,
+        /// which the helper reads back off the ledger (the LAST call under the
+        /// id, the one still owed an outcome in every ledger these tests
+        /// build).
         pub async fn result(&self, tool_call_id: &str) -> i64 {
+            let call = self.call_block(tool_call_id).await;
             self.ctx
                 .store
-                .insert_tool_result_block(
+                .complete_tool_call_block(
                     self.ctx.conversation_id,
                     tool_call_id.into(),
                     "ok".into(),
+                    call,
                 )
                 .await
                 .unwrap()
+                .expect("the call is unresolved")
+        }
+
+        /// The block id of the last `tool_call` recorded under this provider
+        /// id — a result or error write is keyed on it, and a wakeup names it.
+        pub async fn call_block(&self, tool_call_id: &str) -> i64 {
+            self.ctx
+                .store
+                .list_blocks(self.ctx.conversation_id)
+                .await
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|block| {
+                    block.block_type == "tool_call"
+                        && block.fields.get("tool_call_id").and_then(|v| v.as_str())
+                            == Some(tool_call_id)
+                })
+                .unwrap_or_else(|| panic!("no tool_call recorded under '{tool_call_id}'"))
+                .id
         }
 
         pub async fn status(&self, status: &str) -> i64 {
@@ -411,14 +438,14 @@ pub(crate) mod oracle {
         }
 
         #[track_caller]
-        pub fn expect_wakeup(&mut self, tool_call_id: &str) {
+        pub fn expect_wakeup(&mut self, call_block_id: i64) {
             match self.rx.try_recv().expect("expected a ToolCallReady wakeup") {
                 CoreEvent::ToolCallReady {
                     conversation_id,
-                    tool_call_id: id,
+                    call_block_id: id,
                 } => {
                     assert_eq!(conversation_id, self.ctx.conversation_id);
-                    assert_eq!(id, tool_call_id);
+                    assert_eq!(id, call_block_id);
                 }
                 other => panic!("expected ToolCallReady, got {other:?}"),
             }

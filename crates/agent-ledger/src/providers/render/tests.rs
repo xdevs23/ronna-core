@@ -676,7 +676,7 @@ async fn composes_over_a_store_built_ledger_byte_stably() {
         .insert_text_block(conversation, Role::Assistant, "looking".into())
         .await
         .unwrap();
-    store
+    let call = store
         .insert_tool_call_block(
             conversation,
             Role::Assistant,
@@ -691,9 +691,10 @@ async fn composes_over_a_store_built_ledger_byte_stably() {
         .await
         .unwrap();
     store
-        .insert_tool_result_block(conversation, "call_1".into(), "found it".into())
+        .complete_tool_call_block(conversation, "call_1".into(), "found it".into(), call)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the call is unresolved");
     store
         .insert_text_block(conversation, Role::Assistant, "x is x".into())
         .await

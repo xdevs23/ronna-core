@@ -86,6 +86,20 @@ async fn stored_kind(rig: &Rig, block_id: i64) -> BlockKind {
     BlockKind::from_block(block)
 }
 
+async fn resolve_with_result(rig: &Rig, tool_call_id: &str, call_block_id: i64) {
+    rig.ctx
+        .store
+        .complete_tool_call_block(
+            rig.ctx.conversation_id,
+            tool_call_id.into(),
+            "ok".into(),
+            call_block_id,
+        )
+        .await
+        .unwrap()
+        .expect("the call is unresolved");
+}
+
 async fn insert_call(rig: &Rig, tool_call_id: &str) -> i64 {
     rig.ctx
         .store
@@ -116,15 +130,15 @@ fn assert_silent(rx: &mut tokio::sync::broadcast::Receiver<CoreEvent>) {
 fn assert_wakeup(
     rx: &mut tokio::sync::broadcast::Receiver<CoreEvent>,
     conversation_id: i64,
-    tool_call_id: &str,
+    call_block_id: i64,
 ) {
     match rx.try_recv().expect("expected a ToolCallReady wakeup") {
         CoreEvent::ToolCallReady {
             conversation_id: c,
-            tool_call_id: id,
+            call_block_id: id,
         } => {
             assert_eq!(c, conversation_id);
-            assert_eq!(id, tool_call_id);
+            assert_eq!(id, call_block_id);
         }
         other => panic!("expected ToolCallReady, got {other:?}"),
     }
@@ -336,7 +350,7 @@ async fn unresolved_tool_call_parks_and_emits_the_wakeup() {
 
     assert_eq!(call.awaiting(), Some(Awaiting::System));
     assert!(!call.run(&rig.ctx).await.unwrap());
-    assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, "call_1");
+    assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, block_id);
     assert_silent(&mut rig.rx);
 }
 
@@ -344,11 +358,7 @@ async fn unresolved_tool_call_parks_and_emits_the_wakeup() {
 async fn matching_result_settles_the_call_silently() {
     let mut rig = rig().await;
     let block_id = insert_call(&rig, "call_1").await;
-    rig.ctx
-        .store
-        .insert_tool_result_block(rig.ctx.conversation_id, "call_1".into(), "ok".into())
-        .await
-        .unwrap();
+    resolve_with_result(&rig, "call_1", block_id).await;
 
     let call = stored_kind(&rig, block_id).await;
     assert!(call.run(&rig.ctx).await.unwrap());
@@ -361,9 +371,15 @@ async fn matching_error_settles_the_call_silently() {
     let block_id = insert_call(&rig, "call_1").await;
     rig.ctx
         .store
-        .insert_tool_error_block(rig.ctx.conversation_id, "call_1".into(), "boom".into())
+        .fail_tool_call_block(
+            rig.ctx.conversation_id,
+            "call_1".into(),
+            "boom".into(),
+            block_id,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the call is unresolved");
 
     let call = stored_kind(&rig, block_id).await;
     assert!(call.run(&rig.ctx).await.unwrap());
@@ -374,20 +390,24 @@ async fn matching_error_settles_the_call_silently() {
 async fn unrelated_result_never_settles_a_call() {
     let mut rig = rig().await;
     let block_id = insert_call(&rig, "call_1").await;
+    let second = insert_call(&rig, "call_2").await;
+    resolve_with_result(&rig, "call_2", second).await;
+    let third = insert_call(&rig, "call_3").await;
     rig.ctx
         .store
-        .insert_tool_result_block(rig.ctx.conversation_id, "call_2".into(), "ok".into())
+        .fail_tool_call_block(
+            rig.ctx.conversation_id,
+            "call_3".into(),
+            "boom".into(),
+            third,
+        )
         .await
-        .unwrap();
-    rig.ctx
-        .store
-        .insert_tool_error_block(rig.ctx.conversation_id, "call_3".into(), "boom".into())
-        .await
-        .unwrap();
+        .unwrap()
+        .expect("the call is unresolved");
 
     let call = stored_kind(&rig, block_id).await;
     assert!(!call.run(&rig.ctx).await.unwrap());
-    assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, "call_1");
+    assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, block_id);
 }
 
 /// Two payloads with no id at all must not pair up.
@@ -418,19 +438,19 @@ fn an_id_less_call_is_not_settled_by_an_id_less_result() {
     );
 }
 
+/// A result already on the ledger BEFORE the call — an earlier call sharing
+/// the same provider id, already resolved — must not settle the later call:
+/// the predicate only reads forward from the call's own position.
 #[tokio::test]
 async fn a_result_preceding_the_call_does_not_settle_it() {
     let mut rig = rig().await;
-    rig.ctx
-        .store
-        .insert_tool_result_block(rig.ctx.conversation_id, "call_1".into(), "stale".into())
-        .await
-        .unwrap();
+    let earlier = insert_call(&rig, "call_1").await;
+    resolve_with_result(&rig, "call_1", earlier).await;
     let block_id = insert_call(&rig, "call_1").await;
 
     let call = stored_kind(&rig, block_id).await;
     assert!(!call.run(&rig.ctx).await.unwrap());
-    assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, "call_1");
+    assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, block_id);
 }
 
 #[tokio::test]
@@ -506,29 +526,6 @@ async fn approval_blocks_await_an_out_of_band_action_and_run_inert() {
     assert_silent(&mut rig.rx);
 }
 
-/// All four authorship shapes of the denial text, asserted THROUGH the
-/// function — who denied is structural, and every caller builds the error via
-/// this one seam.
-#[test]
-fn denial_error_text_covers_all_four_authorship_shapes() {
-    assert_eq!(
-        denial_error_text(None, None),
-        "The user denied this action."
-    );
-    assert_eq!(
-        denial_error_text(None, Some("too risky")),
-        "The user denied this action. Reason: too risky"
-    );
-    assert_eq!(
-        denial_error_text(Some("policy"), None),
-        "The system denied this action automatically: policy"
-    );
-    assert_eq!(
-        denial_error_text(Some("policy"), Some("agreed")),
-        "The system denied this action automatically: policy The user added: agreed"
-    );
-}
-
 /// A call, its approval request, and optionally a decision — all read back
 /// through the store, so the routing answers from stored fields.
 async fn approval_chain(rig: &Rig, decision: Option<ApprovalChoice>) -> (i64, i64, Option<i64>) {
@@ -538,7 +535,8 @@ async fn approval_chain(rig: &Rig, decision: Option<ApprovalChoice>) -> (i64, i6
         .store
         .insert_approval_request_block(rig.ctx.conversation_id, call)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the first request writes");
     let mut decision_id = None;
     if let Some(choice) = decision {
         decision_id = Some(
@@ -548,7 +546,6 @@ async fn approval_chain(rig: &Rig, decision: Option<ApprovalChoice>) -> (i64, i6
                     rig.ctx.conversation_id,
                     request,
                     choice,
-                    None,
                     None,
                     None,
                 )
@@ -603,12 +600,8 @@ async fn denied_chain_routes_nowhere() {
 #[tokio::test]
 async fn resolved_call_closes_the_approved_route() {
     let rig = rig().await;
-    let (_call, request, decision) = approval_chain(&rig, Some(ApprovalChoice::Approved)).await;
-    rig.ctx
-        .store
-        .insert_tool_result_block(rig.ctx.conversation_id, "call_1".into(), "ok".into())
-        .await
-        .unwrap();
+    let (call, request, decision) = approval_chain(&rig, Some(ApprovalChoice::Approved)).await;
+    resolve_with_result(&rig, "call_1", call).await;
     assert_eq!(post_gate_of(&rig, decision.unwrap()).await, None);
     assert_eq!(post_gate_of(&rig, request).await, None);
 }
@@ -619,11 +612,8 @@ async fn resolved_call_closes_the_approved_route() {
 async fn unrelated_result_does_not_close_the_approval_route() {
     let rig = rig().await;
     let (call, request, decision) = approval_chain(&rig, Some(ApprovalChoice::Approved)).await;
-    rig.ctx
-        .store
-        .insert_tool_result_block(rig.ctx.conversation_id, "call_2".into(), "ok".into())
-        .await
-        .unwrap();
+    let other = insert_call(&rig, "call_2").await;
+    resolve_with_result(&rig, "call_2", other).await;
     assert_eq!(post_gate_of(&rig, decision.unwrap()).await, Some(request));
     assert_eq!(post_gate_of(&rig, request).await, Some(call));
 }
@@ -637,13 +627,9 @@ async fn tool_call_run_post_gate_is_its_own_run() {
     let call = stored_kind(&rig, block_id).await;
 
     call.run_post_gate(&rig.ctx).await.unwrap();
-    assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, "call_1");
+    assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, block_id);
 
-    rig.ctx
-        .store
-        .insert_tool_result_block(rig.ctx.conversation_id, "call_1".into(), "ok".into())
-        .await
-        .unwrap();
+    resolve_with_result(&rig, "call_1", block_id).await;
     call.run_post_gate(&rig.ctx).await.unwrap();
     assert_silent(&mut rig.rx);
 }
@@ -658,15 +644,11 @@ async fn re_driving_an_unresolved_call_re_emits_until_the_result_lands() {
         assert!(!call.run(&rig.ctx).await.unwrap());
     }
     for _ in 0..3 {
-        assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, "call_1");
+        assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, block_id);
     }
     assert_silent(&mut rig.rx);
 
-    rig.ctx
-        .store
-        .insert_tool_result_block(rig.ctx.conversation_id, "call_1".into(), "ok".into())
-        .await
-        .unwrap();
+    resolve_with_result(&rig, "call_1", block_id).await;
     assert!(call.run(&rig.ctx).await.unwrap());
     assert_silent(&mut rig.rx);
 }

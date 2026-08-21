@@ -179,8 +179,9 @@ pub enum CoreEvent {
     ToolCallReady {
         /// The conversation.
         conversation_id: i64,
-        /// The call that awaits execution.
-        tool_call_id: String,
+        /// The block id of the call that awaits execution — the call's one
+        /// identity: a model's `tool_call_id` can repeat, the block id cannot.
+        call_block_id: i64,
     },
     /// A metadata request awaits fulfillment. Same wakeup contract as
     /// `ToolCallReady`: IDs only, never payloads-as-truth — the fulfillment

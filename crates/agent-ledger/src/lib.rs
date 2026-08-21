@@ -51,9 +51,7 @@ pub mod store;
 pub mod tools;
 pub mod types;
 
-pub use agency::{
-    Agency, AgencyCtx, BlockKind, ContentPart, GateDecision, Projection, denial_error_text,
-};
+pub use agency::{Agency, AgencyCtx, BlockKind, ContentPart, GateDecision, Projection};
 pub use block::{
     Block, OpaquePayload, RESERVED_FIELD_NAMES, ReasoningDetailEntry, Role, ToolCallResult,
 };
@@ -65,4 +63,4 @@ pub use providers::{
 };
 pub use store::{Store, StoreError};
 pub use tools::{ToolContext, ToolHandler, ToolOutcome, ToolRegistry, ToolRunner, submit_approval};
-pub use types::{ApprovalChoice, Awaiting, InputBlock, StopReason, StreamUsage};
+pub use types::{ApprovalChoice, Awaiting, InputBlock, StopReason, StreamUsage, denial_error_text};

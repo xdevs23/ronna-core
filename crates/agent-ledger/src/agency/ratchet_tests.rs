@@ -44,7 +44,7 @@ async fn staggered_later_results_never_fire_while_the_earliest_dangles() {
         outcome.cursor, user,
         "cursor parks at or before the dangling first call"
     );
-    o.expect_wakeup("c1");
+    o.expect_wakeup(c1);
     o.expect_silence();
 
     // The third and second land — the tail now awaits the model, but the gate
@@ -60,7 +60,7 @@ async fn staggered_later_results_never_fire_while_the_earliest_dangles() {
     );
     assert!(outcome.parked);
     assert_eq!(outcome.cursor, user);
-    o.expect_wakeup("c1");
+    o.expect_wakeup(c1);
     o.expect_silence();
 
     // The final result lands, and exactly ONE turn is owed against all three.
@@ -70,7 +70,6 @@ async fn staggered_later_results_never_fire_while_the_earliest_dangles() {
     assert!(!outcome.parked);
     assert_eq!(outcome.cursor, r1);
     o.expect_silence();
-    let _ = c1;
 
     // The assistant's reply closes the gate again.
     o.assistant_text("done").await;
@@ -84,10 +83,10 @@ async fn in_order_resolution_first_result_alone_does_not_fire() {
     let mut o = Oracle::new().await;
     o.user_text("two calls").await;
     let c1 = o.call("c1").await;
-    o.call("c2").await;
+    let c2 = o.call("c2").await;
 
     o.drive().await;
-    o.expect_wakeup("c1");
+    o.expect_wakeup(c1);
 
     // The first result lands — the drive confirms the first call and parks on
     // the second. The result itself sits beyond the park, unreachable this
@@ -97,7 +96,7 @@ async fn in_order_resolution_first_result_alone_does_not_fire() {
     assert!(!outcome.owes_turn, "the first result alone must not fire");
     assert!(outcome.parked);
     assert_eq!(outcome.cursor, c1, "cursor confirmed the resolved call");
-    o.expect_wakeup("c2");
+    o.expect_wakeup(c2);
     o.expect_silence();
 
     let r2 = o.result("c2").await;
@@ -110,12 +109,12 @@ async fn in_order_resolution_first_result_alone_does_not_fire() {
 async fn single_call_parks_then_fires_on_its_result() {
     let mut o = Oracle::new().await;
     o.user_text("one call").await;
-    o.call("c1").await;
+    let c1 = o.call("c1").await;
 
     let outcome = o.drive().await;
     assert!(!outcome.owes_turn);
     assert!(outcome.parked);
-    o.expect_wakeup("c1");
+    o.expect_wakeup(c1);
 
     let r1 = o.result("c1").await;
     let outcome = o.drive().await;
@@ -134,9 +133,9 @@ async fn single_call_parks_then_fires_on_its_result() {
 async fn crash_behind_a_persisted_block_re_drives_without_duplicating() {
     let mut o = Oracle::new().await;
     let user = o.user_text("hi").await;
-    o.call("c1").await;
+    let c1 = o.call("c1").await;
     o.drive().await;
-    o.expect_wakeup("c1");
+    o.expect_wakeup(c1);
 
     // The result lands out of band; the cursor is still behind it — exactly the
     // crash-window shape.
@@ -549,7 +548,8 @@ async fn approval_request_tail_rests() {
         .store
         .insert_approval_request_block(o.ctx.conversation_id, call)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the first request writes");
 
     let outcome = o.drive().await;
     assert!(
@@ -582,8 +582,11 @@ async fn empty_ledger_rests() {
 async fn model_owed_tail_behind_a_dangling_call_waits_for_the_drain() {
     let mut o = Oracle::new().await;
     o.user_text("go").await;
-    o.call("c1").await;
-    o.result("other").await; // model-owed tail, but for an unrelated call
+    let c1 = o.call("c1").await;
+    // A model-owed tail for an unrelated call: its own resolved pair, past
+    // the park.
+    o.call("other").await;
+    o.result("other").await;
 
     let outcome = o.drive().await;
     assert!(
@@ -591,7 +594,7 @@ async fn model_owed_tail_behind_a_dangling_call_waits_for_the_drain() {
         "the tail is model-owed but the cursor never reached it"
     );
     assert!(outcome.parked);
-    o.expect_wakeup("c1");
+    o.expect_wakeup(c1);
 
     let r1 = o.result("c1").await;
     let outcome = o.drive().await;
@@ -608,7 +611,7 @@ async fn mid_ledger_model_owed_block_behind_later_dangling_call_does_not_fire() 
     o.user_text("go").await;
     o.call("c1").await;
     let r1 = o.result("c1").await;
-    o.call("c2").await;
+    let c2 = o.call("c2").await;
 
     let outcome = o.drive().await;
     assert!(!outcome.owes_turn);
@@ -617,7 +620,7 @@ async fn mid_ledger_model_owed_block_behind_later_dangling_call_does_not_fire() 
         outcome.cursor, r1,
         "cursor confirmed the resolved pair, parked on the second call"
     );
-    o.expect_wakeup("c2");
+    o.expect_wakeup(c2);
     o.expect_silence();
 }
 
@@ -627,9 +630,9 @@ async fn mid_ledger_model_owed_block_behind_later_dangling_call_does_not_fire() 
 async fn driven_source() -> (Oracle, i64) {
     let mut o = Oracle::new().await;
     o.user_text("first").await;
-    o.call("c1").await;
+    let c1 = o.call("c1").await;
     o.drive().await;
-    o.expect_wakeup("c1");
+    o.expect_wakeup(c1);
     o.result("c1").await;
     o.drive().await;
     o.assistant_text("answer").await;
@@ -799,11 +802,11 @@ async fn new_thread_fork_confirms_nothing_and_derives_its_own_ledger() {
 async fn fork_cursor_never_passes_what_the_source_confirmed() {
     let mut o = Oracle::new().await;
     let user = o.user_text("run it").await;
-    o.call("h-dangle").await;
+    let dangle = o.call("h-dangle").await;
     let outcome = o.drive().await;
     assert!(outcome.parked, "the source parks on the dangling call");
     assert_eq!(outcome.cursor, user);
-    o.expect_wakeup("h-dangle");
+    o.expect_wakeup(dangle);
 
     // The interrupt caps the frontier; the user appends and forks. The source
     // is latched in practice and is never driven again.
@@ -847,7 +850,7 @@ async fn fork_cursor_never_passes_what_the_source_confirmed() {
         !outcome.owes_turn,
         "no turn while the inherited call dangles"
     );
-    fork.expect_wakeup("h-dangle");
+    fork.expect_wakeup(dangle);
 
     // A result lands in the fork — it proceeds to the settled tail.
     let healed = fork.result("h-dangle").await;

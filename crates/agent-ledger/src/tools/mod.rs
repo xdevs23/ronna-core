@@ -53,7 +53,8 @@
 //! they are that product's capabilities rather than the runtime's. The registry
 //! they register into is here; they are not.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 use crate::agency::{AgencyCtx, GateDecision};
 use crate::providers::BoxFuture;
@@ -75,11 +76,18 @@ pub enum ToolOutcome {
     /// call just as firmly as a result does — the model reads it and re-plans.
     Error(String),
     /// The body handed the work to a backing system that will resolve the call
-    /// itself, later, by appending the result block.
+    /// itself, later, through the conditional resolution writes
+    /// ([`Store::complete_tool_call_block`] /
+    /// [`Store::fail_tool_call_block`](crate::store::Store::fail_tool_call_block)).
+    /// The backing system must keep the call's BLOCK id
+    /// ([`ToolContext::block_id`]) — that id keys the write, because a model's
+    /// `tool_call_id` can repeat and the block id is the call's one identity.
     ///
     /// The runner appends nothing and does NOT clear its in-flight mark: the
     /// call stays claimed until the resolution lands in the ledger, so a wakeup
     /// arriving in between does not start the work a second time.
+    ///
+    /// [`Store::complete_tool_call_block`]: crate::store::Store::complete_tool_call_block
     Pending,
 }
 
@@ -93,9 +101,12 @@ pub enum ToolOutcome {
 pub struct ToolContext<'a, E> {
     /// The store handle, the event bus, and the conversation being driven.
     pub agency: &'a AgencyCtx<E>,
-    /// The provider's id for this call — what a result block is keyed on.
+    /// The provider's id for this call — echoed onto the result so the model
+    /// can pair it, never the resolution key: the model may reuse it.
     pub tool_call_id: &'a str,
-    /// The ledger row the call block is.
+    /// The ledger row the call block is — the call's one identity, and the id
+    /// a [`Pending`](ToolOutcome::Pending) body's backing system must keep to
+    /// resolve the call.
     pub block_id: i64,
 }
 
@@ -125,6 +136,12 @@ pub trait ToolHandler<E>: Send + Sync {
     /// Read once, at insert, and stamped onto the call block, so the block
     /// answers who owes its next move from its own data on replay — never from
     /// a tool-name match against a registry that may since have changed.
+    ///
+    /// **Interactive supersedes [`gated`](Self::gated).** The human IS the
+    /// admission for an interactive call — they answer it outright, so it
+    /// never reaches the runner and its gate would never run. A handler
+    /// declaring both is refused at registration in debug builds rather than
+    /// silently shipping a gate that nothing consults.
     fn interactive(&self) -> bool {
         false
     }
@@ -180,8 +197,14 @@ pub trait ToolHandler<E>: Send + Sync {
 /// [`definition().name`](ToolHandler::definition) so that resolution asks the
 /// same question the ledger answers: a stored call names a string, and this is
 /// what that string means.
+///
+/// Held in a `BTreeMap` so every iteration order below is the names' sorted
+/// order — deterministic across insertion orders, restarts and replicas. The
+/// model-facing schema is built from these iterations, and a hash-ordered list
+/// would reorder the prompt on every process start, invalidating prompt caches
+/// and letting two replicas disagree about one prompt.
 pub struct ToolRegistry<E> {
-    handlers: HashMap<String, Box<dyn ToolHandler<E>>>,
+    handlers: BTreeMap<String, Box<dyn ToolHandler<E>>>,
 }
 
 impl<E> ToolRegistry<E> {
@@ -190,13 +213,41 @@ impl<E> ToolRegistry<E> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            handlers: HashMap::new(),
+            handlers: BTreeMap::new(),
         }
     }
 
     /// Register one handler under the name calls will record.
+    ///
+    /// # Panics
+    ///
+    /// If a handler already answers to `name`. This is the only table of tool
+    /// names in the runtime, and a silent overwrite would leave calls already
+    /// recorded under the name meaning a different tool than the one that
+    /// recorded them — a duplicate registration fails loudly instead, naming
+    /// the colliding tool.
+    ///
+    /// In debug builds, also if the handler declares both
+    /// [`gated`](ToolHandler::gated) and [`interactive`](ToolHandler::interactive):
+    /// interactive supersedes gated — see [`ToolHandler::interactive`] — so the
+    /// gate would never run, and nothing else would ever warn the author.
     pub fn register(&mut self, name: impl Into<String>, handler: impl ToolHandler<E> + 'static) {
-        self.handlers.insert(name.into(), Box::new(handler));
+        let name = name.into();
+        debug_assert!(
+            !(handler.gated() && handler.interactive()),
+            "tool '{name}' declares both gated() and interactive(): interactive supersedes \
+             gated — the human answers an interactive call outright, so its gate never runs"
+        );
+        match self.handlers.entry(name) {
+            Entry::Occupied(entry) => panic!(
+                "tool '{}' is already registered: a second handler under one name is refused, \
+                 never a silent overwrite",
+                entry.key()
+            ),
+            Entry::Vacant(entry) => {
+                entry.insert(Box::new(handler));
+            }
+        }
     }
 
     /// Resolve a recorded name, or `None` when nothing answers to it.
@@ -205,19 +256,21 @@ impl<E> ToolRegistry<E> {
         self.handlers.get(name).map(AsRef::as_ref)
     }
 
-    /// The canonical names, for a consumer building an alias map or a schema
-    /// list of its own.
+    /// The canonical names in sorted order, for a consumer building an alias
+    /// map or a schema list of its own.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.handlers.keys().map(String::as_str)
     }
 
-    /// Every registered handler, for a consumer starting the loops they ask for
-    /// through [`ToolHandler::spawn_reactor`].
+    /// Every registered handler in name order, for a consumer starting the
+    /// loops they ask for through [`ToolHandler::spawn_reactor`].
     pub fn handlers(&self) -> impl Iterator<Item = &dyn ToolHandler<E>> {
         self.handlers.values().map(AsRef::as_ref)
     }
 
-    /// The model-facing definitions of everything registered.
+    /// The model-facing definitions of everything registered, in name order —
+    /// identical no matter what order registration happened in, so the schema
+    /// list never reorders between processes.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.handlers.values().map(|h| h.definition()).collect()

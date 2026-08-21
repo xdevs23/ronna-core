@@ -32,12 +32,45 @@ use super::{ToolContext, ToolHandler, ToolOutcome, ToolRegistry};
 /// guard and nothing more — a wakeup can re-arrive before a result row commits,
 /// and a handler that returned [`Pending`](ToolOutcome::Pending) stays claimed
 /// until its backing system writes the resolution. Correctness never rests on
-/// it: the ledger check above it is what makes a second execution impossible to
-/// record, and the body is deliberately at-least-once across a crash, where a
-/// second result is the recovery.
+/// it: the conditional resolution writes are what make a second outcome
+/// impossible to record, and the body is deliberately at-least-once across a
+/// crash — the ledger holds exactly one resolution either way.
 pub struct ToolRunner<E> {
     registry: Arc<ToolRegistry<E>>,
-    in_flight: Mutex<HashSet<(i64, String)>>,
+    in_flight: Mutex<HashSet<(i64, i64)>>,
+}
+
+/// A held claim, released when dropped. Every exit path releases it — the
+/// early stand-downs, the recorded outcomes, and a PANICKING tool body alike —
+/// so no path can leak the claim for the life of the process and park the call
+/// against every later wakeup. A [`Pending`](ToolOutcome::Pending) body calls
+/// [`keep`](Self::keep), the one deliberate exception: the call stays claimed
+/// until its backing system resolves it in the ledger.
+///
+/// Keyed on the call BLOCK id, like everything else about a call's identity:
+/// a model's `tool_call_id` can repeat, and two calls sharing one provider id
+/// must claim independently.
+struct Claim<'r, E> {
+    runner: &'r ToolRunner<E>,
+    conversation_id: i64,
+    call_block_id: i64,
+    held: bool,
+}
+
+impl<E> Claim<'_, E> {
+    /// Keep the claim past this pass: the backing system owns the resolution.
+    fn keep(mut self) {
+        self.held = false;
+    }
+}
+
+impl<E> Drop for Claim<'_, E> {
+    fn drop(&mut self) {
+        if self.held {
+            self.runner
+                .release(self.conversation_id, self.call_block_id);
+        }
+    }
 }
 
 impl<E> ToolRunner<E> {
@@ -57,12 +90,12 @@ impl<E> ToolRunner<E> {
         &self.registry
     }
 
-    /// Claim a call for this process, or report that it is already claimed.
+    /// Claim a call for this process, or `None` when it is already claimed.
     ///
-    /// The guard is released before anything is awaited: holding a
+    /// The lock is released before anything is awaited: holding a
     /// synchronous lock across an await point parks every other conversation's
     /// runner behind whichever tool body happens to be slowest.
-    fn claim(&self, conversation_id: i64, tool_call_id: &str) -> bool {
+    fn claim(&self, conversation_id: i64, call_block_id: i64) -> Option<Claim<'_, E>> {
         let mut in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| {
             // A panicking tool body must not disable the guard for the rest of
             // the process. The set carries no invariant a panic could break —
@@ -70,16 +103,23 @@ impl<E> ToolRunner<E> {
             self.in_flight.clear_poison();
             poisoned.into_inner()
         });
-        in_flight.insert((conversation_id, tool_call_id.to_string()))
+        in_flight
+            .insert((conversation_id, call_block_id))
+            .then(|| Claim {
+                runner: self,
+                conversation_id,
+                call_block_id,
+                held: true,
+            })
     }
 
     /// Release a claim once the call is resolved in the ledger.
-    fn release(&self, conversation_id: i64, tool_call_id: &str) {
+    fn release(&self, conversation_id: i64, call_block_id: i64) {
         let mut in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| {
             self.in_flight.clear_poison();
             poisoned.into_inner()
         });
-        in_flight.remove(&(conversation_id, tool_call_id.to_string()));
+        in_flight.remove(&(conversation_id, call_block_id));
     }
 }
 
@@ -157,19 +197,20 @@ impl<E: RuntimeEvent> ToolRunner<E> {
     /// and the two would disagree about what is still owed. The parked call
     /// re-emits on the next unlatched tick, which is the same recovery that
     /// covers a wakeup lost to a lagging subscriber.
-    pub async fn run_wakeup(&self, ctx: &AgencyCtx<E>, latched: bool, tool_call_id: &str) {
+    pub async fn run_wakeup(&self, ctx: &AgencyCtx<E>, latched: bool, call_block_id: i64) {
         if latched {
             return;
         }
-        self.execute_ready_call(ctx, tool_call_id).await;
+        self.execute_ready_call(ctx, call_block_id).await;
     }
 
     /// One pass of admission, from a fresh read of the ledger.
     ///
     /// The order is the design, not an implementation detail:
     ///
-    /// 1. **Find the call.** Absent — a stale wakeup for another ledger — is a
-    ///    silent return.
+    /// 1. **Find the call**, by its BLOCK id — a model's `tool_call_id` can
+    ///    repeat, the block id cannot, so a wakeup names exactly one call.
+    ///    Absent — a stale wakeup for another ledger — is a silent return.
     /// 2. **Already resolved?** Return. This is what makes a duplicate wakeup
     ///    free, and it comes FIRST so no later step can re-run a completed
     ///    body.
@@ -180,7 +221,7 @@ impl<E: RuntimeEvent> ToolRunner<E> {
     /// 5. **Read the recorded standing** and, only where nothing is recorded
     ///    yet, ask the tool's own gate — which records its answer before
     ///    anything acts on it.
-    async fn execute_ready_call(&self, ctx: &AgencyCtx<E>, tool_call_id: &str) {
+    async fn execute_ready_call(&self, ctx: &AgencyCtx<E>, call_block_id: i64) {
         let ledger = match ctx.store.list_blocks(ctx.conversation_id).await {
             Ok(ledger) => ledger,
             Err(error) => {
@@ -195,8 +236,9 @@ impl<E: RuntimeEvent> ToolRunner<E> {
 
         let Some(call) = ledger
             .iter()
+            .filter(|block| block.id == call_block_id)
             .find_map(|block| match BlockKind::from_block(block) {
-                BlockKind::ToolCall(call) if call.tool_call_id == tool_call_id => Some(call),
+                BlockKind::ToolCall(call) => Some(call),
                 _ => None,
             })
         else {
@@ -208,7 +250,23 @@ impl<E: RuntimeEvent> ToolRunner<E> {
 
         let Some(handler) = self.registry.get(&call.name) else {
             warn!(name = call.name, "tool runner: no handler registered");
-            let unknown = format!("unknown tool: {}", call.name);
+            // The refusal carries the fix: the names that WOULD resolve, in
+            // the registry's sorted order. If visibility tiers ever land, a
+            // HIDDEN tool must produce this exact unknown-tool wording — any
+            // difference between the two answers discloses the hidden tool's
+            // existence — and the listing must then be built from the EXPOSED
+            // set, not the whole registry, or the list itself names every
+            // hidden tool.
+            let known: Vec<&str> = self.registry.names().collect();
+            let unknown = if known.is_empty() {
+                format!("unknown tool: {} (no tools are registered)", call.name)
+            } else {
+                format!(
+                    "unknown tool: {}. The registered tools are: {}",
+                    call.name,
+                    known.join(", ")
+                )
+            };
             self.resolve_with_error(ctx, &call.tool_call_id, unknown, call.id)
                 .await;
             return;
@@ -249,19 +307,31 @@ impl<E: RuntimeEvent> ToolRunner<E> {
                 }
                 GateDecision::Defer => {
                     // Insert-first holds by construction: the call is already in
-                    // the ledger, so the request records its real id. A
-                    // re-received wakeup short-circuits above as Undecided, so
-                    // this appends exactly one request per call.
-                    if let Err(error) = ctx
+                    // the ledger, so the request records its real id. The write
+                    // is conditional on no request covering the call yet, so
+                    // two wakeups whose reads overlapped still append exactly
+                    // one request — the loser's `None` is a stale pass, stood
+                    // down without a retry.
+                    match ctx
                         .store
                         .insert_approval_request_block(ctx.conversation_id, call.id)
                         .await
                     {
-                        warn!(
-                            conversation_id = ctx.conversation_id,
-                            %error,
-                            "tool runner: parking the call for clearance failed"
-                        );
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            tracing::debug!(
+                                conversation_id = ctx.conversation_id,
+                                tool_call_id = call.tool_call_id,
+                                "tool runner: a request already covers this call, standing down"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                conversation_id = ctx.conversation_id,
+                                %error,
+                                "tool runner: parking the call for clearance failed"
+                            );
+                        }
                     }
                     false
                 }
@@ -270,15 +340,44 @@ impl<E: RuntimeEvent> ToolRunner<E> {
     }
 
     /// The body half, identical for every admitted call: claim it against a
-    /// duplicate wakeup, run it, and record whatever it produced.
+    /// duplicate wakeup, re-read under the claim, run it, and record whatever
+    /// it produced.
     async fn run_body(&self, ctx: &AgencyCtx<E>, handler: &dyn ToolHandler<E>, call: &ToolCall) {
-        if !self.claim(ctx.conversation_id, &call.tool_call_id) {
+        let Some(claim) = self.claim(ctx.conversation_id, call.id) else {
             tracing::debug!(
                 conversation_id = ctx.conversation_id,
                 tool_call_id = call.tool_call_id,
                 "tool runner: already in flight, skipping"
             );
             return;
+        };
+
+        // The admission snapshot and this claim are separated by awaits, so
+        // the snapshot can be stale: a sibling wakeup may have run the body,
+        // recorded the result and released between this pass's read and its
+        // claim. Re-read UNDER the claim — nothing else in this process can
+        // start the body while it is held — and stand down if the call
+        // resolved in the meantime. This is what keeps overlapping wakeups at
+        // one execution; the conditional writes below are the ledger's own
+        // backstop for whatever this process cannot see.
+        match ctx.store.list_blocks(ctx.conversation_id).await {
+            Ok(ledger) if call.resolved_in(&ledger) => {
+                tracing::debug!(
+                    conversation_id = ctx.conversation_id,
+                    tool_call_id = call.tool_call_id,
+                    "tool runner: resolved between snapshot and claim, standing down"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    conversation_id = ctx.conversation_id,
+                    %error,
+                    "tool runner: re-reading the ledger under the claim failed"
+                );
+                return;
+            }
         }
 
         info!(
@@ -298,7 +397,7 @@ impl<E: RuntimeEvent> ToolRunner<E> {
             .await;
         match outcome {
             ToolOutcome::Done(result) => {
-                if let Err(error) = ctx
+                match ctx
                     .store
                     .complete_tool_call_block(
                         ctx.conversation_id,
@@ -308,27 +407,41 @@ impl<E: RuntimeEvent> ToolRunner<E> {
                     )
                     .await
                 {
-                    warn!(
-                        conversation_id = ctx.conversation_id,
-                        %error,
-                        "tool runner: recording the result failed"
-                    );
+                    Ok(Some(_)) => {}
+                    // A lost conditional write is a stale pass: the ledger
+                    // already carries the call's outcome. Stand down.
+                    Ok(None) => {
+                        tracing::debug!(
+                            conversation_id = ctx.conversation_id,
+                            tool_call_id = call.tool_call_id,
+                            "tool runner: result already recorded, standing down"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            conversation_id = ctx.conversation_id,
+                            %error,
+                            "tool runner: recording the result failed"
+                        );
+                    }
                 }
-                self.release(ctx.conversation_id, &call.tool_call_id);
             }
             ToolOutcome::Error(error) => {
                 self.resolve_with_error(ctx, &call.tool_call_id, error, call.id)
                     .await;
-                self.release(ctx.conversation_id, &call.tool_call_id);
             }
             // The backing system resolves it; the claim stays until it does.
-            ToolOutcome::Pending => {}
+            ToolOutcome::Pending => claim.keep(),
         }
+        // Every other path releases here, as `claim` drops — including a
+        // panicking body, whose unwind drops it the same way.
     }
 
     /// Resolve a call with a tool error. Every refusal the runner records goes
     /// through here, so a refusal is always a block the model re-plans against
-    /// and never an exception that leaves the call dangling.
+    /// and never an exception that leaves the call dangling. A lost conditional
+    /// write is a stale pass — the call already carries an outcome — and is
+    /// stood down, never retried.
     async fn resolve_with_error(
         &self,
         ctx: &AgencyCtx<E>,
@@ -336,7 +449,7 @@ impl<E: RuntimeEvent> ToolRunner<E> {
         error: String,
         call_block_id: i64,
     ) {
-        if let Err(failure) = ctx
+        match ctx
             .store
             .fail_tool_call_block(
                 ctx.conversation_id,
@@ -346,11 +459,21 @@ impl<E: RuntimeEvent> ToolRunner<E> {
             )
             .await
         {
-            warn!(
-                conversation_id = ctx.conversation_id,
-                error = %failure,
-                "tool runner: recording the error failed"
-            );
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::debug!(
+                    conversation_id = ctx.conversation_id,
+                    tool_call_id,
+                    "tool runner: an outcome is already recorded, standing down"
+                );
+            }
+            Err(failure) => {
+                warn!(
+                    conversation_id = ctx.conversation_id,
+                    error = %failure,
+                    "tool runner: recording the error failed"
+                );
+            }
         }
     }
 }

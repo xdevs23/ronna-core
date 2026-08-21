@@ -14,7 +14,7 @@
 //! consent is durable ledger state, and a question answered from live data
 //! somewhere else would be a second answer.
 
-use crate::agency::{ApprovalRequest, denial_error_text};
+use crate::agency::ApprovalRequest;
 use crate::block::Block;
 use crate::store::{Store, StoreError};
 use crate::types::ApprovalChoice;
@@ -66,10 +66,14 @@ pub(crate) fn approval_state(ledger: &[Block], call_block_id: i64) -> ApprovalSt
 /// On a denial the originating call is resolved with its tool error in the SAME
 /// transaction. That atomicity is not tidiness: a crash between the two writes
 /// would leave a call denied but unresolved, parked forever behind a verdict
-/// nobody can act on. The error text is built in one place so the model always
-/// learns WHO denied — a system reason means the world changed under the
-/// request, a user reason means a person typed it — and never has to infer that
-/// from a flag.
+/// nobody can act on. The error's sentence is built inside that write, by the
+/// one constructor ([`denial_error_text`](crate::types::denial_error_text)),
+/// so the model always learns WHO denied — a system reason means the world
+/// changed under the request, a user reason means a person typed it — and no
+/// caller anywhere can record a divergent sentence.
+///
+/// A denial of a call that is ALREADY resolved is refused with a conflict
+/// error and records nothing: the recorded outcome stays the call's only one.
 ///
 /// A grant of standing permission may accompany an approval but never a denial;
 /// that pairing belongs to the consumer's own endpoint, which calls this.
@@ -77,7 +81,8 @@ pub(crate) fn approval_state(ledger: &[Block], call_block_id: i64) -> ApprovalSt
 /// # Errors
 ///
 /// If the request does not belong to this conversation, if it is already
-/// decided, or if the write fails.
+/// decided, if a denial's covered call is already resolved, or if the write
+/// fails.
 pub async fn submit_approval(
     store: &Store,
     conversation_id: i64,
@@ -86,8 +91,6 @@ pub async fn submit_approval(
     system_reason: Option<String>,
     user_reason: Option<String>,
 ) -> Result<i64, StoreError> {
-    let denial_error = matches!(decision, ApprovalChoice::Denied)
-        .then(|| denial_error_text(system_reason.as_deref(), user_reason.as_deref()));
     store
         .insert_approval_decision_block(
             conversation_id,
@@ -95,7 +98,6 @@ pub async fn submit_approval(
             decision,
             system_reason,
             user_reason,
-            denial_error,
         )
         .await
 }
