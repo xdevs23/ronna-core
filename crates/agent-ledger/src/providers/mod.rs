@@ -74,7 +74,7 @@ pub mod types;
 #[cfg(feature = "anthropic")]
 pub mod anthropic;
 #[cfg(feature = "_chat_stream")]
-mod chat;
+pub(crate) mod chat;
 #[cfg(feature = "kimi")]
 pub mod kimi;
 #[cfg(feature = "mistral")]

@@ -27,7 +27,8 @@ use crate::block::{Block, Role};
 use crate::bus::RuntimeEvent;
 use crate::event::{AsCoreEvent, CoreEvent};
 use crate::providers::types::{
-    ModelSelector, ProviderRequest, ProviderResponse, ProviderRx, ProviderTx, StreamEvent,
+    FinalContentBlock, ModelSelector, ProviderRequest, ProviderResponse, ProviderRx, ProviderTx,
+    StreamEvent,
 };
 use crate::reactive;
 use crate::reactivity::ReadSignal;
@@ -350,8 +351,17 @@ pub(crate) async fn fulfillment_loop<E: RuntimeEvent + AsCoreEvent>(
                         "fulfillment retry"
                     );
                 }
-                if request_title_stream(&store, conv_id, &tx).await {
-                    streaming.store(true, Ordering::Relaxed);
+                // The flag is set BEFORE the dispatch and rolled back on a
+                // failed one. The ingestion reader in the OTHER task clears it
+                // when the stream settles, so a set placed after the dispatch
+                // races that clear: a fast failure could clear first, the late
+                // set would then read true forever, and no title would ever be
+                // derived again for the life of the process. (The conversation
+                // actor's streaming flag is set after its dispatch and is safe
+                // only because one task owns both writes.)
+                streaming.store(true, Ordering::Relaxed);
+                if !request_title_stream(&store, conv_id, &tx).await {
+                    streaming.store(false, Ordering::Relaxed);
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -444,6 +454,30 @@ pub(crate) async fn run_fulfillment_ingestion<E: RuntimeEvent>(
             ProviderResponse::Event(StreamEvent::TextDelta { text }) => {
                 title.push_str(&text);
             }
+            // The two final-content shapes are content too: a provider that
+            // reports its text through `TextFinal` or the integrity
+            // restatement instead of deltas would otherwise derive an empty
+            // title, recorded as a failure and retried forever. A final
+            // restates the WHOLE turn, so it REPLACES the accumulated
+            // partial instead of appending to it.
+            ProviderResponse::Event(StreamEvent::TextFinal { text }) => {
+                title = text;
+            }
+            ProviderResponse::Event(StreamEvent::ContentFinal { blocks }) => {
+                let restated: String = blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        FinalContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !restated.is_empty() {
+                    title = restated;
+                }
+            }
+            // A reconnect regenerates the turn from its start: a kept partial
+            // would have the replayed title concatenated onto it.
+            ProviderResponse::Restart => title.clear(),
             ProviderResponse::Done => {
                 let trimmed = title.trim().trim_matches('"').trim();
 
@@ -465,17 +499,38 @@ pub(crate) async fn run_fulfillment_ingestion<E: RuntimeEvent>(
                         .ok()
                         .and_then(|b| b.first().map(|block| block.id));
 
-                    let _ = store
+                    // The success recording and the TitleUpdated emit are
+                    // conditional on the write: a failed persist announced as
+                    // a success would broadcast a title the store does not
+                    // have, and — unrecorded — would retry unthrottled every
+                    // tick. A failed persist is a failed attempt.
+                    match store
                         .insert_metadata(conv_id, "title_response", source_block_id, Some(trimmed))
-                        .await;
-
-                    bus.emit(CoreEvent::TitleUpdated {
-                        conversation_id: conv_id,
-                        title: trimmed.to_owned(),
-                    });
-
-                    tracing::info!(conversation_id = conv_id, title = trimmed, "title derived");
-                    throttle.record_success();
+                        .await
+                    {
+                        Ok(_) => {
+                            bus.emit(CoreEvent::TitleUpdated {
+                                conversation_id: conv_id,
+                                title: trimmed.to_owned(),
+                            });
+                            tracing::info!(
+                                conversation_id = conv_id,
+                                title = trimmed,
+                                "title derived"
+                            );
+                            throttle.record_success();
+                        }
+                        Err(e) => {
+                            let (failures, delay) = throttle.record_failure();
+                            tracing::error!(
+                                conversation_id = conv_id,
+                                error = %e,
+                                consecutive_failures = failures,
+                                backoff_ms = log_millis(delay),
+                                "title_response persist failed — backing off"
+                            );
+                        }
+                    }
                 }
 
                 title.clear();
@@ -496,7 +551,8 @@ pub(crate) async fn run_fulfillment_ingestion<E: RuntimeEvent>(
                 title.clear();
                 streaming.store(false, Ordering::Relaxed);
             }
-            _ => {}
+            // The remaining stream events carry no title text.
+            ProviderResponse::Event(_) => {}
         }
     }
 }
@@ -928,6 +984,82 @@ mod tests {
         );
     }
 
+    /// The in-flight flag rolls back on a failed dispatch, so a later wakeup
+    /// still proceeds. Without the rollback the flag would read true forever —
+    /// no stream is in flight to ever clear it — and no title would be derived
+    /// again for the life of the process.
+    #[tokio::test]
+    async fn failed_dispatch_rolls_the_in_flight_flag_back() {
+        let mut rig = FulfillmentRig::new(false).await;
+        let request = title_request(&rig.o).await;
+
+        // No prose in the ledger yet: the dispatch fails AFTER the flag was
+        // set, which is exactly the rollback's moment.
+        rig.send_wakeup(request);
+        assert_eq!(
+            rig.stream_requests(Duration::from_millis(150)).await,
+            0,
+            "there was nothing to stream over"
+        );
+
+        // Prose arrives; the SAME loop must still dispatch.
+        rig.o.user_text("hello").await;
+        rig.send_wakeup(request);
+        assert_eq!(
+            rig.stream_requests(Duration::from_millis(500)).await,
+            1,
+            "the rolled-back flag lets the next wakeup through"
+        );
+    }
+
+    /// A failed `title_response` persist is a FAILED attempt: nothing is
+    /// announced (a `TitleUpdated` for a title the store does not have), no
+    /// success clears the streak — the failure is recorded and backed off.
+    #[tokio::test]
+    async fn failed_title_persist_announces_nothing_and_backs_off() {
+        let mut o = Oracle::new().await;
+        o.ctx
+            .store
+            .run(|conn| {
+                conn.execute(
+                    "CREATE TRIGGER injected_metadata_failure BEFORE INSERT ON metadata \
+                     BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+                    [],
+                )
+                .map(|_| ())
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+
+        let (throttle, streaming) = run_reader(
+            &o,
+            vec![
+                ProviderResponse::Event(StreamEvent::TextDelta {
+                    text: "A Title".into(),
+                }),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(recorded_title(&o).await, None, "the store has no title");
+        assert!(
+            throttle.suppressed(),
+            "the failed persist opened the backoff window, not the success path"
+        );
+        assert!(
+            !streaming.load(Ordering::Relaxed),
+            "the in-flight flag is released for the retry"
+        );
+        while let Ok(event) = o.rx.try_recv() {
+            assert!(
+                !matches!(event, CoreEvent::TitleUpdated { .. }),
+                "no title is announced that the store cannot show"
+            );
+        }
+    }
+
     /// The failure signal reaches the throttle from the REAL ingestion
     /// reader: a provider error opens the window and releases the in-flight
     /// flag.
@@ -960,6 +1092,115 @@ mod tests {
             !streaming.load(Ordering::Relaxed),
             "the in-flight flag is released for the retry"
         );
+    }
+
+    /// Spawn the real fulfillment ingestion reader over a bare channel and
+    /// wait for it to drain everything sent.
+    async fn run_reader(
+        o: &Oracle,
+        responses: Vec<ProviderResponse>,
+    ) -> (Arc<FulfillmentThrottle>, Arc<AtomicBool>) {
+        let ctx = runtime_ctx(o);
+        let throttle = Arc::new(FulfillmentThrottle::new());
+        let streaming = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let reader = tokio::spawn(run_fulfillment_ingestion(
+            o.ctx.conversation_id,
+            ctx,
+            rx,
+            Arc::clone(&streaming),
+            Arc::clone(&throttle),
+        ));
+        for response in responses {
+            tx.send(response).unwrap();
+        }
+        drop(tx);
+        reader.await.unwrap();
+        (throttle, streaming)
+    }
+
+    async fn recorded_title(o: &Oracle) -> Option<String> {
+        o.ctx
+            .store
+            .list_metadata_blocks(o.ctx.conversation_id)
+            .await
+            .unwrap()
+            .iter()
+            .find(|b| b.block_type == "title_response")
+            .and_then(|b| b.fields["content"].as_str().map(str::to_string))
+    }
+
+    /// A reconnect's `Restart` clears the accumulated partial: the
+    /// regenerated stream replays the title from its start, so a kept partial
+    /// would have the whole replay concatenated onto it.
+    #[tokio::test]
+    async fn restart_clears_the_partial_title_before_the_replay() {
+        let o = Oracle::new().await;
+        let (throttle, _streaming) = run_reader(
+            &o,
+            vec![
+                ProviderResponse::Event(StreamEvent::TextDelta {
+                    text: "A Par".into(),
+                }),
+                ProviderResponse::Restart,
+                ProviderResponse::Event(StreamEvent::TextDelta {
+                    text: "A Replayed Title".into(),
+                }),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            recorded_title(&o).await.as_deref(),
+            Some("A Replayed Title"),
+            "the replay stands alone — no partial concatenated in front"
+        );
+        assert!(
+            !throttle.suppressed(),
+            "a clean derivation opens no backoff"
+        );
+    }
+
+    /// A provider that reports its text through the final-content shapes
+    /// instead of deltas still derives a title: `TextFinal` and the text
+    /// blocks of `ContentFinal` are content, each replacing whatever partial
+    /// accumulated — without them the derivation reads empty and is recorded
+    /// as a failure, retried forever.
+    #[tokio::test]
+    async fn final_content_shapes_derive_the_title() {
+        let o = Oracle::new().await;
+        run_reader(
+            &o,
+            vec![
+                ProviderResponse::Event(StreamEvent::TextFinal {
+                    text: "A Final Title".into(),
+                }),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+        assert_eq!(recorded_title(&o).await.as_deref(), Some("A Final Title"));
+
+        let o = Oracle::new().await;
+        let (throttle, streaming) = run_reader(
+            &o,
+            vec![
+                ProviderResponse::Event(StreamEvent::ContentFinal {
+                    blocks: vec![crate::providers::types::FinalContentBlock::Text {
+                        text: "A Restated Title".into(),
+                    }],
+                }),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+        assert_eq!(
+            recorded_title(&o).await.as_deref(),
+            Some("A Restated Title")
+        );
+        assert!(!throttle.suppressed(), "no failure was recorded");
+        assert!(!streaming.load(Ordering::Relaxed), "the stream settled");
     }
 
     /// The title request carries PROSE only: user/assistant text through the

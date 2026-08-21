@@ -79,11 +79,21 @@ pub enum CoreEvent {
 
     // ─── Streaming plane (ephemeral, not persisted) ───────────────────
     /// Ephemeral status update for a consumer's interface.
-    /// An empty label signals "content is flowing" (clear the label).
+    ///
+    /// `label` is a stable machine key, never display copy — the runtime is a
+    /// library and ships no prose a consumer could not translate, restyle or
+    /// suppress. The vocabulary a consumer maps to its own copy:
+    ///
+    /// - `sending` — a request is on its way to the provider; `subtitle`
+    ///   carries the provider's own status line when it gave one.
+    /// - `waiting_for_response` — the stream is open, no content yet.
+    /// - `running_tools` — the turn stopped for tool use and the calls are
+    ///   executing.
+    /// - `""` (empty) — content is flowing: clear the label.
     StreamStatus {
         /// The conversation.
         conversation_id: i64,
-        /// Short status label, empty to clear.
+        /// Stable machine key from the vocabulary above, empty to clear.
         label: String,
         /// Optional second line.
         subtitle: Option<String>,
@@ -96,19 +106,42 @@ pub enum CoreEvent {
         usage: Option<StreamUsage>,
         /// Why the provider stopped, when it said.
         stop_reason: Option<StopReason>,
+        /// The provider binding that produced this signal. The conversation
+        /// actor assigns a fresh generation at every bind and the ingestion
+        /// reader stamps it on the lifecycle signals it emits, so a torn-down
+        /// reader's late signal can be told apart from the live binding's.
+        /// `None` when the signal is not scoped to any binding; it then
+        /// applies unconditionally.
+        generation: Option<u64>,
     },
-    /// A turn's stream failed.
+    /// A turn's stream failed, or ended abnormally.
+    ///
+    /// Two vocabularies share the field. A turn the RUNTIME ends abnormally
+    /// carries a stable machine key the consumer maps to its own copy —
+    /// `max_tokens` (the context window is exhausted) or `content_filter`
+    /// (the provider's filter halted the response), mirroring
+    /// [`StopReason`]. A provider or transport failure carries the error text
+    /// as the provider rendered it.
     StreamError {
         /// The conversation.
         conversation_id: i64,
-        /// The failure, already rendered for display.
+        /// A machine key for a runtime-ended turn, or the provider's own
+        /// rendering of its failure.
         error: String,
+        /// The provider binding that produced this signal — the same contract
+        /// as on [`StreamDone`](Self::StreamDone). `None` for a failure that
+        /// is not scoped to any binding (the actor's own append and bind
+        /// failures); it then applies unconditionally.
+        generation: Option<u64>,
     },
     /// The provider stream has fully closed. Distinct from `StreamDone`
     /// (which fires per-turn) — this fires once when the stream exits.
     StreamClosed {
         /// The conversation.
         conversation_id: i64,
+        /// The provider binding that produced this signal — the same contract
+        /// as on [`StreamDone`](Self::StreamDone).
+        generation: Option<u64>,
     },
 
     // ─── Data plane (stored state → consumer re-fetch) ───────────────────

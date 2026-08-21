@@ -322,7 +322,14 @@ fn parse_usage(value: &Value) -> Option<Usage> {
 }
 
 /// Drain the calls in flight as complete lifecycles, each one's arguments its
-/// own, in the order the wire numbered them.
+/// own, in the order the wire numbered them, closed by the SINGLE terminal
+/// `ToolUseEnd` that covers all of them.
+///
+/// The close rides on the calls themselves, never on the stop reason: a call
+/// buffered here is complete by the time the turn finishes, and an endpoint
+/// that finishes with `stop` while carrying complete calls — an aggregator
+/// shape — still owes its reader the terminal close, or every buffered call is
+/// an orphaned lifecycle that never executes.
 fn drain_tool_calls(state: &mut SseState) -> Vec<StreamEvent> {
     let mut calls: Vec<ToolCallInFlight> = state.tool_calls.drain(..).collect();
     calls.sort_by_key(|call| call.index);
@@ -339,12 +346,15 @@ fn drain_tool_calls(state: &mut SseState) -> Vec<StreamEvent> {
             });
         }
     }
+    if !events.is_empty() {
+        events.push(StreamEvent::ToolUseEnd);
+    }
     events
 }
 
 /// Release the deferred end of turn with the given counts, preserving the
-/// terminal order: the end, then the assembled tool calls, then the SINGLE tool
-/// close that covers all of them.
+/// terminal order: the end, then the assembled tool calls with their single
+/// terminal close.
 ///
 /// Inert while no finish reason has been captured, so a stray usage chunk
 /// cannot conjure an end of turn and a double release is impossible.
@@ -354,9 +364,6 @@ fn release_message_end(state: &mut SseState, usage: Usage) -> Vec<Result<StreamE
     };
     let mut events = vec![Ok(StreamEvent::MessageEnd { usage, stop_reason })];
     events.extend(drain_tool_calls(state).into_iter().map(Ok));
-    if stop_reason == StopReason::ToolUse {
-        events.push(Ok(StreamEvent::ToolUseEnd));
-    }
     events
 }
 
@@ -441,6 +448,33 @@ pub(crate) fn parse_sse_chunk(
     }
 
     events
+}
+
+/// Test support: the aggregator's finish-reason-`stop` tool-call turn as RAW
+/// wire chunks, decoded through the real decoder into neutral events.
+///
+/// Lives here because the isolation rule allows only a vendor module to name
+/// this wire's field names — the joined ingestion test consumes what the
+/// translator ACTUALLY emits for this shape, so a decoder that stopped
+/// releasing the buffered lifecycle (or dropped its terminal close) fails that
+/// test instead of hiding behind a hand-written fixture.
+#[cfg(test)]
+pub(crate) fn decoded_stop_finish_tool_call_turn() -> Vec<StreamEvent> {
+    let chunks = [
+        serde_json::json!({ "choices": [{ "delta": { "tool_calls": [
+            { "id": "agg-1", "function": { "name": "read_file", "arguments": "{}" } }
+        ] } }] }),
+        serde_json::json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }),
+        serde_json::json!({ "choices": [], "usage": {
+            "prompt_tokens": 1, "completion_tokens": 2
+        } }),
+    ];
+    let mut state = SseState::default();
+    chunks
+        .iter()
+        .flat_map(|chunk| parse_sse_chunk(&chunk.to_string(), &mut state))
+        .map(|event| event.expect("the chunk decodes cleanly"))
+        .collect()
 }
 
 /// Read one open response as this surface's event stream, decoded into neutral

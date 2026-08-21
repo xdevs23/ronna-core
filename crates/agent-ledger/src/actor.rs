@@ -213,6 +213,13 @@ struct ConversationActor<E> {
     blocks_ready: tokio::sync::mpsc::UnboundedReceiver<()>,
     provider_tx: Option<ProviderTx>,
     streaming: bool,
+    /// The binding identity of the CURRENT provider channel, incremented at
+    /// every bind and stamped by that binding's ingestion reader on the
+    /// stream-lifecycle signals it emits. A torn-down reader exits
+    /// asynchronously, so its parting signal can arrive when the successor
+    /// turn is already streaming — [`Self::owns_stream_signal`] is what keeps
+    /// that stale signal from clearing the streaming flag on a live turn.
+    stream_generation: u64,
 }
 
 impl<E: RuntimeEvent + AsCoreEvent> ConversationActor<E> {
@@ -272,11 +279,38 @@ impl<E: RuntimeEvent + AsCoreEvent> ConversationActor<E> {
             CoreEvent::UnlatchRequested { .. } | CoreEvent::UnlatchAll { .. } => {
                 self.handle_unlatch();
             }
+            // The stream-lifecycle signals carry binding identity, and the
+            // gate below is the one place it is enforced: a signal stamped
+            // with a generation this actor no longer owns is a torn-down
+            // reader's parting word, and acting on it would clear the
+            // streaming flag on a live successor turn — the next delivery
+            // would then dispatch a second concurrent stream.
+            CoreEvent::StreamDone { generation, .. }
+            | CoreEvent::StreamError { generation, .. }
+            | CoreEvent::StreamClosed { generation, .. }
+                if !self.owns_stream_signal(generation) =>
+            {
+                tracing::debug!(
+                    conversation_id = self.id,
+                    event = label,
+                    ?generation,
+                    current_generation = self.stream_generation,
+                    "stale stream-lifecycle signal from a torn-down reader — ignored"
+                );
+            }
             CoreEvent::StreamDone { stop_reason, .. } => self.handle_stream_done(stop_reason),
             CoreEvent::StreamError { .. } => self.handle_stream_error(),
             CoreEvent::StreamClosed { .. } => self.handle_stream_closed(),
             _ => {}
         }
+    }
+
+    /// Whether a stream-lifecycle signal speaks for the binding this actor
+    /// currently owns. An unstamped signal (`None`) is not scoped to any
+    /// binding — the actor's own failure paths emit those — and always
+    /// applies.
+    fn owns_stream_signal(&self, generation: Option<u64>) -> bool {
+        generation.is_none_or(|g| g == self.stream_generation)
     }
 
     // ── Event handlers ──────────────────────────────────────────────────
@@ -298,6 +332,7 @@ impl<E: RuntimeEvent + AsCoreEvent> ConversationActor<E> {
                 bus.emit(CoreEvent::StreamError {
                     conversation_id: self.id,
                     error: e.to_string(),
+                    generation: None,
                 });
                 return;
             }
@@ -334,6 +369,7 @@ impl<E: RuntimeEvent + AsCoreEvent> ConversationActor<E> {
                 bus.emit(CoreEvent::StreamError {
                     conversation_id: self.id,
                     error: e.to_string(),
+                    generation: None,
                 });
                 return;
             }
@@ -410,14 +446,45 @@ impl<E: RuntimeEvent + AsCoreEvent> ConversationActor<E> {
         self.write_latched.set(true);
         self.streaming = false;
 
-        if let Some(tx) = &self.provider_tx {
+        // TEARDOWN, not a second cleanup channel: cancel, then DROP the
+        // provider channel and clear the binding. The cancelled turn's reader
+        // still tracks this turn's rows — the very rows the sweep below
+        // deletes — and a reader kept alive would serve the next turn with
+        // those trackers: its deltas would append to deleted ids, nothing
+        // would error, nothing would commit, and no assistant block would
+        // land. Dropping the channel ends the provider task, the reader
+        // drains out through its mid-turn close path (the tail cleanup comes
+        // for free there), and the next turn lazily rebinds with a fresh
+        // reader and fresh trackers.
+        if let Some(tx) = self.provider_tx.take() {
             let _ = tx.send(ProviderRequest::Interrupt);
         }
 
         let store = &self.ctx.store;
-        let _ = store
+        // The interrupt keeps sweeping the turn's streaming tails itself,
+        // immediately before its status append — the IMMEDIATE ledger
+        // cleanup. The cancelled turn closes nothing by design, the torn-down
+        // reader's own cleanup runs later and touches only what it tracked —
+        // without this sweep, the half-written answer stays live-looking in
+        // the ledger until then.
+        match store.delete_streaming_blocks(self.id).await {
+            Ok(deleted) => {
+                tracing::info!(
+                    conversation_id = self.id,
+                    deleted,
+                    "interrupt discarded the turn's streaming tails"
+                );
+            }
+            Err(e) => {
+                tracing::error!(conversation_id = self.id, error = %e, "interrupt: deleting streaming tails failed");
+            }
+        }
+        if let Err(e) = store
             .insert_status_block(self.id, "interrupted".into(), None)
-            .await;
+            .await
+        {
+            tracing::error!(conversation_id = self.id, error = %e, "interrupt: status append failed");
+        }
 
         tracing::info!(conversation_id = self.id, "interrupted, latched");
     }
@@ -450,6 +517,19 @@ impl<E: RuntimeEvent + AsCoreEvent> ConversationActor<E> {
     /// model-owed tail. Lazy-bind the provider if needed, then send the
     /// stream request.
     async fn handle_blocks_ready(&mut self) {
+        // The latch is re-read at DELIVERY, not trusted from the emitting
+        // tick: the scheduler rests while latched, but an owed-turn signal
+        // already queued when an interrupt latched would otherwise fire here.
+        // The latch covers the whole engagement family, and firing a turn is
+        // that family's center — a latched delivery stands down; the owed
+        // turn re-signals on the next unlatched tick.
+        if self.read_latched.get() {
+            tracing::debug!(
+                conversation_id = self.id,
+                "handle_blocks_ready: latched — standing down"
+            );
+            return;
+        }
         if self.streaming {
             tracing::debug!(
                 conversation_id = self.id,
@@ -525,6 +605,12 @@ impl<E: RuntimeEvent + AsCoreEvent> ConversationActor<E> {
             tracing::error!(conversation_id = self.id, error = ?e, "handle_blocks_ready: provider channel closed");
             return;
         }
+        // Set AFTER the dispatch, which is safe HERE and only here because
+        // this actor task is the sole writer of `streaming`: the stream-end
+        // handlers that clear it run on this same task, so no clear can slip
+        // in between the send above and this set. The metadata fulfillment
+        // loop has the same shape across TWO tasks and must set its flag
+        // before dispatching.
         self.streaming = true;
 
         tracing::info!(conversation_id = self.id, "sent stream request to provider");
@@ -549,6 +635,7 @@ impl<E: RuntimeEvent + AsCoreEvent> ConversationActor<E> {
                 bus.emit(CoreEvent::StreamError {
                     conversation_id: self.id,
                     error: e,
+                    generation: None,
                 });
                 None
             }
@@ -593,11 +680,16 @@ impl<E: RuntimeEvent + AsCoreEvent> ConversationActor<E> {
         let (provider_tx, provider_rx) =
             module.bind(self.id, conv.model.provider_id.clone(), config);
 
+        // Each bind is a new binding identity: the reader carries it and
+        // stamps it on its stream-lifecycle signals, so this actor can tell a
+        // torn-down predecessor's late signal from this binding's.
+        self.stream_generation += 1;
         crate::ingestion::spawn_channel(
             self.id,
             self.ctx.clone(),
             provider_rx,
             self.read_latched.clone(),
+            self.stream_generation,
         );
 
         self.provider_tx = Some(provider_tx.clone());
@@ -745,10 +837,14 @@ fn spawn_tool_pipeline<E: RuntimeEvent + AsCoreEvent>(
     ctx: &RuntimeContext<E>,
     latched: &ReadSignal<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
+    // Subscribed here, before the spawn, so no wakeup can slip between the
+    // caller's world starting to move and the loop's own subscription.
+    let executor_rx = ctx.bus.subscribe();
     let mut handles = vec![tokio::spawn(run_executor(
         conv_id,
         ctx.clone(),
         latched.clone(),
+        executor_rx,
     ))];
     for handler in ctx.runner.registry().handlers() {
         if let Some(h) = handler.spawn_reactor(ctx.agency(conv_id), latched.clone()) {
@@ -758,32 +854,51 @@ fn spawn_tool_pipeline<E: RuntimeEvent + AsCoreEvent>(
     handles
 }
 
-/// The runner's wakeup loop: subscribes to the bus and feeds every
-/// [`CoreEvent::ToolCallReady`] for this conversation to the chokepoint. The
-/// latch is read at delivery and handed to the runner, which DROPS a latched
-/// wakeup rather than deferring it — the latch is a full short-circuit: the
-/// parked call re-emits on the next unlatched tick, the same recovery that
-/// covers a wakeup lost to lag; the ratchet is the retry loop.
+/// The runner's wakeup loop: consumes every [`CoreEvent::ToolCallReady`] for
+/// this conversation off the subscription the caller took BEFORE spawning, and
+/// feeds each to the chokepoint. The latch is read at delivery and handed to
+/// the runner, which DROPS a latched wakeup rather than deferring it — the
+/// latch is a full short-circuit: the parked call re-emits on the next
+/// unlatched tick, the same recovery that covers a wakeup lost to lag; the
+/// ratchet is the retry loop.
+///
+/// Each wakeup's body runs in a task of its own, never awaited inline here: a
+/// loop that awaits one body serializes every parallel sibling behind it, and
+/// parallel calls are promised parallel. The runner's claim set and its
+/// conditional resolution writes are what make concurrent bodies safe.
+///
+/// The bodies join a [`tokio::task::JoinSet`] OWNED by this loop, so aborting
+/// the executor aborts the in-flight bodies with it — the pipeline handles
+/// returned to the actor really do end the pipeline, bodies included. The set
+/// adds NO concurrency bound: every admitted wakeup still spawns immediately;
+/// settled bodies are merely reaped so the set holds only in-flight ones.
 async fn run_executor<E: RuntimeEvent + AsCoreEvent>(
     conv_id: i64,
     ctx: RuntimeContext<E>,
     latched: ReadSignal<bool>,
+    mut rx: tokio::sync::broadcast::Receiver<E>,
 ) {
     let agency = ctx.agency(conv_id);
-    let mut rx = ctx.bus.subscribe();
+    let mut bodies = tokio::task::JoinSet::new();
 
     loop {
         match rx.recv().await {
             Ok(event) => {
+                while bodies.try_join_next().is_some() {}
                 if let Some(&CoreEvent::ToolCallReady {
                     conversation_id,
                     call_block_id,
                 }) = event.as_core()
                     && conversation_id == conv_id
                 {
-                    ctx.runner
-                        .run_wakeup(&agency, latched.get(), call_block_id)
-                        .await;
+                    let runner = Arc::clone(&ctx.runner);
+                    let agency = agency.clone();
+                    let latched_at_delivery = latched.get();
+                    bodies.spawn(async move {
+                        runner
+                            .run_wakeup(&agency, latched_at_delivery, call_block_id)
+                            .await;
+                    });
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -838,6 +953,7 @@ impl<E: RuntimeEvent + AsCoreEvent> PerConversationActor<E> for ConversationActo
             blocks_ready: blocks_ready_rx,
             provider_tx: None,
             streaming: false,
+            stream_generation: 0,
         };
         tokio::spawn(async move {
             actor.run().await;
@@ -1236,6 +1352,72 @@ mod tests {
         /// Every request is counted and left open — the stream never speaks.
         /// The double-turn probe: any second request is a defect, not a retry.
         CountOnly,
+        /// The first turn streams a partial answer and then the provider task
+        /// dies, dropping the response channel with no `Done`. Every later
+        /// turn (on the rebound channel) answers with prose. The
+        /// dead-channel-recovery probe.
+        DieMidStreamOnce,
+        /// The first turn streams a partial answer and then STALLS — the
+        /// channel stays open and no `Done` ever arrives, until the binding
+        /// is torn down. Every later turn (on a fresh binding) answers with
+        /// prose. The interrupt-teardown probe.
+        StallFirstTurn,
+        /// Like `StallFirstTurn`, but with realistic wind-down timing: the
+        /// provider task takes [`SLOW_WIND_DOWN`] to exit after the
+        /// Interrupt, and the second turn's prose streams at once while its
+        /// `MessageEnd` lags by [`SLOW_TURN_END`] — so the successor turn is
+        /// still live when the torn-down reader announces its close. Turns
+        /// after the second answer immediately. The stale-signal probe.
+        SlowTeardown,
+    }
+
+    /// How long the `SlowTeardown` provider task keeps winding down after the
+    /// Interrupt before it exits and its reader sees the channel close.
+    const SLOW_WIND_DOWN: Duration = Duration::from_millis(400);
+    /// How long the `SlowTeardown` second turn stays live after its prose:
+    /// the gap between its first delta and its `MessageEnd`, long enough to
+    /// contain the torn-down reader's late close and the assertions on it.
+    const SLOW_TURN_END: Duration = Duration::from_millis(1500);
+
+    /// One `SlowTeardown` turn's answer. Bare deltas, no `TextBlockStart` —
+    /// the chat stream decoder's real shape, which is how a reader kept
+    /// across an interrupt appends the NEXT turn's deltas to a swept tail.
+    fn slow_teardown_turn(
+        turn: usize,
+        resp_tx: &tokio::sync::mpsc::UnboundedSender<ProviderResponse>,
+    ) {
+        let message_end = StreamEvent::MessageEnd {
+            usage: crate::providers::Usage::default(),
+            stop_reason: StopReason::EndTurn,
+        };
+        match turn {
+            // The stall: no `Done` ever comes — torn down by the interrupt.
+            1 => {
+                let _ = resp_tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
+                    text: "half-".into(),
+                }));
+            }
+            // The successor turn stays LIVE past the torn-down reader's late
+            // close: its `MessageEnd` arrives from a side task, so the
+            // provider task keeps serving — a spurious concurrent request
+            // must be counted, not queued behind a sleep.
+            2 => {
+                let _ = resp_tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
+                    text: "recovered".into(),
+                }));
+                let resp_tx = resp_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(SLOW_TURN_END).await;
+                    let _ = resp_tx.send(ProviderResponse::Event(message_end));
+                });
+            }
+            _ => {
+                let _ = resp_tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
+                    text: "clean".into(),
+                }));
+                let _ = resp_tx.send(ProviderResponse::Event(message_end));
+            }
+        }
     }
 
     /// A provider module that answers from a script instead of a wire. It
@@ -1300,6 +1482,13 @@ mod tests {
             tokio::spawn(async move {
                 while let Some(request) = req_rx.recv().await {
                     let ProviderRequest::Stream { blocks, tools, .. } = request else {
+                        // The Interrupt lands here. A real provider does not
+                        // vanish on it instantly — `SlowTeardown` winds down
+                        // for a beat first, so the reader's channel-close exit
+                        // runs AFTER the successor turn is already streaming.
+                        if matches!(script, Script::SlowTeardown) {
+                            tokio::time::sleep(SLOW_WIND_DOWN).await;
+                        }
                         continue;
                     };
                     // The metadata worker shares this provider and its
@@ -1317,13 +1506,66 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push(blocks.iter().map(|b| b.block_type.clone()).collect());
-                    requests.fetch_add(1, Ordering::SeqCst);
+                    let turn = requests.fetch_add(1, Ordering::SeqCst) + 1;
                     // Scripted by ledger content, not arrival order: a turn
                     // whose ledger already carries the answered call gets the
                     // closing prose, the opening turn gets the call.
                     let answered = blocks.iter().any(|b| b.block_type == "tool_result");
                     let events: Vec<StreamEvent> = match (script, answered) {
                         (Script::CountOnly, _) => continue,
+                        (Script::SlowTeardown, _) => {
+                            slow_teardown_turn(turn, &resp_tx);
+                            continue;
+                        }
+                        (Script::StallFirstTurn, _) => {
+                            // Bare deltas, no `TextBlockStart` — the chat
+                            // stream decoder's real shape: the reader
+                            // lazy-creates the tail on the first delta, which
+                            // is exactly how a reader kept across an
+                            // interrupt appends the NEXT turn's deltas to the
+                            // swept tail's deleted id.
+                            if turn == 1 {
+                                let _ =
+                                    resp_tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
+                                        text: "half-".into(),
+                                    }));
+                                // The stall: no `Done` ever comes — the task
+                                // keeps listening until its channel drops.
+                                continue;
+                            }
+                            vec![
+                                StreamEvent::TextDelta {
+                                    text: "recovered".into(),
+                                },
+                                StreamEvent::MessageEnd {
+                                    usage: crate::providers::Usage::default(),
+                                    stop_reason: StopReason::EndTurn,
+                                },
+                            ]
+                        }
+                        (Script::DieMidStreamOnce, _) => {
+                            if turn == 1 {
+                                let _ = resp_tx
+                                    .send(ProviderResponse::Event(StreamEvent::TextBlockStart));
+                                let _ =
+                                    resp_tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
+                                        text: "half-".into(),
+                                    }));
+                                // The provider task dies mid-turn: the
+                                // response channel drops with no `Done`.
+                                return;
+                            }
+                            vec![
+                                StreamEvent::TextBlockStart,
+                                StreamEvent::TextDelta {
+                                    text: "recovered".into(),
+                                },
+                                StreamEvent::MessageEnd {
+                                    usage: crate::providers::Usage::default(),
+                                    stop_reason: StopReason::EndTurn,
+                                },
+                            ]
+                        }
                         (Script::ToolCallThenText, false) => vec![
                             StreamEvent::ToolUseStart {
                                 id: "call-1".into(),
@@ -1383,7 +1625,9 @@ mod tests {
         shapes: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
     }
 
-    async fn composed_runtime(script: Script) -> (RuntimeContext<CoreEvent>, i64, ComposedProbe) {
+    /// The scripted context WITHOUT the reactor: for tests that construct or
+    /// call actor internals directly rather than routing through the bus.
+    async fn scripted_context(script: Script) -> (RuntimeContext<CoreEvent>, i64, ComposedProbe) {
         let store = Store::in_memory().unwrap();
         store
             .save_provider_instance(ProviderInstance {
@@ -1420,8 +1664,13 @@ mod tests {
             Arc::new(providers),
             Arc::new(tools),
         );
-        spawn_reactor(ctx.clone());
         (ctx, conv, ComposedProbe { requests, shapes })
+    }
+
+    async fn composed_runtime(script: Script) -> (RuntimeContext<CoreEvent>, i64, ComposedProbe) {
+        let (ctx, conv, probe) = scripted_context(script).await;
+        spawn_reactor(ctx.clone());
+        (ctx, conv, probe)
     }
 
     /// Poll the ledger until `accept` says it is the shape awaited, with a
@@ -1585,6 +1834,7 @@ mod tests {
         ctx.bus.emit(CoreEvent::StreamError {
             conversation_id: conv,
             error: "scripted failure".into(),
+            generation: None,
         });
 
         // The broadcaster reports the latch flipping on.
@@ -1614,5 +1864,728 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let after = ctx.store.list_blocks(conv).await.unwrap().len();
         assert_eq!(before, after, "a latched conversation appends nothing");
+    }
+
+    // ─── The post-review fixes, pinned ───────────────────────────────────
+
+    /// A bare actor over the scripted context, outside the reactor, so the
+    /// seams under test are called directly.
+    fn bare_actor(
+        conv: i64,
+        ctx: RuntimeContext<CoreEvent>,
+        latched: bool,
+    ) -> ConversationActor<CoreEvent> {
+        let (read_latched, write_latched) = create_signal(latched);
+        let (_mail_tx, mailbox) = tokio::sync::mpsc::unbounded_channel();
+        let (_ready_tx, blocks_ready) = tokio::sync::mpsc::unbounded_channel();
+        ConversationActor {
+            id: conv,
+            ctx,
+            mailbox,
+            write_latched,
+            read_latched,
+            blocks_ready,
+            provider_tx: None,
+            streaming: false,
+            stream_generation: 0,
+        }
+    }
+
+    /// An interrupt sweeps the turn's streaming tails itself: the cancelled
+    /// turn closes nothing and the latched reader discards every cleanup
+    /// response, so without the sweep the half-written answer stays
+    /// live-looking forever. Afterwards the recorded status caps the frontier:
+    /// even a fully unlatched tick owes no turn out of the interrupted ledger.
+    #[tokio::test]
+    async fn interrupt_sweeps_streaming_tails_and_the_status_caps_the_frontier() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        ctx.store
+            .insert_user_blocks(
+                conv,
+                vec![InputBlock::Text {
+                    content: "hi".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        ctx.store
+            .insert_streaming_block(conv, crate::block::Role::Assistant)
+            .await
+            .unwrap();
+
+        let mut actor = bare_actor(conv, ctx.clone(), false);
+        actor.handle_interrupt().await;
+
+        let blocks = ctx.store.list_blocks(conv).await.unwrap();
+        assert!(
+            blocks
+                .iter()
+                .all(|b| !b.block_type.starts_with("streaming")),
+            "no streaming row survives the interrupt"
+        );
+        assert_eq!(
+            blocks.last().map(|b| b.block_type.as_str()),
+            Some("status"),
+            "the interrupt recorded its status"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = scheduler_tick(&ctx.agency(conv), false, &tx).await.unwrap();
+        assert!(!outcome.owes_turn, "the status caps the frontier");
+        assert!(rx.try_recv().is_err(), "no turn signal past an interrupt");
+    }
+
+    /// A queued owed-turn signal delivered after an interrupt: the latch is
+    /// re-read at delivery, so the delivery stands down instead of firing by
+    /// accident — and one unlatched delivery afterwards fires the turn.
+    #[tokio::test]
+    async fn latched_owed_turn_delivery_stands_down_until_unlatched() {
+        let (ctx, conv, probe) = scripted_context(Script::CountOnly).await;
+        ctx.store
+            .insert_user_blocks(
+                conv,
+                vec![InputBlock::Text {
+                    content: "hi".into(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let mut actor = bare_actor(conv, ctx, true);
+        actor.handle_blocks_ready().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            0,
+            "a latched delivery fires nothing"
+        );
+        assert!(
+            actor.provider_tx.is_none(),
+            "a latched delivery binds nothing either"
+        );
+
+        actor.handle_unlatch();
+        actor.handle_blocks_ready().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while probe.requests.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the unlatched delivery never fired the turn"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A provider channel that dies mid-stream — closed with no `Done` — no
+    /// longer bricks the conversation: the reader closes the stream on the
+    /// provider's behalf, the actor's streaming flag clears, and the next
+    /// appended message fires the next turn on a rebound channel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dead_provider_channel_recovers_on_the_next_message() {
+        let (ctx, conv, probe) = composed_runtime(Script::DieMidStreamOnce).await;
+
+        let mut closed_rx = ctx.bus.subscribe();
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "hi".into(),
+            }],
+        });
+
+        // The dead channel's reader announces the close the provider never
+        // sent.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match closed_rx.try_recv() {
+                Ok(CoreEvent::StreamClosed {
+                    conversation_id, ..
+                }) if conversation_id == conv => {
+                    break;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the dead channel never closed the stream"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(e) => panic!("subscription failed: {e}"),
+            }
+        }
+
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "again".into(),
+            }],
+        });
+
+        let blocks = await_ledger(&ctx, conv, "the recovered turn's answer", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.block_type == "text" && b.fields["content"] == json!("recovered"))
+        })
+        .await;
+        assert!(
+            blocks
+                .iter()
+                .all(|b| !b.block_type.starts_with("streaming")),
+            "the dead turn's tail was discarded"
+        );
+        assert!(
+            probe.requests.load(Ordering::SeqCst) >= 2,
+            "the next turn fired after the channel died"
+        );
+    }
+
+    /// Two admitted sibling bodies each block until BOTH are running, with a
+    /// timeout that turns a deadlock into a recorded error — so this passes
+    /// only if the executor spawns per wakeup and the bodies genuinely
+    /// overlap. An executor that awaited a body inline would run the first
+    /// sibling to its timeout before the second ever started.
+    struct RendezvousTool {
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    impl ToolHandler<CoreEvent> for RendezvousTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "rendezvous".into(),
+                description: "blocks until its sibling is also running".into(),
+                parameters: json!({ "type": "object" }),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _input: &'a str,
+            _ctx: ToolContext<'a, CoreEvent>,
+        ) -> BoxFuture<'a, ToolOutcome> {
+            let barrier = Arc::clone(&self.barrier);
+            Box::pin(async move {
+                match tokio::time::timeout(Duration::from_secs(5), barrier.wait()).await {
+                    Ok(_) => ToolOutcome::Done("overlapped".into()),
+                    Err(_) => ToolOutcome::Error("serialized: the sibling never arrived".into()),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_bodies_genuinely_overlap() {
+        let store = Store::in_memory().unwrap();
+        let conv = store
+            .create_conversation("p".into(), "m".into(), "m".into(), String::new())
+            .await
+            .unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(
+            "rendezvous",
+            RendezvousTool {
+                barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            },
+        );
+        let ctx = RuntimeContext::new(
+            store,
+            Arc::new(EventBus::<CoreEvent>::new()),
+            Arc::new(crate::providers::ProviderRegistry::new()),
+            Arc::new(tools),
+        );
+
+        let (latched, _write_latched) = create_signal(false);
+        let executor_rx = ctx.bus.subscribe();
+        let executor = tokio::spawn(run_executor(conv, ctx.clone(), latched, executor_rx));
+
+        // Recorded latched so nothing acts at insert: the wakeups below are
+        // the only triggers, delivered through the executor under test.
+        let agency = ctx.agency(conv);
+        let first = ctx
+            .runner
+            .insert_call(
+                &agency,
+                true,
+                "sib-a".into(),
+                "rendezvous".into(),
+                "{}".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let second = ctx
+            .runner
+            .insert_call(
+                &agency,
+                true,
+                "sib-b".into(),
+                "rendezvous".into(),
+                "{}".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        ctx.bus.emit(CoreEvent::ToolCallReady {
+            conversation_id: conv,
+            call_block_id: first,
+        });
+        ctx.bus.emit(CoreEvent::ToolCallReady {
+            conversation_id: conv,
+            call_block_id: second,
+        });
+
+        let blocks = await_ledger(&ctx, conv, "both rendezvous outcomes", |blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.block_type == "tool_result" || b.block_type == "tool_error")
+                .count()
+                == 2
+        })
+        .await;
+        let outcomes: Vec<(&str, &str)> = blocks
+            .iter()
+            .filter(|b| b.block_type == "tool_result" || b.block_type == "tool_error")
+            .map(|b| {
+                (
+                    b.block_type.as_str(),
+                    b.fields
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![("tool_result", "overlapped"), ("tool_result", "overlapped")],
+            "both bodies were running at once"
+        );
+        executor.abort();
+    }
+
+    /// The verifier's probe, pinned: stream, interrupt, unlatch, append — the
+    /// next turn lands its assistant block, every run. Before the teardown
+    /// the interrupt only cancelled: the binding survived, the same reader
+    /// served the next turn with trackers naming the swept rows, its deltas
+    /// appended to deleted ids, nothing errored, nothing committed, and in
+    /// five of eight observed runs the conversation stalled. Eight runs,
+    /// deterministically green.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_turn_after_an_interrupt_lands_its_assistant_block() {
+        for run in 0..8 {
+            let (ctx, conv, _probe) = composed_runtime(Script::StallFirstTurn).await;
+
+            ctx.bus.emit(CoreEvent::BlocksAppended {
+                conversation_id: conv,
+                blocks: vec![InputBlock::Text {
+                    content: "hi".into(),
+                }],
+            });
+            await_ledger(&ctx, conv, "the stalled turn's live tail", |blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.block_type == "streaming" && b.fields["content"] == json!("half-"))
+            })
+            .await;
+
+            ctx.bus.emit(CoreEvent::InterruptRequested {
+                conversation_id: conv,
+            });
+            await_ledger(&ctx, conv, "the interrupt's sweep and status", |blocks| {
+                blocks.last().is_some_and(|b| b.block_type == "status")
+                    && blocks
+                        .iter()
+                        .all(|b| !b.block_type.starts_with("streaming"))
+            })
+            .await;
+
+            ctx.bus.emit(CoreEvent::UnlatchRequested {
+                conversation_id: conv,
+            });
+            ctx.bus.emit(CoreEvent::BlocksAppended {
+                conversation_id: conv,
+                blocks: vec![InputBlock::Text {
+                    content: "again".into(),
+                }],
+            });
+
+            let blocks = await_ledger(
+                &ctx,
+                conv,
+                "the post-interrupt turn's assistant block",
+                |blocks| {
+                    blocks.iter().any(|b| {
+                        b.block_type == "text" && b.fields["content"] == json!("recovered")
+                    })
+                },
+            )
+            .await;
+            assert!(
+                blocks
+                    .iter()
+                    .all(|b| !b.block_type.starts_with("streaming")),
+                "run {run}: no swept tail resurfaces"
+            );
+        }
+    }
+
+    /// Drain the subscription until a `StreamClosed` for this conversation
+    /// arrives — in the `SlowTeardown` scripts the only one is the torn-down
+    /// reader's parting close, emitted AFTER its exit cleanup ran.
+    async fn await_stream_closed(rx: &mut tokio::sync::broadcast::Receiver<CoreEvent>, conv: i64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.try_recv() {
+                Ok(CoreEvent::StreamClosed {
+                    conversation_id, ..
+                }) if conversation_id == conv => return,
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the torn-down reader never announced its close"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(e) => panic!("subscription failed: {e}"),
+            }
+        }
+    }
+
+    /// The committed assistant prose, in ledger order.
+    fn assistant_answers(blocks: &[Block]) -> Vec<String> {
+        blocks
+            .iter()
+            .filter(|b| b.block_type == "text" && b.role == Some(crate::block::Role::Assistant))
+            .map(|b| b.fields["content"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The verifier's `SlowTeardown` repro, pinned: the torn-down reader exits
+    /// ASYNCHRONOUSLY, and with a realistic provider wind-down its parting
+    /// `StreamClosed` lands while the retyped successor turn is already
+    /// streaming. Before lifecycle signals carried binding identity, that
+    /// late close cleared the streaming flag on the live turn, and the next
+    /// delivery dispatched a SECOND concurrent stream — three requests where
+    /// two belong, the two billed turns' prose merged into one assistant
+    /// block. With the generation stamp the actor ignores the stale signal:
+    /// exactly two requests at the danger point, and every answered turn
+    /// lands its own, distinct assistant block.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_torn_down_readers_late_close_never_doubles_a_turn() {
+        for run in 0..4 {
+            let (ctx, conv, probe) = composed_runtime(Script::SlowTeardown).await;
+            let mut closed_rx = ctx.bus.subscribe();
+
+            // Turn one, live and stalled.
+            ctx.bus.emit(CoreEvent::BlocksAppended {
+                conversation_id: conv,
+                blocks: vec![InputBlock::Text {
+                    content: "hi".into(),
+                }],
+            });
+            await_ledger(&ctx, conv, "the stalled turn's live tail", |blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.block_type == "streaming" && b.fields["content"] == json!("half-"))
+            })
+            .await;
+
+            // Interrupt — the provider winds down slowly — and retype
+            // immediately: the successor turn streams on a fresh binding.
+            ctx.bus.emit(CoreEvent::InterruptRequested {
+                conversation_id: conv,
+            });
+            await_ledger(&ctx, conv, "the interrupt's status", |blocks| {
+                blocks.last().is_some_and(|b| b.block_type == "status")
+            })
+            .await;
+            ctx.bus.emit(CoreEvent::UnlatchRequested {
+                conversation_id: conv,
+            });
+            ctx.bus.emit(CoreEvent::BlocksAppended {
+                conversation_id: conv,
+                blocks: vec![InputBlock::Text {
+                    content: "again".into(),
+                }],
+            });
+            await_ledger(&ctx, conv, "the successor turn's live tail", |blocks| {
+                blocks.iter().any(|b| {
+                    b.block_type == "streaming" && b.fields["content"] == json!("recovered")
+                })
+            })
+            .await;
+
+            // The torn-down reader's late close lands mid-successor-turn.
+            await_stream_closed(&mut closed_rx, conv).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            // Retype during the live turn: in the stale-signal world the
+            // cleared flag let this delivery dispatch the concurrent third
+            // stream.
+            ctx.bus.emit(CoreEvent::BlocksAppended {
+                conversation_id: conv,
+                blocks: vec![InputBlock::Text {
+                    content: "third".into(),
+                }],
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                probe.requests.load(Ordering::SeqCst),
+                2,
+                "run {run}: exactly two requests — a delivery during the live \
+                 successor turn stands down"
+            );
+
+            // The live turn completes untouched by the stale close...
+            await_ledger(&ctx, conv, "the successor turn's answer", |blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.block_type == "text" && b.fields["content"] == json!("recovered"))
+            })
+            .await;
+
+            // ...and the next asked-for turn lands as its own block.
+            ctx.bus.emit(CoreEvent::BlocksAppended {
+                conversation_id: conv,
+                blocks: vec![InputBlock::Text {
+                    content: "fourth".into(),
+                }],
+            });
+            let blocks = await_ledger(&ctx, conv, "the third turn's answer", |blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.block_type == "text" && b.fields["content"] == json!("clean"))
+            })
+            .await;
+
+            assert_eq!(
+                assistant_answers(&blocks),
+                vec!["recovered".to_string(), "clean".to_string()],
+                "run {run}: two distinct assistant blocks, neither merged"
+            );
+            assert_eq!(
+                probe.requests.load(Ordering::SeqCst),
+                3,
+                "run {run}: the third turn was the only later request"
+            );
+        }
+    }
+
+    /// The exit-path discard's scoping, pinned: it deletes exactly the rows
+    /// the DYING reader tracked, never the conversation-wide sweep — the old
+    /// reader exits while the successor turn is streaming, and a wide sweep
+    /// running that late would eat the successor's live tail. The tail
+    /// survives the torn-down reader's cleanup, and the successor's turn
+    /// completes out of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_torn_down_readers_exit_discard_spares_the_successors_live_tail() {
+        let (ctx, conv, _probe) = composed_runtime(Script::SlowTeardown).await;
+        let mut closed_rx = ctx.bus.subscribe();
+
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "hi".into(),
+            }],
+        });
+        await_ledger(&ctx, conv, "the stalled turn's live tail", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.block_type == "streaming" && b.fields["content"] == json!("half-"))
+        })
+        .await;
+
+        ctx.bus.emit(CoreEvent::InterruptRequested {
+            conversation_id: conv,
+        });
+        await_ledger(&ctx, conv, "the interrupt's status", |blocks| {
+            blocks.last().is_some_and(|b| b.block_type == "status")
+        })
+        .await;
+        ctx.bus.emit(CoreEvent::UnlatchRequested {
+            conversation_id: conv,
+        });
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "again".into(),
+            }],
+        });
+        await_ledger(&ctx, conv, "the successor turn's live tail", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.block_type == "streaming" && b.fields["content"] == json!("recovered"))
+        })
+        .await;
+
+        // The old reader is gone — its exit discard has already run by the
+        // time its close reaches the bus.
+        await_stream_closed(&mut closed_rx, conv).await;
+        let blocks = ctx.store.list_blocks(conv).await.unwrap();
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b.block_type == "streaming" && b.fields["content"] == json!("recovered")),
+            "the successor's live tail survives the torn-down reader's cleanup"
+        );
+
+        // And the surviving tail is what the turn commits from.
+        let blocks = await_ledger(&ctx, conv, "the successor turn's answer", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.block_type == "text" && b.fields["content"] == json!("recovered"))
+        })
+        .await;
+        assert!(
+            blocks
+                .iter()
+                .all(|b| !b.block_type.starts_with("streaming")),
+            "the completed turn replaced its tail"
+        );
+    }
+
+    /// The pre-spawn subscription, pinned deterministically: on the
+    /// current-thread test runtime NOTHING yields between
+    /// `spawn_tool_pipeline` returning and the emit below, so the wakeup is
+    /// only ever seen if the subscription predates the spawn — a subscription
+    /// taken inside the spawned task misses it every time.
+    #[tokio::test]
+    async fn a_wakeup_emitted_right_after_the_pipeline_spawn_reaches_the_executor() {
+        let store = Store::in_memory().unwrap();
+        let conv = store
+            .create_conversation("p".into(), "m".into(), "m".into(), String::new())
+            .await
+            .unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register("echo", EchoTool);
+        let ctx = RuntimeContext::new(
+            store,
+            Arc::new(EventBus::<CoreEvent>::new()),
+            Arc::new(crate::providers::ProviderRegistry::new()),
+            Arc::new(tools),
+        );
+
+        // Recorded latched so the insert itself drives nothing: the emit
+        // below is the one wakeup, and only the pre-spawn subscription can
+        // catch it.
+        let agency = ctx.agency(conv);
+        let call = ctx
+            .runner
+            .insert_call(
+                &agency,
+                true,
+                "pre".into(),
+                "echo".into(),
+                "{}".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (latched, _write_latched) = create_signal(false);
+        let _handles = spawn_tool_pipeline(conv, &ctx, &latched);
+        ctx.bus.emit(CoreEvent::ToolCallReady {
+            conversation_id: conv,
+            call_block_id: call,
+        });
+
+        let blocks = await_ledger(&ctx, conv, "the executed result", |blocks| {
+            blocks.iter().any(|b| b.block_type == "tool_result")
+        })
+        .await;
+        let result = blocks
+            .iter()
+            .find(|b| b.block_type == "tool_result")
+            .unwrap();
+        assert_eq!(result.fields["content"], json!("echoed"));
+    }
+
+    /// A body that reports when it starts and — through a drop guard — when
+    /// it is torn down; on its own it never finishes.
+    struct HangingTool {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        torn_down: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ToolHandler<CoreEvent> for HangingTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "hang".into(),
+                description: "runs until torn down".into(),
+                parameters: json!({ "type": "object" }),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _input: &'a str,
+            _ctx: ToolContext<'a, CoreEvent>,
+        ) -> BoxFuture<'a, ToolOutcome> {
+            let started = self.started.clone();
+            let torn_down = Arc::clone(&self.torn_down);
+            Box::pin(async move {
+                struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for SetOnDrop {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _guard = SetOnDrop(torn_down);
+                let _ = started.send(());
+                std::future::pending::<()>().await;
+                unreachable!("the pending future never resolves")
+            })
+        }
+    }
+
+    /// Aborting the executor aborts the in-flight bodies too: they join a set
+    /// the loop owns, so the pipeline handles the actor aborts on shutdown
+    /// really end the pipeline — bodies included. (The set adds no
+    /// concurrency bound; the overlap test above still holds.)
+    #[tokio::test]
+    async fn aborting_the_executor_aborts_in_flight_tool_bodies() {
+        let store = Store::in_memory().unwrap();
+        let conv = store
+            .create_conversation("p".into(), "m".into(), "m".into(), String::new())
+            .await
+            .unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let torn_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(
+            "hang",
+            HangingTool {
+                started: started_tx,
+                torn_down: Arc::clone(&torn_down),
+            },
+        );
+        let ctx = RuntimeContext::new(
+            store,
+            Arc::new(EventBus::<CoreEvent>::new()),
+            Arc::new(crate::providers::ProviderRegistry::new()),
+            Arc::new(tools),
+        );
+
+        let (latched, _write_latched) = create_signal(false);
+        let executor_rx = ctx.bus.subscribe();
+        let executor = tokio::spawn(run_executor(conv, ctx.clone(), latched, executor_rx));
+
+        let agency = ctx.agency(conv);
+        let call = ctx
+            .runner
+            .insert_call(&agency, true, "h1".into(), "hang".into(), "{}".into(), None)
+            .await
+            .unwrap();
+        ctx.bus.emit(CoreEvent::ToolCallReady {
+            conversation_id: conv,
+            call_block_id: call,
+        });
+        started_rx.recv().await.expect("the body started");
+
+        executor.abort();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !torn_down.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the in-flight body outlived the aborted executor"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }

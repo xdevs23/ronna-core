@@ -34,13 +34,17 @@ use super::actor::RuntimeContext;
 /// Reads [`ProviderResponse`]s, persists streaming events as blocks, and
 /// bridges status/completion signals to the bus. When latched, incoming
 /// events are silently discarded.
+/// `generation` is the binding identity the actor assigned at this bind. The
+/// reader stamps it on every stream-lifecycle signal it emits, so the actor
+/// can ignore a signal from a reader it already tore down.
 pub(crate) fn spawn_channel<E: RuntimeEvent>(
     conv_id: i64,
     ctx: RuntimeContext<E>,
     provider_rx: ProviderRx,
     latched: ReadSignal<bool>,
+    generation: u64,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_channel(conv_id, ctx, provider_rx, latched))
+    tokio::spawn(run_channel(conv_id, ctx, provider_rx, latched, generation))
 }
 
 /// One turn's mutable ingestion state, reset at every turn boundary — a
@@ -58,6 +62,26 @@ struct TurnTrackers {
     open_streaming_tool_calls: Vec<(i64, String, String)>,
 }
 
+/// What became of the open streamed text tail at a finalization point.
+///
+/// Three-valued on purpose: the guard logic in [`ChannelReader::content_final`]
+/// must tell a DELIBERATE no-persist (no tail, or an empty tail discarded by
+/// the empty-block rule) from a FAILED persist (content that may still exist
+/// and that a fallback path could still save). Collapsing both into one
+/// "nothing persisted" answer is what let an empty sibling clear the received
+/// guard and a following `TextFinal` commit the turn's text twice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TailFinalization {
+    /// The tail's prose committed as a final text block.
+    Persisted,
+    /// There was nothing to commit — no open tail, or an empty one that was
+    /// deliberately discarded. Not a failure.
+    NothingToPersist,
+    /// A commit was owed and did not happen — the fallback paths may still
+    /// save the content.
+    Failed,
+}
+
 /// The reader itself: the hook context, the runner whose insert seam
 /// finalizes tool calls, the latch, and the turn's trackers.
 struct ChannelReader<E> {
@@ -65,6 +89,16 @@ struct ChannelReader<E> {
     runner: Arc<ToolRunner<E>>,
     latched: ReadSignal<bool>,
     trackers: TurnTrackers,
+    /// A turn is open: something arrived since the last `Done`. What makes the
+    /// channel closing mid-turn distinguishable from it closing at rest, so
+    /// the exit path knows whether it still owes the actor a close.
+    mid_turn: bool,
+    /// The binding identity the actor assigned at this reader's bind, stamped
+    /// on every stream-lifecycle signal the reader emits. A torn-down reader
+    /// exits asynchronously, and its parting `StreamClosed` can land while the
+    /// successor turn is already streaming — the stamp is what lets the actor
+    /// tell that late signal from the live binding's and ignore it.
+    generation: u64,
 }
 
 async fn run_channel<E: RuntimeEvent>(
@@ -72,12 +106,15 @@ async fn run_channel<E: RuntimeEvent>(
     ctx: RuntimeContext<E>,
     mut provider_rx: ProviderRx,
     latched: ReadSignal<bool>,
+    generation: u64,
 ) {
     let mut reader = ChannelReader {
         ctx: ctx.agency(conv_id),
         runner: Arc::clone(ctx.runner()),
         latched,
         trackers: TurnTrackers::default(),
+        mid_turn: false,
+        generation,
     };
 
     while let Some(response) = provider_rx.recv().await {
@@ -91,12 +128,32 @@ async fn run_channel<E: RuntimeEvent>(
         reader.handle_response(response).await;
     }
 
+    // The channel closed. If it closed MID-TURN — a provider task that died
+    // without its terminal `Done` — the actor's streaming flag is still set
+    // and, left alone, no future turn signal would ever fire again for this
+    // conversation. Close the turn ourselves: discard whatever tails the dead
+    // stream left open, then emit the close the provider never sent.
+    if reader.mid_turn {
+        tracing::warn!(
+            conversation_id = conv_id,
+            "provider channel closed mid-turn — closing the stream for it"
+        );
+        reader.discard_tracked_tails().await;
+        reader.ctx.bus.emit(CoreEvent::StreamClosed {
+            conversation_id: conv_id,
+            generation: Some(reader.generation),
+        });
+    }
+
     tracing::info!(conversation_id = conv_id, "ingestion stopped");
 }
 
 impl<E: RuntimeEvent> ChannelReader<E> {
     async fn handle_response(&mut self, response: ProviderResponse) {
         let conv_id = self.ctx.conversation_id;
+        if !matches!(response, ProviderResponse::Done) {
+            self.mid_turn = true;
+        }
         match response {
             ProviderResponse::Event(stream_event) => self.ingest(stream_event).await,
             ProviderResponse::Restart => {
@@ -111,6 +168,7 @@ impl<E: RuntimeEvent> ChannelReader<E> {
                 self.ctx.bus.emit(CoreEvent::StreamError {
                     conversation_id: conv_id,
                     error,
+                    generation: Some(self.generation),
                 });
                 // A terminal error ends the turn without a MessageEnd, so its
                 // uncommitted streaming blocks are never finalized. Discard
@@ -123,11 +181,98 @@ impl<E: RuntimeEvent> ChannelReader<E> {
                 // from in-band failure/cancellation terminals, the first
                 // non-recoverable errors that fire after partial content.
                 self.discard_streaming_tails("provider error").await;
+                // The error IS the turn's end: the `StreamError` above settles
+                // the actor, so a channel close that follows must not read the
+                // turn as still open and emit a second stream-end signal.
+                self.mid_turn = false;
             }
             ProviderResponse::Done => {
+                // `Done` is the turn's REAL boundary: every provider emits its
+                // tool lifecycles AFTER `MessageEnd`, so only here can "nothing
+                // is still open" be checked. An open TEXT tail at `Done` is
+                // complete prose — content, not an incomplete lifecycle — and
+                // finalizes; a tool or thinking tail still open here is an
+                // unterminated lifecycle — an incomplete fact — and is
+                // discarded the way Restart discards, so no path leaves a
+                // streaming tail alive past its turn.
+                self.finalize_streamed_text_tail().await;
+                self.discard_unterminated_tails("turn done").await;
+                self.mid_turn = false;
                 self.ctx.bus.emit(CoreEvent::StreamClosed {
                     conversation_id: conv_id,
+                    generation: Some(self.generation),
                 });
+            }
+        }
+    }
+
+    /// The open tails' display names, for the boundary warnings.
+    fn name_open_tails(&self) -> Vec<String> {
+        let mut open = Vec::new();
+        if let Some(id) = self.trackers.current_streaming_block {
+            open.push(format!("streaming text block {id}"));
+        }
+        if let Some(id) = self.trackers.current_thinking_block {
+            open.push(format!("streaming thinking block {id}"));
+        }
+        for (block_id, tool_call_id, name) in &self.trackers.open_streaming_tool_calls {
+            open.push(format!(
+                "streaming tool call block {block_id} ({name}, call id {tool_call_id})"
+            ));
+        }
+        open
+    }
+
+    /// Discard whatever the turn boundary found still open, warning with the
+    /// name of each dropped tail. Silent when the turn closed cleanly.
+    async fn discard_unterminated_tails(&mut self, boundary: &'static str) {
+        let dropped = self.name_open_tails();
+        if dropped.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            conversation_id = self.ctx.conversation_id,
+            dropped = ?dropped,
+            boundary,
+            "unterminated streaming lifecycles at the turn boundary — an \
+             unterminated lifecycle is an incomplete fact, discarding"
+        );
+        self.discard_streaming_tails("unterminated at turn boundary")
+            .await;
+    }
+
+    /// The exit path's discard: exactly the rows this reader tracked, never
+    /// the conversation-wide sweep. The channel can close AFTER an interrupt
+    /// already tore the binding down and a successor reader is live for the
+    /// next turn, and a conversation-wide delete running that late would take
+    /// the successor's live tail with it. On rows the interrupt already swept,
+    /// each targeted delete is a no-op.
+    async fn discard_tracked_tails(&mut self) {
+        let dropped = self.name_open_tails();
+        if dropped.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            conversation_id = self.ctx.conversation_id,
+            dropped = ?dropped,
+            boundary = "channel closed mid-turn",
+            "unterminated streaming lifecycles at the channel's end — an \
+             unterminated lifecycle is an incomplete fact, discarding"
+        );
+        let trackers = std::mem::take(&mut self.trackers);
+        let ids = trackers
+            .current_streaming_block
+            .into_iter()
+            .chain(trackers.current_thinking_block)
+            .chain(
+                trackers
+                    .open_streaming_tool_calls
+                    .into_iter()
+                    .map(|(id, _, _)| id),
+            );
+        for block_id in ids {
+            if let Err(e) = self.ctx.store.discard_streaming_block(block_id).await {
+                tracing::error!(conversation_id = self.ctx.conversation_id, block_id, error = %e, "discard tracked tail failed");
             }
         }
     }
@@ -182,17 +327,20 @@ impl<E: RuntimeEvent> ChannelReader<E> {
     async fn ingest(&mut self, event: StreamEvent) {
         let conv_id = self.ctx.conversation_id;
         match event {
+            // Labels are the stable machine keys documented on
+            // [`CoreEvent::StreamStatus`] — a consumer maps them to its own
+            // copy; the runtime ships no prose.
             StreamEvent::ProviderStatus { label } => {
                 self.ctx.bus.emit(CoreEvent::StreamStatus {
                     conversation_id: conv_id,
-                    label: "Sending…".into(),
+                    label: "sending".into(),
                     subtitle: Some(label),
                 });
             }
             StreamEvent::Connected => {
                 self.ctx.bus.emit(CoreEvent::StreamStatus {
                     conversation_id: conv_id,
-                    label: "Waiting for response…".into(),
+                    label: "waiting_for_response".into(),
                     subtitle: None,
                 });
             }
@@ -257,11 +405,14 @@ impl<E: RuntimeEvent> ChannelReader<E> {
                 }
             },
         };
-        let _ = self
+        if let Err(e) = self
             .ctx
             .store
             .append_to_block_by_id(block_id, "block_text", text, now_iso8601())
-            .await;
+            .await
+        {
+            tracing::error!(conversation_id = conv_id, block_id, error = %e, "append text delta failed");
+        }
     }
 
     // ── Thinking blocks ──────────────────────────────────────
@@ -294,11 +445,14 @@ impl<E: RuntimeEvent> ChannelReader<E> {
         let Some(block_id) = self.ensure_streaming_thinking_block().await else {
             return;
         };
-        let _ = self
+        if let Err(e) = self
             .ctx
             .store
             .append_to_block_by_id(block_id, "block_thinking", text, now_iso8601())
-            .await;
+            .await
+        {
+            tracing::error!(conversation_id = self.ctx.conversation_id, block_id, error = %e, "append thinking delta failed");
+        }
     }
 
     async fn thinking_summary_delta(&mut self, text: String) {
@@ -309,11 +463,14 @@ impl<E: RuntimeEvent> ChannelReader<E> {
         let Some(block_id) = self.ensure_streaming_thinking_block().await else {
             return;
         };
-        let _ = self
+        if let Err(e) = self
             .ctx
             .store
             .append_to_thinking_summary(block_id, text, now_iso8601())
-            .await;
+            .await
+        {
+            tracing::error!(conversation_id = self.ctx.conversation_id, block_id, error = %e, "append thinking summary delta failed");
+        }
     }
 
     async fn thinking_end(&mut self, opaque: Option<crate::block::OpaquePayload>) {
@@ -331,7 +488,7 @@ impl<E: RuntimeEvent> ChannelReader<E> {
                 // immutability: no UPDATE to a committed block. The streaming
                 // tail is deleted in the SAME transaction: streaming blocks
                 // are ephemeral, replaced by finals.
-                let _ = self
+                match self
                     .ctx
                     .store
                     .insert_thinking_block_with_content(
@@ -342,17 +499,27 @@ impl<E: RuntimeEvent> ChannelReader<E> {
                         opaque,
                         Some(block_id),
                     )
-                    .await;
-                // This turn's thinking is now persisted from the live stream.
-                // A later `ContentFinal` — the authoritative integrity
-                // restatement some providers send — must not re-insert it;
-                // mirrors the text guard below.
-                self.trackers.thinking_finalized = true;
+                    .await
+                {
+                    // This turn's thinking is now persisted from the live
+                    // stream. A later `ContentFinal` — the authoritative
+                    // integrity restatement some providers send — must not
+                    // re-insert it; mirrors the text check below. Set only on
+                    // a SUCCESSFUL insert: a failed one has persisted nothing,
+                    // and the flag would suppress the restatement — the one
+                    // remaining path that could still save the thinking.
+                    Ok(_) => self.trackers.thinking_finalized = true,
+                    Err(e) => {
+                        tracing::error!(conversation_id = conv_id, block_id, error = %e, "finalize thinking block failed");
+                    }
+                }
             }
             _ => {
                 // An empty (or unreadable) streaming tail can never finalize —
                 // discard it instead of orphaning it.
-                let _ = self.ctx.store.discard_streaming_block(block_id).await;
+                if let Err(e) = self.ctx.store.discard_streaming_block(block_id).await {
+                    tracing::error!(conversation_id = conv_id, block_id, error = %e, "discard empty thinking tail failed");
+                }
             }
         }
     }
@@ -361,12 +528,34 @@ impl<E: RuntimeEvent> ChannelReader<E> {
 
     async fn content_final(&mut self, blocks: Vec<FinalContentBlock>) {
         let conv_id = self.ctx.conversation_id;
+        // The received flag below exists to stop `TextFinal` and `MessageEnd`
+        // from writing the turn's text a second time. It is withheld on a
+        // FAILED persist — a failed persist has written the content no first
+        // time, and the flag would silence the fallback paths that could
+        // still save it — and on a restatement that persisted NOTHING, whose
+        // content a fallback may still carry. A deliberate no-persist (an
+        // empty block beside a sibling that committed) is NEITHER: nothing
+        // was lost, so it must not clear the guard — that clearing is what
+        // let a following `TextFinal` commit the turn's text twice.
+        let mut any_failed = false;
+        let mut any_persisted = false;
         for block in blocks {
             match block {
                 FinalContentBlock::Text { text } => {
                     // The first final text replaces the turn's streaming text
-                    // tail atomically (ephemeral, replaced by finals).
-                    let _ = self
+                    // tail atomically (ephemeral, replaced by finals). An
+                    // empty final never commits ITSELF — but over a NON-empty
+                    // streamed tail the streamed prose is the turn's content,
+                    // so it finalizes from the tail instead of discarding it.
+                    if text.is_empty() {
+                        match self.finalize_streamed_text_tail().await {
+                            TailFinalization::Persisted => any_persisted = true,
+                            TailFinalization::NothingToPersist => {}
+                            TailFinalization::Failed => any_failed = true,
+                        }
+                        continue;
+                    }
+                    match self
                         .ctx
                         .store
                         .insert_final_text_block(
@@ -375,66 +564,159 @@ impl<E: RuntimeEvent> ChannelReader<E> {
                             text,
                             self.trackers.current_streaming_block.take(),
                         )
-                        .await;
+                        .await
+                    {
+                        Ok(_) => any_persisted = true,
+                        Err(e) => {
+                            any_failed = true;
+                            tracing::error!(conversation_id = conv_id, error = %e, "persist final text block failed");
+                        }
+                    }
                 }
                 FinalContentBlock::Thinking { text } => {
                     // Skip if the live `ThinkingEnd` already persisted this
                     // turn's thinking — otherwise the block is written twice
                     // (the streaming finalize and this integrity persist).
-                    // Symmetric to the `content_final_received` guard that
-                    // protects text.
-                    if !self.trackers.thinking_finalized {
-                        let _ = self
-                            .ctx
-                            .store
-                            .insert_thinking_block_with_content(
-                                conv_id,
-                                crate::block::Role::Assistant,
-                                text,
-                                None,
-                                None,
-                                self.trackers.current_thinking_block.take(),
-                            )
-                            .await;
+                    // The skip counts as persisted: the turn's thinking IS in
+                    // the ledger. Symmetric to the `content_final_received`
+                    // check that protects text.
+                    if self.trackers.thinking_finalized {
+                        any_persisted = true;
+                        continue;
+                    }
+                    match self
+                        .ctx
+                        .store
+                        .insert_thinking_block_with_content(
+                            conv_id,
+                            crate::block::Role::Assistant,
+                            text,
+                            None,
+                            None,
+                            self.trackers.current_thinking_block.take(),
+                        )
+                        .await
+                    {
+                        Ok(_) => any_persisted = true,
+                        Err(e) => {
+                            any_failed = true;
+                            tracing::error!(conversation_id = conv_id, error = %e, "persist final thinking block failed");
+                        }
                     }
                 }
                 FinalContentBlock::Reasoning { text, opaque } => {
                     // Persisted exactly like Thinking, plus the payload — same
-                    // `thinking_finalized` guard. The integrity restatement
+                    // `thinking_finalized` check. The integrity restatement
                     // carries verbatim thinking, never a summary, so no
                     // summary channel exists on this path.
-                    if !self.trackers.thinking_finalized {
-                        let _ = self
-                            .ctx
-                            .store
-                            .insert_thinking_block_with_content(
-                                conv_id,
-                                crate::block::Role::Assistant,
-                                text,
-                                None,
-                                opaque,
-                                self.trackers.current_thinking_block.take(),
-                            )
-                            .await;
+                    if self.trackers.thinking_finalized {
+                        any_persisted = true;
+                        continue;
+                    }
+                    match self
+                        .ctx
+                        .store
+                        .insert_thinking_block_with_content(
+                            conv_id,
+                            crate::block::Role::Assistant,
+                            text,
+                            None,
+                            opaque,
+                            self.trackers.current_thinking_block.take(),
+                        )
+                        .await
+                    {
+                        Ok(_) => any_persisted = true,
+                        Err(e) => {
+                            any_failed = true;
+                            tracing::error!(conversation_id = conv_id, error = %e, "persist final reasoning block failed");
+                        }
                     }
                 }
             }
         }
-        self.trackers.content_final_received = true;
+        if any_persisted && !any_failed {
+            self.trackers.content_final_received = true;
+        }
+    }
+
+    /// Commit the open streamed text tail as its final block — the atomic
+    /// replace — or discard it when it is empty: an empty final can never
+    /// commit, because a committed empty text block renders as an empty
+    /// content part, which some vendors reject with an API error on EVERY
+    /// later turn, poisoning the conversation permanently.
+    async fn finalize_streamed_text_tail(&mut self) -> TailFinalization {
+        let conv_id = self.ctx.conversation_id;
+        let Some(block_id) = self.trackers.current_streaming_block.take() else {
+            return TailFinalization::NothingToPersist;
+        };
+        match self
+            .ctx
+            .store
+            .get_block_content(block_id, "block_text")
+            .await
+        {
+            Ok(Some(content)) if !content.is_empty() => {
+                match self
+                    .ctx
+                    .store
+                    .insert_final_text_block(
+                        conv_id,
+                        crate::block::Role::Assistant,
+                        content,
+                        Some(block_id),
+                    )
+                    .await
+                {
+                    Ok(_) => TailFinalization::Persisted,
+                    Err(e) => {
+                        tracing::error!(conversation_id = conv_id, block_id, error = %e, "persist final text block failed");
+                        TailFinalization::Failed
+                    }
+                }
+            }
+            Ok(_) => {
+                // An empty tail is deliberately discarded — content-free, so
+                // nothing a fallback path could still save, even when the
+                // discard itself errors.
+                if let Err(e) = self.ctx.store.discard_streaming_block(block_id).await {
+                    tracing::error!(conversation_id = conv_id, block_id, error = %e, "discard empty text tail failed");
+                }
+                TailFinalization::NothingToPersist
+            }
+            Err(e) => {
+                // Unreadable is not empty: the tail may hold real prose a
+                // fallback restatement could still save, so this counts as a
+                // failure, never as a deliberate no-persist.
+                tracing::error!(conversation_id = conv_id, block_id, error = %e, "read streaming text for finalization failed");
+                TailFinalization::Failed
+            }
+        }
     }
 
     async fn text_final(&mut self, text: String) {
-        if !self.trackers.content_final_received {
-            let _ = self
-                .ctx
-                .store
-                .insert_final_text_block(
-                    self.ctx.conversation_id,
-                    crate::block::Role::Assistant,
-                    text,
-                    self.trackers.current_streaming_block.take(),
-                )
-                .await;
+        if self.trackers.content_final_received {
+            return;
+        }
+        if text.is_empty() {
+            // A non-empty streamed tail under an empty restatement is still
+            // the turn's content — finalize from the tail; an empty tail is
+            // discarded.
+            self.finalize_streamed_text_tail().await;
+            return;
+        }
+        if let Err(e) = self
+            .ctx
+            .store
+            .insert_final_text_block(
+                self.ctx.conversation_id,
+                crate::block::Role::Assistant,
+                text,
+                self.trackers.current_streaming_block.take(),
+            )
+            .await
+        {
+            tracing::error!(conversation_id = self.ctx.conversation_id, error = %e, "persist final text block failed");
         }
     }
 
@@ -442,26 +724,10 @@ impl<E: RuntimeEvent> ChannelReader<E> {
 
     async fn message_end(&mut self, usage: crate::providers::Usage, stop_reason: StopReason) {
         let conv_id = self.ctx.conversation_id;
-        if !self.trackers.content_final_received
-            && let Some(block_id) = self.trackers.current_streaming_block.take()
-            && let Ok(Some(content)) = self
-                .ctx
-                .store
-                .get_block_content(block_id, "block_text")
-                .await
-        {
-            // The atomic replace: the final text lands and the streaming
-            // tail dies in one transaction.
-            let _ = self
-                .ctx
-                .store
-                .insert_final_text_block(
-                    conv_id,
-                    crate::block::Role::Assistant,
-                    content,
-                    Some(block_id),
-                )
-                .await;
+        if !self.trackers.content_final_received {
+            // The atomic replace: the final text commits and the streaming
+            // tail dies in one transaction — or the empty tail is discarded.
+            self.finalize_streamed_text_tail().await;
         }
 
         self.ctx.bus.emit(CoreEvent::StreamDone {
@@ -471,42 +737,50 @@ impl<E: RuntimeEvent> ChannelReader<E> {
                 output_tokens: usage.output_tokens,
             }),
             stop_reason: Some(stop_reason),
+            generation: Some(self.generation),
         });
 
         if stop_reason == StopReason::ToolUse {
             self.ctx.bus.emit(CoreEvent::StreamStatus {
                 conversation_id: conv_id,
-                label: "Running tools…".into(),
+                label: "running_tools".into(),
                 subtitle: None,
             });
         }
 
         if stop_reason == StopReason::MaxTokens {
-            self.end_with_error("Context window limit reached").await;
+            self.end_with_error("max_tokens").await;
         }
 
         if stop_reason == StopReason::ContentFilter {
-            self.end_with_error("Response stopped by content filter")
-                .await;
+            self.end_with_error("content_filter").await;
         }
 
-        // Reset state for the next turn.
+        // Reset state for the next turn's content; the open tool lifecycles a
+        // provider emits AFTER this event live in fresh trackers, and `Done` —
+        // the turn's real boundary — sweeps whatever they leave open.
         self.trackers = TurnTrackers::default();
     }
 
     /// A stop that ends the turn abnormally: record a visible error status
-    /// block and surface the same text on the stream-error plane, so the turn
-    /// ends with an explanation, not silence.
+    /// block and surface the same key on the stream-error plane, so the turn
+    /// ends with an explanation, not silence. `error` is a stable machine key
+    /// from the vocabulary documented on [`CoreEvent::StreamError`] — the
+    /// consumer maps it to its own copy.
     async fn end_with_error(&mut self, error: &str) {
         let conv_id = self.ctx.conversation_id;
-        let _ = self
+        if let Err(e) = self
             .ctx
             .store
             .insert_status_block(conv_id, "error".into(), Some(error.into()))
-            .await;
+            .await
+        {
+            tracing::error!(conversation_id = conv_id, error = %e, status = error, "insert error status block failed");
+        }
         self.ctx.bus.emit(CoreEvent::StreamError {
             conversation_id: conv_id,
             error: error.into(),
+            generation: Some(self.generation),
         });
     }
 
@@ -546,12 +820,18 @@ impl<E: RuntimeEvent> ChannelReader<E> {
         // buffers a call's deltas contiguously after its Start; the
         // event-native shape sends one call at a time), so they belong to the
         // most-recently opened call.
-        if let Some((block_id, _, _)) = self.trackers.open_streaming_tool_calls.last() {
-            let _ = self
+        if let Some(&(block_id, _, _)) = self.trackers.open_streaming_tool_calls.last() {
+            // A dropped append is truncated tool JSON — an argument set the
+            // model never sent, executed anyway — so the failure is recorded,
+            // never swallowed.
+            if let Err(e) = self
                 .ctx
                 .store
-                .append_to_streaming_tool_call(*block_id, json, now_iso8601())
-                .await;
+                .append_to_streaming_tool_call(block_id, json, now_iso8601())
+                .await
+            {
+                tracing::error!(conversation_id = self.ctx.conversation_id, block_id, error = %e, "append tool call input delta failed");
+            }
         }
     }
 
@@ -564,23 +844,30 @@ impl<E: RuntimeEvent> ChannelReader<E> {
         for (streaming_block_id, tool_call_id, name) in
             std::mem::take(&mut self.trackers.open_streaming_tool_calls)
         {
-            let input = self
+            let input = match self
                 .ctx
                 .store
                 .get_streaming_tool_call_input(streaming_block_id)
                 .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+            {
+                Ok(input) => input.unwrap_or_default(),
+                Err(e) => {
+                    tracing::error!(conversation_id = conv_id, tool_call_id = %tool_call_id, block_id = streaming_block_id, error = %e, "read streaming tool call input failed");
+                    String::new()
+                }
+            };
 
             if input.is_empty() {
                 tracing::warn!(conversation_id = conv_id, tool_call_id = %tool_call_id, name = %name, "tool call with empty input — skipping");
                 // Nothing will ever finalize this tail — discard it.
-                let _ = self
+                if let Err(e) = self
                     .ctx
                     .store
                     .discard_streaming_block(streaming_block_id)
-                    .await;
+                    .await
+                {
+                    tracing::error!(conversation_id = conv_id, block_id = streaming_block_id, error = %e, "discard empty tool call tail failed");
+                }
                 continue;
             }
 
@@ -636,15 +923,32 @@ mod tests {
     /// Drive a sequence of stream events through a single turn's ingestion,
     /// threading the per-turn mutable state exactly as `run_channel` does.
     async fn drive(ctx: &AgencyCtx<CoreEvent>, latched: bool, events: Vec<StreamEvent>) {
+        drive_responses(
+            ctx,
+            latched,
+            events.into_iter().map(ProviderResponse::Event).collect(),
+        )
+        .await;
+    }
+
+    /// Drive whole provider responses — `Done` and `Restart` included —
+    /// through the reader, exactly as `run_channel` delivers them.
+    async fn drive_responses(
+        ctx: &AgencyCtx<CoreEvent>,
+        latched: bool,
+        responses: Vec<ProviderResponse>,
+    ) {
         let (latched, _write_latched) = create_signal(latched);
         let mut reader = ChannelReader {
             ctx: ctx.clone(),
             runner: Arc::new(ToolRunner::new(Arc::new(ToolRegistry::new()))),
             latched,
             trackers: TurnTrackers::default(),
+            mid_turn: false,
+            generation: 1,
         };
-        for event in events {
-            reader.ingest(event).await;
+        for response in responses {
+            reader.handle_response(response).await;
         }
     }
 
@@ -1470,5 +1774,535 @@ mod tests {
             1,
             "one error status block"
         );
+    }
+
+    /// The aggregator's finish-reason-`stop` tool call, end to end through
+    /// ingestion — joined at the REAL seam: the raw wire chunks go through
+    /// the shared chat-stream decoder and whatever IT emits is what feeds the
+    /// reader, so a decoder that failed to release the buffered lifecycle (or
+    /// released it without its terminal close) fails HERE, not behind a
+    /// hand-written fixture that restates the expected events. The decoder
+    /// releases the lifecycle at the finish whatever the stop reason, the
+    /// reader sees `MessageEnd` (`EndTurn`) FIRST and the tool lifecycle
+    /// after it — the call finalizes and its wakeup fires exactly as under a
+    /// `tool_calls` finish.
+    #[cfg(feature = "_chat_stream")]
+    #[tokio::test]
+    async fn stop_finish_tool_call_executes_through_ingestion() {
+        let (ctx, mut rx) = fixture().await;
+
+        // The raw chunks live with the decoder (only a vendor module may name
+        // this wire); what arrives here is whatever the REAL translator emits
+        // for them.
+        let events = crate::providers::chat::sse::decoded_stop_finish_tool_call_turn();
+        drive(&ctx, false, events).await;
+
+        assert_eq!(streaming_count(&ctx).await, 0, "the tail is replaced");
+        assert_eq!(count_type(&ctx, "tool_call").await, 1, "the call is real");
+        assert_eq!(
+            wakeups(&mut rx).len(),
+            1,
+            "the call woke the runner despite the stop finish"
+        );
+    }
+
+    /// A synthetic unterminated lifecycle — a `ToolUseStart` whose `End`
+    /// never arrives — is discarded at `Done`, the turn's real boundary, the
+    /// same way Restart discards. The ledger keeps owing the model turn: the
+    /// dropped tail neither answers the user nor parks the cursor.
+    #[tokio::test]
+    async fn unterminated_tail_is_discarded_at_done_and_the_frontier_stays_owed() {
+        let (ctx, _rx) = fixture().await;
+        ctx.store
+            .insert_user_blocks(
+                ctx.conversation_id,
+                vec![crate::types::InputBlock::Text {
+                    content: "hi".into(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        drive_responses(
+            &ctx,
+            false,
+            vec![
+                ProviderResponse::Event(StreamEvent::ToolUseStart {
+                    id: "never-ends".into(),
+                    name: "read_file".into(),
+                }),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(streaming_count(&ctx).await, 0, "the open tail is discarded");
+        assert_eq!(
+            count_type(&ctx, "tool_call").await,
+            0,
+            "an unterminated lifecycle never finalizes"
+        );
+        let outcome = crate::agency::ratchet::drive(&ctx).await.unwrap();
+        assert!(outcome.owes_turn, "the frontier stays owed after the sweep");
+    }
+
+    /// Empty final text never commits — the same rule the thinking path
+    /// applies. `MessageEnd` over a started-but-empty tail discards the tail
+    /// instead of committing an empty text block (the shape one vendor rejects
+    /// with an API error on every later turn).
+    #[tokio::test]
+    async fn empty_streamed_text_is_discarded_at_message_end() {
+        let (ctx, _rx) = fixture().await;
+        drive(
+            &ctx,
+            false,
+            vec![
+                StreamEvent::TextBlockStart,
+                StreamEvent::MessageEnd {
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                },
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            streaming_count(&ctx).await,
+            0,
+            "the empty tail is discarded"
+        );
+        assert_eq!(count_type(&ctx, "text").await, 0, "no empty text committed");
+    }
+
+    /// A reusable reader over the fixture's context, for tests that thread
+    /// state across store-failure toggles. The latch's write half rides along
+    /// so the signal stays alive for the reader's lifetime.
+    fn bare_reader(
+        ctx: &AgencyCtx<CoreEvent>,
+    ) -> (
+        ChannelReader<CoreEvent>,
+        crate::reactivity::WriteSignal<bool>,
+    ) {
+        let (latched, write_latched) = create_signal(false);
+        (
+            ChannelReader {
+                ctx: ctx.clone(),
+                runner: Arc::new(ToolRunner::new(Arc::new(ToolRegistry::new()))),
+                latched,
+                trackers: TurnTrackers::default(),
+                mid_turn: false,
+                generation: 1,
+            },
+            write_latched,
+        )
+    }
+
+    /// Inject (or lift) a transient store failure: a RAISE trigger on the
+    /// `blocks` header insert, so every block-committing write fails and its
+    /// transaction rolls back — the finalization-insert failure the guards
+    /// must survive.
+    async fn set_insert_failure(ctx: &AgencyCtx<CoreEvent>, failing: bool) {
+        let sql = if failing {
+            "CREATE TRIGGER injected_insert_failure BEFORE INSERT ON blocks \
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+        } else {
+            "DROP TRIGGER injected_insert_failure"
+        };
+        ctx.store
+            .run(move |conn| conn.execute(sql, []).map(|_| ()).map_err(Into::into))
+            .await
+            .unwrap();
+    }
+
+    /// The received guard on a FAILED `ContentFinal` persist: the flag exists
+    /// to stop the fallbacks from writing the text a second time, and a failed
+    /// persist has written it no first time — so the guard stays unset and the
+    /// `TextFinal` fallback still saves the turn's text.
+    #[tokio::test]
+    async fn failed_content_final_persist_sets_no_guard_and_the_fallback_saves_the_text() {
+        let (ctx, _rx) = fixture().await;
+        let (mut reader, _latch) = bare_reader(&ctx);
+        for event in [
+            StreamEvent::TextBlockStart,
+            StreamEvent::TextDelta {
+                text: "streamed".into(),
+            },
+        ] {
+            reader.handle_response(ProviderResponse::Event(event)).await;
+        }
+
+        set_insert_failure(&ctx, true).await;
+        reader
+            .handle_response(ProviderResponse::Event(StreamEvent::ContentFinal {
+                blocks: vec![FinalContentBlock::Text {
+                    text: "answer".into(),
+                }],
+            }))
+            .await;
+        assert!(
+            !reader.trackers.content_final_received,
+            "a failed persist must not set the received guard"
+        );
+
+        set_insert_failure(&ctx, false).await;
+        reader
+            .handle_response(ProviderResponse::Event(StreamEvent::TextFinal {
+                text: "answer".into(),
+            }))
+            .await;
+        assert_eq!(
+            count_type(&ctx, "text").await,
+            1,
+            "the fallback still persists the turn's text"
+        );
+    }
+
+    /// The `thinking_finalized` guard on a FAILED `ThinkingEnd` insert: a
+    /// failed finalize has persisted nothing, so the guard stays unset and the
+    /// `ContentFinal` restatement — the one remaining path that can still save
+    /// the thinking — still runs.
+    #[tokio::test]
+    async fn failed_thinking_finalize_sets_no_guard_and_the_restatement_saves_it() {
+        let (ctx, _rx) = fixture().await;
+        let (mut reader, _latch) = bare_reader(&ctx);
+        for event in [
+            StreamEvent::ThinkingStart,
+            StreamEvent::ThinkingDelta {
+                text: "trace".into(),
+            },
+        ] {
+            reader.handle_response(ProviderResponse::Event(event)).await;
+        }
+
+        set_insert_failure(&ctx, true).await;
+        reader
+            .handle_response(ProviderResponse::Event(StreamEvent::ThinkingEnd {
+                opaque: None,
+            }))
+            .await;
+        assert!(
+            !reader.trackers.thinking_finalized,
+            "a failed finalize must not set the guard"
+        );
+
+        set_insert_failure(&ctx, false).await;
+        reader
+            .handle_response(ProviderResponse::Event(StreamEvent::ContentFinal {
+                blocks: vec![FinalContentBlock::Thinking {
+                    text: "trace".into(),
+                }],
+            }))
+            .await;
+        assert_eq!(
+            count_type(&ctx, "thinking").await,
+            1,
+            "the restatement still saves the thinking"
+        );
+    }
+
+    /// The status plane speaks EXACTLY the documented machine keys — never
+    /// prose. The vocabulary is the contract on [`CoreEvent::StreamStatus`]:
+    /// `sending`, `waiting_for_response`, the empty clear, `running_tools`.
+    #[tokio::test]
+    async fn stream_status_labels_are_exactly_the_documented_machine_keys() {
+        let (ctx, mut rx) = fixture().await;
+        drive(
+            &ctx,
+            false,
+            vec![
+                StreamEvent::ProviderStatus {
+                    label: "provider detail".into(),
+                },
+                StreamEvent::Connected,
+                StreamEvent::TextBlockStart,
+                StreamEvent::MessageEnd {
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                },
+            ],
+        )
+        .await;
+
+        let mut statuses = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let CoreEvent::StreamStatus {
+                label, subtitle, ..
+            } = event
+            {
+                statuses.push((label, subtitle));
+            }
+        }
+        assert_eq!(
+            statuses,
+            vec![
+                ("sending".to_string(), Some("provider detail".to_string())),
+                ("waiting_for_response".to_string(), None),
+                (String::new(), None),
+                ("running_tools".to_string(), None),
+            ],
+            "exactly the documented machine keys, in stream order"
+        );
+    }
+
+    /// A turn ending at `Done` with an open TEXT tail and no `MessageEnd`:
+    /// complete prose is content, not an incomplete lifecycle — the tail
+    /// finalizes. A thinking tail at the same boundary stays discarded.
+    #[tokio::test]
+    async fn open_text_tail_at_done_finalizes_and_other_tails_stay_discarded() {
+        let (ctx, _rx) = fixture().await;
+        drive_responses(
+            &ctx,
+            false,
+            vec![
+                ProviderResponse::Event(StreamEvent::ThinkingStart),
+                ProviderResponse::Event(StreamEvent::ThinkingDelta { text: "hmm".into() }),
+                ProviderResponse::Event(StreamEvent::TextBlockStart),
+                ProviderResponse::Event(StreamEvent::TextDelta {
+                    text: "complete prose".into(),
+                }),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(streaming_count(&ctx).await, 0, "no tail survives the turn");
+        let blocks = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+        let text = blocks
+            .iter()
+            .find(|b| b.block_type == "text")
+            .expect("the open text tail finalized");
+        assert_eq!(text.fields["content"], serde_json::json!("complete prose"));
+        assert_eq!(
+            count_type(&ctx, "thinking").await,
+            0,
+            "an open thinking tail is still an incomplete fact"
+        );
+    }
+
+    /// An empty `TextFinal` over a NON-empty streamed tail finalizes from the
+    /// tail: the streamed prose is the turn's content, and the empty
+    /// restatement must not discard it.
+    #[tokio::test]
+    async fn empty_text_final_over_a_streamed_tail_finalizes_from_the_tail() {
+        let (ctx, _rx) = fixture().await;
+        drive(
+            &ctx,
+            false,
+            vec![
+                StreamEvent::TextBlockStart,
+                StreamEvent::TextDelta {
+                    text: "streamed answer".into(),
+                },
+                StreamEvent::TextFinal {
+                    text: String::new(),
+                },
+                StreamEvent::MessageEnd {
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                },
+            ],
+        )
+        .await;
+
+        assert_eq!(streaming_count(&ctx).await, 0);
+        let blocks = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+        let text = blocks
+            .iter()
+            .find(|b| b.block_type == "text")
+            .expect("the streamed text finalized");
+        assert_eq!(text.fields["content"], serde_json::json!("streamed answer"));
+    }
+
+    /// The same rule through `ContentFinal`: an empty final text block over a
+    /// non-empty streamed tail finalizes from the tail.
+    #[tokio::test]
+    async fn empty_content_final_text_over_a_streamed_tail_finalizes_from_the_tail() {
+        let (ctx, _rx) = fixture().await;
+        drive(
+            &ctx,
+            false,
+            vec![
+                StreamEvent::TextBlockStart,
+                StreamEvent::TextDelta {
+                    text: "tail text".into(),
+                },
+                StreamEvent::ContentFinal {
+                    blocks: vec![FinalContentBlock::Text {
+                        text: String::new(),
+                    }],
+                },
+                StreamEvent::MessageEnd {
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                },
+            ],
+        )
+        .await;
+
+        assert_eq!(streaming_count(&ctx).await, 0);
+        let blocks = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+        let text = blocks
+            .iter()
+            .find(|b| b.block_type == "text")
+            .expect("the streamed text finalized");
+        assert_eq!(text.fields["content"], serde_json::json!("tail text"));
+    }
+
+    /// An empty `ContentFinal` text over NO tail persists nothing — and must
+    /// not set the received guard through the `continue`, or a later
+    /// `TextFinal` carrying the real text would be silenced.
+    #[tokio::test]
+    async fn empty_content_final_text_does_not_set_the_received_guard() {
+        let (ctx, _rx) = fixture().await;
+        let (mut reader, _latch) = bare_reader(&ctx);
+        reader
+            .handle_response(ProviderResponse::Event(StreamEvent::ContentFinal {
+                blocks: vec![FinalContentBlock::Text {
+                    text: String::new(),
+                }],
+            }))
+            .await;
+        assert!(
+            !reader.trackers.content_final_received,
+            "nothing was persisted, so nothing is received"
+        );
+
+        reader
+            .handle_response(ProviderResponse::Event(StreamEvent::TextFinal {
+                text: "late text".into(),
+            }))
+            .await;
+        assert_eq!(
+            count_type(&ctx, "text").await,
+            1,
+            "the fallback still persists the turn's text"
+        );
+    }
+
+    /// The reproduced double-commit, pinned: `ContentFinal` carrying a real
+    /// text block AND an empty sibling. The real block persists; the empty
+    /// one is a DELIBERATE no-persist, not a failed one — and conflating the
+    /// two cleared the received guard, so the following `TextFinal`
+    /// restatement committed the turn's text a second time. The guard
+    /// reflects failures only: exactly one text block lands.
+    #[tokio::test]
+    async fn empty_sibling_in_content_final_does_not_reopen_the_text_fallback() {
+        let (ctx, _rx) = fixture().await;
+        drive(
+            &ctx,
+            false,
+            vec![
+                StreamEvent::ContentFinal {
+                    blocks: vec![
+                        FinalContentBlock::Text {
+                            text: "answer".into(),
+                        },
+                        FinalContentBlock::Text {
+                            text: String::new(),
+                        },
+                    ],
+                },
+                StreamEvent::TextFinal {
+                    text: "answer".into(),
+                },
+            ],
+        )
+        .await;
+
+        let blocks = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+        let texts: Vec<&serde_json::Value> = blocks
+            .iter()
+            .filter(|b| b.block_type == "text")
+            .map(|b| &b.fields["content"])
+            .collect();
+        assert_eq!(
+            texts,
+            vec![&serde_json::json!("answer")],
+            "the turn's text commits exactly once"
+        );
+    }
+
+    /// A provider error ends the turn: the channel closing AFTERWARDS is a
+    /// close at rest, not a mid-turn death — no warning, and no second
+    /// stream-end signal chasing the `StreamError` that already settled the
+    /// actor.
+    #[tokio::test]
+    async fn provider_error_then_close_emits_no_second_stream_end() {
+        let (ctx, mut rx) = fixture().await;
+        let runtime = RuntimeContext::new(
+            ctx.store.clone(),
+            Arc::clone(&ctx.bus),
+            Arc::new(crate::providers::ProviderRegistry::new()),
+            Arc::new(ToolRegistry::new()),
+        );
+        let (latched, _write_latched) = create_signal(false);
+        let (tx, provider_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = spawn_channel(ctx.conversation_id, runtime, provider_rx, latched, 1);
+
+        tx.send(ProviderResponse::Event(StreamEvent::TextBlockStart))
+            .unwrap();
+        tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
+            text: "partial".into(),
+        }))
+        .unwrap();
+        tx.send(ProviderResponse::Error("boom".into())).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        let (mut errors, mut closes) = (0, 0);
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                CoreEvent::StreamError { .. } => errors += 1,
+                CoreEvent::StreamClosed { .. } => closes += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(errors, 1, "the error surfaced exactly once");
+        assert_eq!(
+            closes, 0,
+            "the error ended the turn — the close that followed was a close at rest"
+        );
+    }
+
+    /// The two explicit final-content paths follow the same empty rule:
+    /// an empty `TextFinal` and an empty `ContentFinal` text block each
+    /// discard the streaming tail and commit nothing.
+    #[tokio::test]
+    async fn empty_final_text_variants_discard_instead_of_committing() {
+        let (ctx, _rx) = fixture().await;
+        drive(
+            &ctx,
+            false,
+            vec![
+                StreamEvent::TextBlockStart,
+                StreamEvent::TextFinal {
+                    text: String::new(),
+                },
+            ],
+        )
+        .await;
+        assert_eq!(streaming_count(&ctx).await, 0);
+        assert_eq!(count_type(&ctx, "text").await, 0);
+
+        let (ctx, _rx) = fixture().await;
+        drive(
+            &ctx,
+            false,
+            vec![
+                StreamEvent::TextBlockStart,
+                StreamEvent::ContentFinal {
+                    blocks: vec![FinalContentBlock::Text {
+                        text: String::new(),
+                    }],
+                },
+                StreamEvent::MessageEnd {
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(streaming_count(&ctx).await, 0);
+        assert_eq!(count_type(&ctx, "text").await, 0);
     }
 }

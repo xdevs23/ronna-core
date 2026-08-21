@@ -584,6 +584,44 @@ mod usage_tests {
         ));
     }
 
+    /// A complete buffered call finishing under `stop` — the aggregator shape,
+    /// where an endpoint reports tool calls but not the `tool_calls` finish
+    /// reason — is still released as a full lifecycle, terminal close included.
+    /// The close follows from the drained calls, never from the stop reason:
+    /// without it the buffered call reaches the reader as an open lifecycle
+    /// that no event ever finalizes, so it never executes.
+    #[test]
+    fn stop_finish_releases_buffered_tool_calls_with_their_close() {
+        let mut state = SseState::default();
+        parse(
+            json!({ "choices": [{ "delta": { "tool_calls": [
+                { "id": "call_1", "function": { "name": "search", "arguments": "{\"q\":1}" } }
+            ] } }] }),
+            &mut state,
+        );
+        parse(
+            json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }),
+            &mut state,
+        );
+
+        let events = parse(
+            json!({ "choices": [], "usage": { "prompt_tokens": 1, "completion_tokens": 2 } }),
+            &mut state,
+        );
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    StreamEvent::MessageEnd { stop_reason: StopReason::EndTurn, .. },
+                    StreamEvent::ToolUseStart { id, name },
+                    StreamEvent::ToolUseInputDelta { json },
+                    StreamEvent::ToolUseEnd,
+                ] if id == "call_1" && name == "search" && json == "{\"q\":1}"
+            ),
+            "the stop finish releases the complete lifecycle: {events:?}"
+        );
+    }
+
     /// Parallel calls: N buffered start-and-arguments pairs are released by a
     /// SINGLE terminal close. That cardinality is what a multi-call finalizer
     /// relies on to tell a sibling call from a duplicate.
