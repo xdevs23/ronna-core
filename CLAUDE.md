@@ -26,6 +26,11 @@ an exception:
 - **Blocks are append-only.** Only a streaming tail mutates in place; finalizing appends a
   fresh committed block in the same transaction.
 - **Derived, never stored.** If a fact can be folded from the ledger, it is not a column.
+  One recorded exception (2026-08-22): the block header's `dispatch_anchor`. Which turn a
+  block is the product of is an insert-time decision, not a foldable fact — the first
+  consumer's closure adversarially refuted the shape walk three times (an absorbed message
+  after a finalized narration, the whole post-narration tool phase, the window behind a
+  failed round's error block), so the decision is recorded at the one moment it is known.
 - **One decision, one place, recorded once.** A decision that travels both as a durable record
   and as an in-memory value is two decisions waiting to disagree.
 - **Reach and consent are separate rails.** Authority is resolved live and cannot be

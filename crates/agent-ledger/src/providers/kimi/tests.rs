@@ -19,6 +19,7 @@ fn block(id: i64, role: Role, block_type: &str, fields: &[(&str, &str)]) -> Bloc
         role: Some(role),
         block_type: block_type.into(),
         created_at: String::new(),
+        dispatch_anchor: None,
         fields: map,
     }
 }
@@ -89,6 +90,7 @@ fn date_marker_joins_the_system_message() {
         role: None,
         block_type: "date_marker".into(),
         created_at: String::new(),
+        dispatch_anchor: None,
         fields: {
             let mut m = serde_json::Map::new();
             m.insert("date".into(), Value::String("2026-07-12".into()));

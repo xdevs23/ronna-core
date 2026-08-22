@@ -267,6 +267,7 @@ mod replay {
                 role: Some(Role::Assistant),
                 block_type: "thinking".into(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields: thinking,
             },
             Block {
@@ -274,6 +275,7 @@ mod replay {
                 role: Some(Role::Assistant),
                 block_type: "text".into(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields: text,
             },
             Block {
@@ -281,6 +283,7 @@ mod replay {
                 role: Some(Role::Assistant),
                 block_type: "tool_call".into(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields: tool_call,
             },
         ]

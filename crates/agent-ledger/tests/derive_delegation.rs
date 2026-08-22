@@ -138,6 +138,7 @@ async fn the_derived_enum_returns_the_leaf_answer_for_every_hook() {
         role: None,
         block_type: "probe".into(),
         created_at: String::new(),
+        dispatch_anchor: None,
         fields: serde_json::Map::new(),
     };
     assert!(matches!(

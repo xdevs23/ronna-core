@@ -45,6 +45,12 @@
 //! open for a later stage), and a runtime registry of boxed kinds (two classes
 //! of the same thing, which this architecture exists to avoid). The ported path
 //! keeps its fidelity; the new path is a declared seam.
+//!
+//! Amended 2026-08-22: "byte-identical" pins the statements against SILENT
+//! drift, not against deliberate schema growth — the dispatch-anchor column
+//! joined the block query's header select and the reference union's
+//! self-referential arm, and both pinned literals moved in lockstep with the
+//! statements, each carrying its dated note.
 
 use std::collections::{HashMap, HashSet};
 
@@ -210,10 +216,15 @@ pub struct StoreConfig {
 const ROLE_COLUMN: &str = "role";
 
 /// Column names a descriptor may not declare: the row header's field names
-/// (`id`, `type`, `created_at` — see
-/// [`RESERVED_FIELD_NAMES`](crate::block::RESERVED_FIELD_NAMES)) and the
-/// content table's own key.
-const RESERVED_COLUMNS: &[&str] = &["id", "type", "created_at", "block_id"];
+/// ([`RESERVED_FIELD_NAMES`](crate::block::RESERVED_FIELD_NAMES), except
+/// `role` — the one header fact a content table legitimately carries, as its
+/// voice column) and the content table's own key. This literal moves in
+/// lockstep with `RESERVED_FIELD_NAMES` (2026-08-22, when `dispatch_anchor`
+/// joined both): a header name missing here is a column the open-time
+/// validation ACCEPTS and the serializer then silently drops, so the
+/// lockstep is asserted by
+/// [`tests::reserved_columns_mirror_the_header_field_names`].
+const RESERVED_COLUMNS: &[&str] = &["id", "type", "created_at", "dispatch_anchor", "block_id"];
 
 /// How many block ids one batch read binds at a time. The engine's parameter
 /// ceiling is finite (999 by default), a bound the literal core statements
@@ -1078,6 +1089,10 @@ impl Store {
             }
 
             transact(conn, |tx| {
+                // The public consumer write path never sets a dispatch
+                // anchor: the anchor is written by the framework's own paths
+                // only, so a consumer block is never a turn's product by its
+                // own claim.
                 let block_id = super::messages::insert_block(tx, conversation_id, kind)?;
 
                 let mut names: Vec<String> = vec![quoted("block_id")];
@@ -1218,11 +1233,16 @@ mod tests {
     // ─── The core kinds' statements, pinned against the literals ─────────
 
     /// The one block query, exactly as the library's own kinds use it. A
-    /// difference here means wave 2 touched the core load path, which it must
-    /// not: consumer kinds load through the overlay, never through an edited
-    /// join list.
+    /// difference here means the core load path was touched without this pin
+    /// moving in lockstep: consumer kinds load through the overlay, never
+    /// through an edited join list.
+    ///
+    /// Updated 2026-08-22 with the statement: the header select gained
+    /// `dispatch_anchor` — a header column on `blocks`, not a content join,
+    /// so the join list is untouched and every kind carries the anchor for
+    /// free.
     const PINNED_BLOCKS_QUERY: &str = "SELECT
-            b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at,
+            b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
             bq.role AS bq_role, bq.start_block_id, bq.start_pos, bq.end_block_id, bq.end_pos,
             bc.role AS bc_role, bc.language AS bc_language, bc.content AS bc_content,
@@ -1251,7 +1271,12 @@ mod tests {
      LEFT JOIN block_date_marker bdm ON bdm.block_id = b.id AND b.block_type = 'date_marker'";
 
     /// The collector's reference union for a core-only store, spelled out.
-    const PINNED_ORPHAN_PREDICATE: &str = "NOT EXISTS (SELECT 1 FROM conversation_blocks r WHERE r.block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM block_quote r WHERE r.start_block_id = blocks.id OR r.end_block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM block_approval_request r WHERE r.for_block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM block_approval_decision r WHERE r.for_block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM block_tool_result r WHERE r.source_block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM block_tool_error r WHERE r.source_block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM metadata r WHERE r.source_block_id = blocks.id)";
+    ///
+    /// Updated 2026-08-22 with the union: the self-referential
+    /// `dispatch_anchor` arm joined it — an anchored-at block is a referenced
+    /// block, which is what keeps a fork-then-delete anchor loadable instead
+    /// of dangling.
+    const PINNED_ORPHAN_PREDICATE: &str = "NOT EXISTS (SELECT 1 FROM conversation_blocks r WHERE r.block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM block_quote r WHERE r.start_block_id = blocks.id OR r.end_block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM block_approval_request r WHERE r.for_block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM block_approval_decision r WHERE r.for_block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM block_tool_result r WHERE r.source_block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM block_tool_error r WHERE r.source_block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM metadata r WHERE r.source_block_id = blocks.id)\n    AND NOT EXISTS (SELECT 1 FROM blocks r WHERE r.dispatch_anchor = blocks.id)";
 
     /// The change-hook allowlist a core-only store carried before descriptors
     /// existed, as the set it always was.
@@ -1351,6 +1376,7 @@ mod tests {
                 role: None,
                 block_type: (*kind).to_owned(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields: Map::new(),
             };
             let parsed = BlockKind::from_block(&block);
@@ -2494,6 +2520,15 @@ mod tests {
         ephemeral: false,
     }];
 
+    static ANCHOR_COLUMN: &[ContentDescriptor] = &[ContentDescriptor {
+        table: "block_note",
+        domain: "notes",
+        kinds: &["note"],
+        columns: &[Column::new("dispatch_anchor", ColumnType::Integer)],
+        reference_columns: &[],
+        ephemeral: false,
+    }];
+
     static CORE_KIND_COLLISION: &[ContentDescriptor] = &[ContentDescriptor {
         table: "block_note",
         domain: "notes",
@@ -2615,6 +2650,39 @@ mod tests {
             domain_migrations: note_migrations(),
         });
         assert!(reason.contains("does not exist in the table"), "{reason}");
+
+        // The header column this slice added is refused at open like the
+        // rest of the header set: accepted, it would load into the payload
+        // beside the header's own column and the serializer would silently
+        // drop it — data loss with no open-time rejection.
+        let (_, reason) = open_fails_with(StoreConfig {
+            descriptors: ANCHOR_COLUMN,
+            domain_migrations: note_migrations(),
+        });
+        assert!(reason.contains("collides with the row header"), "{reason}");
+    }
+
+    /// The lockstep behind [`RESERVED_COLUMNS`]: every header field name is a
+    /// refused column except `role` — the one header fact a content table
+    /// legitimately carries as its voice column — and the content table's own
+    /// key joins the set. A header name missing from the refusal set is a
+    /// column open-validation accepts and serialization then silently drops.
+    #[test]
+    fn reserved_columns_mirror_the_header_field_names() {
+        for name in crate::block::RESERVED_FIELD_NAMES {
+            if name == "role" {
+                assert!(
+                    !RESERVED_COLUMNS.contains(&name),
+                    "the voice column stays declarable"
+                );
+                continue;
+            }
+            assert!(
+                RESERVED_COLUMNS.contains(&name),
+                "header field '{name}' is missing from RESERVED_COLUMNS — the two literals move in lockstep"
+            );
+        }
+        assert!(RESERVED_COLUMNS.contains(&"block_id"));
     }
 
     #[tokio::test]

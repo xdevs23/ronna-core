@@ -79,6 +79,7 @@ struct Leaf<'a> {
 ///     role: None,
 ///     block_type: "note".into(),
 ///     created_at: String::new(),
+///     dispatch_anchor: None,
 ///     fields,
 /// };
 /// // The consumer's kind resolves through its own parse…

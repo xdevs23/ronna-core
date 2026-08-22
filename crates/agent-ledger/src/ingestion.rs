@@ -15,16 +15,18 @@
 //!   racing a mid-stream insert records the block and drives nothing.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::agency::{AgencyCtx, RuntimeKind};
 use crate::bus::RuntimeEvent;
+use crate::dispatch::TurnAnchor;
 use crate::event::CoreEvent;
 use crate::providers::types::{
     FinalContentBlock, ProviderResponse, ProviderRx, StopReason, StreamEvent,
 };
 use crate::reactivity::ReadSignal;
-use crate::store::now_iso8601;
-use crate::tools::ToolRunner;
+use crate::store::{BlockDestination, now_iso8601};
+use crate::tools::{CallOrigin, ToolRunner};
 use crate::types::StreamUsage;
 
 use super::actor::RuntimeContext;
@@ -36,16 +38,53 @@ use super::actor::RuntimeContext;
 /// events are silently discarded.
 /// `generation` is the binding identity the actor assigned at this bind. The
 /// reader stamps it on every stream-lifecycle signal it emits, so the actor
-/// can ignore a signal from a reader it already tore down.
+/// can ignore a signal from a reader it already tore down. `anchor` is the
+/// binding's per-turn dispatch seam: the actor sets it at dispatch and clears
+/// it at close, and this reader stamps its value on every block it inserts —
+/// the provider channel itself stays neutral and never carries ledger
+/// identity.
 pub(crate) fn spawn_channel<K: RuntimeKind, E: RuntimeEvent>(
     conv_id: i64,
     ctx: RuntimeContext<K, E>,
     provider_rx: ProviderRx,
     latched: ReadSignal<bool>,
     generation: u64,
+    anchor: TurnAnchor,
+    drain_deadline: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_channel(conv_id, ctx, provider_rx, latched, generation))
+    tokio::spawn(run_channel(
+        conv_id,
+        ctx,
+        provider_rx,
+        latched,
+        generation,
+        anchor,
+        drain_deadline,
+    ))
 }
+
+/// The DEFAULT drain deadline (a construction-time parameter of the reader,
+/// so tests pin the expiry without waiting production bounds — the same
+/// discipline as construction-time tool timeouts): how long the reader
+/// waits, after a turn's
+/// `MessageEnd`, for the turn's remaining events — the drained tool
+/// lifecycles and the trailing done, which real wires send within moments
+/// because they are already in flight behind the end. A provider that emits
+/// `MessageEnd` and then stalls would otherwise wedge the conversation
+/// forever, since message-end no longer settles the dispatch state: no close
+/// edge would ever fire. Generous on purpose — a slow wire is not a stall.
+///
+/// On expiry the reader abandons the turn (2026-08-22): it marks the drained
+/// turn's epoch abandoned on the seam, emits its own closed terminal, and
+/// exits. The mark is what makes the exit sound — the actor observes it at
+/// the close and retires the binding, so the next turn rebinds fresh and the
+/// stalled provider's late tail, delivered into the dropped channel, reaches
+/// nobody. Staying on the channel instead was rejected: the channel is
+/// neutral, so once a successor turn shares it the stalled turn's late tail
+/// and the successor's own events cannot be told apart — a late trailing
+/// `Done` would close the live turn mid-flight, and the late lifecycles
+/// would ingest under the live turn's anchor.
+pub(crate) const MESSAGE_END_DRAIN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// One turn's mutable ingestion state, reset at every turn boundary — a
 /// message end, a restart, a terminal error.
@@ -99,6 +138,30 @@ struct ChannelReader<K: RuntimeKind, E> {
     /// successor turn is already streaming — the stamp is what lets the actor
     /// tell that late signal from the live binding's and ignore it.
     generation: u64,
+    /// This binding's per-turn dispatch seam. The actor sets the open turn's
+    /// anchor at dispatch and clears it at close; every block this reader
+    /// inserts stamps the seam's current value. Read per insert rather than
+    /// captured per turn: the seam IS the turn state, owned by the one
+    /// dispatcher, and a copy here would be a second record of it.
+    anchor: TurnAnchor,
+    /// An abnormal stop (`max_tokens`, `content_filter`) recorded at
+    /// `MessageEnd`, surfaced as the turn's terminal when the drain finishes.
+    /// Emitting the error AT the stop closed the dispatch under a reader
+    /// still ingesting the same turn: the seam cleared mid-drain, the turn's
+    /// trailing writes stamped NULL anchors, and the released streaming flag
+    /// mid-turn was the duplicate-turn shape again. Deferred, the error keeps
+    /// its latch semantics — the actor latches when it arrives — and the
+    /// close happens where every close happens: when the reader is done with
+    /// the turn.
+    pending_error: Option<String>,
+    /// Between a turn's `MessageEnd` and its terminal: the phase the drain
+    /// deadline covers.
+    draining: bool,
+    /// The seam epoch of the turn being drained, recorded when the drain
+    /// begins. If the drain deadline expires, this is the epoch the reader
+    /// marks abandoned on the seam — the fact the actor's close reads to
+    /// retire the stalled binding.
+    drained_epoch: u64,
 }
 
 async fn run_channel<K: RuntimeKind, E: RuntimeEvent>(
@@ -107,6 +170,8 @@ async fn run_channel<K: RuntimeKind, E: RuntimeEvent>(
     mut provider_rx: ProviderRx,
     latched: ReadSignal<bool>,
     generation: u64,
+    anchor: TurnAnchor,
+    drain_deadline: Duration,
 ) {
     let mut reader = ChannelReader {
         ctx: ctx.agency(conv_id),
@@ -115,9 +180,64 @@ async fn run_channel<K: RuntimeKind, E: RuntimeEvent>(
         trackers: TurnTrackers::default(),
         mid_turn: false,
         generation,
+        anchor,
+        pending_error: None,
+        draining: false,
+        drained_epoch: 0,
     };
 
-    while let Some(response) = provider_rx.recv().await {
+    loop {
+        // Between `MessageEnd` and the turn's terminal the recv is bounded:
+        // the remaining events are already in flight on a live wire, so a
+        // silence of [`MESSAGE_END_DRAIN_DEADLINE`] here is a stalled
+        // provider, and the reader closes the turn itself instead of leaving
+        // the dispatch state open forever. Every received event re-arms the
+        // deadline.
+        let response = if reader.draining {
+            let Ok(bounded) = tokio::time::timeout(drain_deadline, provider_rx.recv()).await else {
+                tracing::warn!(
+                    conversation_id = conv_id,
+                    "no event within the drain deadline after message-end — \
+                     abandoning the turn and closing the stream for the \
+                     stalled provider"
+                );
+                // A deadline is scoped to the turn that armed it. If the
+                // seam's epoch moved on — an out-of-band close ended the
+                // drained turn and a successor already dispatched on this
+                // binding — this timer is stale: firing it would cap the
+                // successor's time to its first token at the drain deadline
+                // and abandon a healthy binding. The stale drain state
+                // resets and the reader keeps serving the successor.
+                if reader.anchor.epoch() != reader.drained_epoch {
+                    // Only the drain state resets: mid_turn belongs to
+                    // whatever the successor's stream is doing right now
+                    // and is managed by its own arms.
+                    reader.draining = false;
+                    continue;
+                }
+                reader
+                    .discard_unterminated_tails("drain deadline expired")
+                    .await;
+                // The mark goes on the seam BEFORE the terminal, so the
+                // actor's close observes it and retires the binding; then
+                // this reader exits. The provider may still wake and deliver
+                // the turn's held tail — trailing lifecycles, a late done —
+                // but it delivers into a channel nobody reads and nobody
+                // will read again: the successor turn rebinds fresh. Kept
+                // reading instead, this reader could not tell that late
+                // tail from a successor turn's own events (the channel is
+                // neutral), and the late done would close the live turn
+                // mid-flight — the second-terminal defect this fence exists
+                // for.
+                reader.anchor.mark_abandoned(reader.drained_epoch);
+                reader.emit_turn_terminal();
+                break;
+            };
+            bounded
+        } else {
+            provider_rx.recv().await
+        };
+        let Some(response) = response else { break };
         if reader.latched.get() {
             tracing::debug!(
                 conversation_id = conv_id,
@@ -139,16 +259,48 @@ async fn run_channel<K: RuntimeKind, E: RuntimeEvent>(
             "provider channel closed mid-turn — closing the stream for it"
         );
         reader.discard_tracked_tails().await;
-        reader.ctx.bus.emit(CoreEvent::StreamClosed {
-            conversation_id: conv_id,
-            generation: Some(reader.generation),
-        });
+        reader.emit_turn_terminal();
     }
 
     tracing::info!(conversation_id = conv_id, "ingestion stopped");
 }
 
 impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
+    /// Where this reader's inserts land: the conversation, anchored on the
+    /// open turn from the per-turn seam. Read per insert on purpose — the
+    /// seam IS the turn state, owned by the one dispatcher, and a copy here
+    /// would be a second record of it.
+    fn turn_destination(&self) -> BlockDestination {
+        BlockDestination::anchored(self.ctx.conversation_id, self.anchor.get())
+    }
+
+    /// The turn's terminal, on every reader-side close: the recorded abnormal
+    /// stop when one is pending — the actor latches on it, exactly as it
+    /// latches on any stream error — and the plain closed signal otherwise.
+    /// One emitter for all three reader-side ends (the trailing done, the
+    /// drain deadline, the channel dying mid-turn), so no path can close the
+    /// turn and drop the error, or surface the error and leave the turn open.
+    fn emit_turn_terminal(&mut self) {
+        let conv_id = self.ctx.conversation_id;
+        self.mid_turn = false;
+        self.draining = false;
+        match self.pending_error.take() {
+            Some(error) => {
+                self.ctx.bus.emit(CoreEvent::StreamError {
+                    conversation_id: conv_id,
+                    error,
+                    generation: Some(self.generation),
+                });
+            }
+            None => {
+                self.ctx.bus.emit(CoreEvent::StreamClosed {
+                    conversation_id: conv_id,
+                    generation: Some(self.generation),
+                });
+            }
+        }
+    }
+
     async fn handle_response(&mut self, response: ProviderResponse) {
         let conv_id = self.ctx.conversation_id;
         if !matches!(response, ProviderResponse::Done) {
@@ -160,8 +312,12 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 // Restart-clean: a recoverable mid-stream drop. Discard the
                 // turn's uncommitted streaming blocks and reset trackers so
                 // the regenerated stream writes onto a clean slate with no
-                // orphans.
+                // orphans. The regenerated stream replays the turn from its
+                // start, so the drain phase and a recorded abnormal stop are
+                // both superseded.
                 self.discard_streaming_tails("restart-clean").await;
+                self.pending_error = None;
+                self.draining = false;
             }
             ProviderResponse::Error(error) => {
                 tracing::warn!(conversation_id = conv_id, error = %error, "provider error");
@@ -183,8 +339,11 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 self.discard_streaming_tails("provider error").await;
                 // The error IS the turn's end: the `StreamError` above settles
                 // the actor, so a channel close that follows must not read the
-                // turn as still open and emit a second stream-end signal.
+                // turn as still open and emit a second stream-end signal — and
+                // a recorded abnormal stop is superseded by it.
                 self.mid_turn = false;
+                self.pending_error = None;
+                self.draining = false;
             }
             ProviderResponse::Done => {
                 // `Done` is the turn's REAL boundary: every provider emits its
@@ -197,11 +356,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 // streaming tail alive past its turn.
                 self.finalize_streamed_text_tail().await;
                 self.discard_unterminated_tails("turn done").await;
-                self.mid_turn = false;
-                self.ctx.bus.emit(CoreEvent::StreamClosed {
-                    conversation_id: conv_id,
-                    generation: Some(self.generation),
-                });
+                self.emit_turn_terminal();
             }
         }
     }
@@ -310,7 +465,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
         match self
             .ctx
             .store
-            .insert_streaming_thinking_block(conv_id, crate::block::Role::Assistant)
+            .insert_streaming_thinking_block(self.turn_destination(), crate::block::Role::Assistant)
             .await
         {
             Ok(id) => {
@@ -368,7 +523,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
         match self
             .ctx
             .store
-            .insert_streaming_block(conv_id, crate::block::Role::Assistant)
+            .insert_streaming_block(self.turn_destination(), crate::block::Role::Assistant)
             .await
         {
             Ok(block_id) => {
@@ -392,7 +547,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
             None => match self
                 .ctx
                 .store
-                .insert_streaming_block(conv_id, crate::block::Role::Assistant)
+                .insert_streaming_block(self.turn_destination(), crate::block::Role::Assistant)
                 .await
             {
                 Ok(id) => {
@@ -422,7 +577,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
         match self
             .ctx
             .store
-            .insert_streaming_thinking_block(conv_id, crate::block::Role::Assistant)
+            .insert_streaming_thinking_block(self.turn_destination(), crate::block::Role::Assistant)
             .await
         {
             Ok(block_id) => {
@@ -492,7 +647,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                     .ctx
                     .store
                     .insert_thinking_block_with_content(
-                        conv_id,
+                        self.turn_destination(),
                         crate::block::Role::Assistant,
                         content,
                         summary.filter(|s| !s.is_empty()),
@@ -559,7 +714,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                         .ctx
                         .store
                         .insert_final_text_block(
-                            conv_id,
+                            self.turn_destination(),
                             crate::block::Role::Assistant,
                             text,
                             self.trackers.current_streaming_block.take(),
@@ -588,7 +743,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                         .ctx
                         .store
                         .insert_thinking_block_with_content(
-                            conv_id,
+                            self.turn_destination(),
                             crate::block::Role::Assistant,
                             text,
                             None,
@@ -617,7 +772,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                         .ctx
                         .store
                         .insert_thinking_block_with_content(
-                            conv_id,
+                            self.turn_destination(),
                             crate::block::Role::Assistant,
                             text,
                             None,
@@ -661,7 +816,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                     .ctx
                     .store
                     .insert_final_text_block(
-                        conv_id,
+                        self.turn_destination(),
                         crate::block::Role::Assistant,
                         content,
                         Some(block_id),
@@ -709,7 +864,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
             .ctx
             .store
             .insert_final_text_block(
-                self.ctx.conversation_id,
+                self.turn_destination(),
                 crate::block::Role::Assistant,
                 text,
                 self.trackers.current_streaming_block.take(),
@@ -749,39 +904,46 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
         }
 
         if stop_reason == StopReason::MaxTokens {
-            self.end_with_error("max_tokens").await;
+            self.record_abnormal_stop("max_tokens").await;
         }
 
         if stop_reason == StopReason::ContentFilter {
-            self.end_with_error("content_filter").await;
+            self.record_abnormal_stop("content_filter").await;
         }
 
         // Reset state for the next turn's content; the open tool lifecycles a
         // provider emits AFTER this event live in fresh trackers, and `Done` —
-        // the turn's real boundary — sweeps whatever they leave open.
+        // the turn's real boundary — sweeps whatever they leave open. From
+        // here to the terminal the reader is draining, which is the phase the
+        // drain deadline bounds.
         self.trackers = TurnTrackers::default();
+        self.draining = true;
+        // Recorded now, while the drained turn is provably the seam's open
+        // turn — the actor cannot dispatch again before this turn's close.
+        self.drained_epoch = self.anchor.epoch();
     }
 
     /// A stop that ends the turn abnormally: record a visible error status
-    /// block and surface the same key on the stream-error plane, so the turn
-    /// ends with an explanation, not silence. `error` is a stable machine key
-    /// from the vocabulary documented on [`CoreEvent::StreamError`] — the
-    /// consumer maps it to its own copy.
-    async fn end_with_error(&mut self, error: &str) {
+    /// block — anchored, like every product of the turn — and hold the same
+    /// machine key for the terminal the drain's end emits, so the turn ends
+    /// with an explanation, not silence. The key is from the vocabulary
+    /// documented on [`CoreEvent::StreamError`] — the consumer maps it to its
+    /// own copy. Deferred to the terminal on purpose: the reader is still
+    /// ingesting this turn (a truncated tool lifecycle can trail the stop),
+    /// and an error signal emitted here closed the dispatch mid-drain — the
+    /// cleared seam stamped NULL anchors on the trailing writes, and the
+    /// released streaming flag was the duplicate-turn window again.
+    async fn record_abnormal_stop(&mut self, error: &str) {
         let conv_id = self.ctx.conversation_id;
         if let Err(e) = self
             .ctx
             .store
-            .insert_status_block(conv_id, "error".into(), Some(error.into()))
+            .insert_status_block(self.turn_destination(), "error".into(), Some(error.into()))
             .await
         {
             tracing::error!(conversation_id = conv_id, error = %e, status = error, "insert error status block failed");
         }
-        self.ctx.bus.emit(CoreEvent::StreamError {
-            conversation_id: conv_id,
-            error: error.into(),
-            generation: Some(self.generation),
-        });
+        self.pending_error = Some(error.into());
     }
 
     // ── Tool use blocks ──────────────────────────────────────
@@ -797,7 +959,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
             .ctx
             .store
             .insert_streaming_tool_call_block(
-                conv_id,
+                self.turn_destination(),
                 crate::block::Role::Assistant,
                 id.clone(),
                 name.clone(),
@@ -886,7 +1048,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                     tool_call_id.clone(),
                     name,
                     input,
-                    Some(streaming_block_id),
+                    CallOrigin::streamed(Some(streaming_block_id), self.anchor.get()),
                 )
                 .await
             {
@@ -949,6 +1111,10 @@ mod tests {
             trackers: TurnTrackers::default(),
             mid_turn: false,
             generation: 1,
+            anchor: TurnAnchor::new(),
+            pending_error: None,
+            draining: false,
+            drained_epoch: 0,
         };
         for response in responses {
             reader.handle_response(response).await;
@@ -1899,6 +2065,10 @@ mod tests {
                 trackers: TurnTrackers::default(),
                 mid_turn: false,
                 generation: 1,
+                anchor: TurnAnchor::new(),
+                pending_error: None,
+                draining: false,
+                drained_epoch: 0,
             },
             write_latched,
         )
@@ -2244,7 +2414,15 @@ mod tests {
         );
         let (latched, _write_latched) = create_signal(false);
         let (tx, provider_rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = spawn_channel(ctx.conversation_id, runtime, provider_rx, latched, 1);
+        let handle = spawn_channel(
+            ctx.conversation_id,
+            runtime,
+            provider_rx,
+            latched,
+            1,
+            TurnAnchor::new(),
+            MESSAGE_END_DRAIN_DEADLINE,
+        );
 
         tx.send(ProviderResponse::Event(StreamEvent::TextBlockStart))
             .unwrap();
@@ -2269,6 +2447,309 @@ mod tests {
             closes, 0,
             "the error ended the turn — the close that followed was a close at rest"
         );
+    }
+
+    /// A drain deadline is scoped to the turn that armed it (2026-08-22,
+    /// from the closing verification): here the drained turn was ended out
+    /// of band and a successor was dispatched on the same binding — the
+    /// seam's epoch moved past the reader's drained epoch — so the leftover
+    /// timer must NOT abandon the healthy binding. It resets the stale
+    /// drain state instead, and the successor's events keep ingesting with
+    /// no terminal fired by the stale timer. Real time on purpose: the
+    /// constructed 300ms deadline keeps the whole test under a second.
+    #[tokio::test]
+    async fn a_stale_drain_deadline_resets_instead_of_abandoning_the_binding() {
+        let (ctx, _rx) = fixture().await;
+        let runtime: RuntimeContext<BlockKind, CoreEvent> = RuntimeContext::new(
+            ctx.store.clone(),
+            Arc::clone(&ctx.bus),
+            Arc::new(crate::providers::ProviderRegistry::new()),
+            Arc::new(ToolRegistry::new()),
+        );
+        let (latched, _write_latched) = create_signal(false);
+        let (tx, provider_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Real summoner blocks: the anchor column is a foreign key, so the
+        // anchors must name rows that exist.
+        let summoner_one = ctx
+            .store
+            .insert_text_block(
+                ctx.conversation_id,
+                crate::block::Role::User,
+                "ask one".into(),
+            )
+            .await
+            .expect("the first summoner inserts");
+        let summoner_two = ctx
+            .store
+            .insert_text_block(
+                ctx.conversation_id,
+                crate::block::Role::User,
+                "ask two".into(),
+            )
+            .await
+            .expect("the second summoner inserts");
+        let anchor = TurnAnchor::new();
+        anchor.set(summoner_one); // the drained turn's dispatch: epoch 1
+        let handle = spawn_channel(
+            ctx.conversation_id,
+            runtime,
+            provider_rx,
+            latched,
+            1,
+            anchor.clone(),
+            Duration::from_millis(300),
+        );
+        // Turn one streams and ends its message; its tool tail never comes.
+        for event in [
+            StreamEvent::TextBlockStart,
+            StreamEvent::TextDelta { text: "one".into() },
+            StreamEvent::TextFinal { text: "one".into() },
+            StreamEvent::MessageEnd {
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+            },
+        ] {
+            tx.send(ProviderResponse::Event(event)).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The actor ends the turn out of band and dispatches a successor on
+        // the same binding: the seam's epoch moves on.
+        anchor.clear();
+        anchor.set(summoner_two); // successor dispatch: epoch 2
+        // Silence past the deadline: the stale timer fires, resets, and the
+        // reader keeps serving — no abandon mark, no terminal.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !anchor.is_abandoned(),
+            "a stale timer must not mark the binding abandoned"
+        );
+        // The successor's own stream flows and ingests normally.
+        for event in [
+            StreamEvent::TextBlockStart,
+            StreamEvent::TextDelta {
+                text: "recovered".into(),
+            },
+            StreamEvent::TextFinal {
+                text: "recovered".into(),
+            },
+            StreamEvent::MessageEnd {
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+            },
+        ] {
+            tx.send(ProviderResponse::Event(event)).unwrap();
+        }
+        tx.send(ProviderResponse::Done).unwrap();
+        drop(tx);
+        handle
+            .await
+            .expect("the reader exits when the channel closes");
+        let blocks = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+        let recovered: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.block_type == "text" && b.fields["content"] == "recovered")
+            .collect();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "the successor's prose ingests exactly once after the stale reset; ledger: {:?}",
+            blocks
+                .iter()
+                .map(|b| (
+                    b.block_type.clone(),
+                    b.fields.get("content").cloned(),
+                    b.dispatch_anchor
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            recovered[0].dispatch_anchor,
+            Some(summoner_two),
+            "the successor's prose carries the successor's anchor"
+        );
+    }
+
+    /// The drain deadline: a provider that emits `MessageEnd` and then stalls
+    /// forever — no tool lifecycle, no trailing done, channel held open —
+    /// must not wedge the conversation. Message-end no longer settles the
+    /// dispatch state, so without the bounded drain no close edge would ever
+    /// fire; with it, silence past [`MESSAGE_END_DRAIN_DEADLINE`] makes the
+    /// reader mark the turn abandoned on the seam, emit its own closed
+    /// terminal and exit, and the turn's committed content stands. Paused
+    /// time: the deadline elapses virtually, instantly.
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_after_message_end_closes_the_stream_at_the_drain_deadline() {
+        let (ctx, mut rx) = fixture().await;
+        let runtime: RuntimeContext<BlockKind, CoreEvent> = RuntimeContext::new(
+            ctx.store.clone(),
+            Arc::clone(&ctx.bus),
+            Arc::new(crate::providers::ProviderRegistry::new()),
+            Arc::new(ToolRegistry::new()),
+        );
+        let (latched, _write_latched) = create_signal(false);
+        let (tx, provider_rx) = tokio::sync::mpsc::unbounded_channel();
+        let anchor = TurnAnchor::new();
+        let handle = spawn_channel(
+            ctx.conversation_id,
+            runtime,
+            provider_rx,
+            latched,
+            1,
+            anchor.clone(),
+            MESSAGE_END_DRAIN_DEADLINE,
+        );
+
+        for event in [
+            StreamEvent::TextBlockStart,
+            StreamEvent::TextDelta {
+                text: "the answer".into(),
+            },
+            StreamEvent::MessageEnd {
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+            },
+        ] {
+            tx.send(ProviderResponse::Event(event)).unwrap();
+        }
+        // The stall: `tx` stays alive and silent — the channel never closes,
+        // and no `Done` ever comes.
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let closed = loop {
+            match rx.try_recv() {
+                Ok(CoreEvent::StreamClosed { generation, .. }) => break generation,
+                Ok(CoreEvent::StreamError { .. }) => {
+                    panic!("a clean stop that stalls is closed, not errored")
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the drain deadline never closed the stalled stream"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Err(e) => panic!("subscription failed: {e}"),
+            }
+        };
+        assert_eq!(closed, Some(1), "the reader's own terminal is stamped");
+        assert!(
+            anchor.is_abandoned(),
+            "the abandoned mark reached the seam before the terminal — the \
+             actor's close reads it to retire the binding"
+        );
+
+        assert_eq!(streaming_count(&ctx).await, 0, "no tail outlives the turn");
+        assert_eq!(
+            count_type(&ctx, "text").await,
+            1,
+            "the finalized answer stands"
+        );
+
+        // The reader exited at the deadline on its own; the channel closing
+        // afterwards is unobserved.
+        handle.await.unwrap();
+        drop(tx);
+        let mut late_terminals = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(
+                event,
+                CoreEvent::StreamClosed { .. } | CoreEvent::StreamError { .. }
+            ) {
+                late_terminals += 1;
+            }
+        }
+        assert_eq!(
+            late_terminals, 0,
+            "the deadline's close settled the turn — the channel dying later adds no second terminal"
+        );
+    }
+
+    /// The abnormal-stop terminal is DEFERRED to the drain's end: a
+    /// `max_tokens` stop trailed by a truncated tool lifecycle records the
+    /// error status AND the trailing call with the open turn's anchor — the
+    /// error signal arrives once, when the reader is done with the turn, so
+    /// no trailing write can be stamped after the seam cleared.
+    #[tokio::test]
+    async fn an_abnormal_stop_defers_its_error_until_the_drain_ends() {
+        let (ctx, mut rx) = fixture().await;
+        let runtime: RuntimeContext<BlockKind, CoreEvent> = RuntimeContext::new(
+            ctx.store.clone(),
+            Arc::clone(&ctx.bus),
+            Arc::new(crate::providers::ProviderRegistry::new()),
+            Arc::new(ToolRegistry::new()),
+        );
+        let (latched, _write_latched) = create_signal(false);
+        let summoner = ctx
+            .store
+            .insert_user_blocks(
+                ctx.conversation_id,
+                vec![crate::types::InputBlock::Text {
+                    content: "summon".into(),
+                }],
+            )
+            .await
+            .unwrap()[0];
+        let anchor = TurnAnchor::new();
+        anchor.set(summoner);
+        let (tx, provider_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = spawn_channel(
+            ctx.conversation_id,
+            runtime,
+            provider_rx,
+            latched,
+            1,
+            anchor,
+            MESSAGE_END_DRAIN_DEADLINE,
+        );
+
+        for response in [
+            ProviderResponse::Event(StreamEvent::TextDelta {
+                text: "cut-".into(),
+            }),
+            ProviderResponse::Event(StreamEvent::MessageEnd {
+                usage: Usage::default(),
+                stop_reason: StopReason::MaxTokens,
+            }),
+            ProviderResponse::Event(StreamEvent::ToolUseStart {
+                id: "trailing".into(),
+                name: "read_file".into(),
+            }),
+            ProviderResponse::Event(StreamEvent::ToolUseInputDelta { json: "{}".into() }),
+            ProviderResponse::Event(StreamEvent::ToolUseEnd),
+            ProviderResponse::Done,
+        ] {
+            tx.send(response).unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let mut terminals = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                CoreEvent::StreamError { error, .. } => terminals.push(error),
+                CoreEvent::StreamClosed { .. } => terminals.push("closed".into()),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            terminals,
+            vec!["max_tokens".to_string()],
+            "one terminal, the recorded stop, at the drain's end"
+        );
+
+        let blocks = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+        for (block_type, expected) in [("status", 1), ("text", 1), ("tool_call", 1)] {
+            let anchored: Vec<Option<i64>> = blocks
+                .iter()
+                .filter(|b| b.block_type == block_type && b.id != summoner)
+                .map(|b| b.dispatch_anchor)
+                .collect();
+            assert_eq!(
+                anchored,
+                vec![Some(summoner); expected],
+                "every {block_type} the drained turn wrote carries the turn's anchor"
+            );
+        }
     }
 
     /// The two explicit final-content paths follow the same empty rule:

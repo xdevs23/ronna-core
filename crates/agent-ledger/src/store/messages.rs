@@ -14,6 +14,56 @@ use super::blocks::{
 use super::descriptors::ContentDescriptor;
 use super::{Store, StoreError, now_iso8601, transact};
 
+/// Where one ledger append lands: the conversation, and — through the
+/// crate-only constructor — the dispatch anchor the row's header records.
+///
+/// This is the anchor's one route into a write (2026-08-22). Every insert
+/// method takes `impl Into<BlockDestination>`, and the two forms are the two
+/// writer surfaces: a bare conversation id converts to the anchor-less
+/// destination, which is all the public write surface can express, while the
+/// anchored constructor is crate-internal — the framework's own paths (the
+/// streaming reader's per-turn seam, the interrupt's status, the metadata
+/// worker's response) are the only writers that can record an anchor. One
+/// method per operation, no anchored siblings.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockDestination {
+    conversation_id: i64,
+    dispatch_anchor: Option<i64>,
+}
+
+impl From<i64> for BlockDestination {
+    /// The public form: a bare conversation id, recording no anchor.
+    fn from(conversation_id: i64) -> Self {
+        Self {
+            conversation_id,
+            dispatch_anchor: None,
+        }
+    }
+}
+
+impl BlockDestination {
+    /// The framework's form: a destination that records the given turn's
+    /// dispatch anchor on the inserted header.
+    pub(crate) fn anchored(conversation_id: i64, dispatch_anchor: Option<i64>) -> Self {
+        Self {
+            conversation_id,
+            dispatch_anchor,
+        }
+    }
+
+    /// The conversation this destination appends to.
+    pub(crate) fn conversation_id(self) -> i64 {
+        self.conversation_id
+    }
+
+    /// The dispatch anchor this destination records, `None` for the public
+    /// form. For the metadata ledger's own insert, which writes no `blocks`
+    /// header and therefore reads the destination directly.
+    pub(crate) fn dispatch_anchor(self) -> Option<i64> {
+        self.dispatch_anchor
+    }
+}
+
 /// The facts a tool call carries into the ledger, grouped because they travel
 /// together: a call's identity, what it asks for, and whether it is answered in
 /// the chat rather than out of band.
@@ -107,22 +157,44 @@ pub(super) fn delete_streaming_counterpart(
 /// trigger fires exactly there), and what that left behind was a committed
 /// header with no junction row and no content, a block belonging to nothing
 /// that no query can even name.
+///
+/// The destination's `dispatch_anchor` is the header's dispatch identity
+/// (2026-08-22): the block whose owed turn dispatched the stream this block
+/// is a product of, `None` for everything else. Every writer passes it
+/// through this one helper as part of its [`BlockDestination`], so the
+/// per-writer-class rule — the reader's per-turn seam, the copy at the
+/// resolution write, the actor's own at the interrupt, NULL on the public
+/// write surface — has exactly one place it lands in the header.
 pub(super) fn insert_block(
     conn: &Connection,
-    conversation_id: i64,
+    dest: impl Into<BlockDestination>,
     block_type: &str,
 ) -> Result<i64, StoreError> {
+    let dest = dest.into();
     let now = now_iso8601();
     conn.execute(
-        "INSERT INTO blocks (block_type, created_at) VALUES (?1, ?2)",
-        params![block_type, now],
+        "INSERT INTO blocks (block_type, created_at, dispatch_anchor) VALUES (?1, ?2, ?3)",
+        params![block_type, now, dest.dispatch_anchor],
     )?;
     let block_id = conn.last_insert_rowid();
     conn.execute(
         "INSERT INTO conversation_blocks (conversation_id, block_id) VALUES (?1, ?2)",
-        params![conversation_id, block_id],
+        params![dest.conversation_id, block_id],
     )?;
     Ok(block_id)
+}
+
+/// One block's recorded dispatch anchor — the copy source for the writer class
+/// that answers a call. Results, errors and the approval chain copy the anchor
+/// from the block they resolve AT the resolution write, off the durable row,
+/// which is what makes a restart-recovered round correct for free: no
+/// in-memory state has to survive to the write.
+pub(super) fn anchor_of(conn: &Connection, block_id: i64) -> Result<Option<i64>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT dispatch_anchor FROM blocks WHERE id = ?1",
+        [block_id],
+        |row| row.get(0),
+    )
 }
 
 impl Store {
@@ -188,7 +260,8 @@ impl Store {
 
     // ─── Typed block insertion ───────────────────────────────────────────
 
-    /// Append a committed text block.
+    /// Append a committed text block. Part of the public write surface, which
+    /// never records a dispatch anchor.
     ///
     /// # Errors
     ///
@@ -217,20 +290,25 @@ impl Store {
     /// that keeps streaming blocks ephemeral. `replaces_streaming = None`
     /// covers the finalization events that never opened a streaming tail.
     ///
+    /// The streaming reader appends through an anchored [`BlockDestination`],
+    /// carrying the anchor its per-turn seam holds; a bare conversation id is
+    /// the public, anchor-less form.
+    ///
     /// # Errors
     ///
     /// If the transaction fails or the store's actor has stopped.
     pub async fn insert_final_text_block(
         &self,
-        conversation_id: i64,
+        dest: impl Into<BlockDestination>,
         role: Role,
         content: String,
         replaces_streaming: Option<i64>,
     ) -> Result<i64, StoreError> {
+        let dest = dest.into();
         let descriptors = self.descriptors;
         self.run(move |conn| {
             let tx = conn.transaction()?;
-            let block_id = insert_block(&tx, conversation_id, "text")?;
+            let block_id = insert_block(&tx, dest, "text")?;
             tx.execute(
                 "INSERT INTO block_text (block_id, role, content) VALUES (?1, ?2, ?3)",
                 params![block_id, role.as_str(), content],
@@ -282,19 +360,22 @@ impl Store {
         .await
     }
 
-    /// Open a streaming text tail for the model's next emission.
+    /// Open a streaming text tail for the model's next emission. The live tail
+    /// is a turn product too: the streaming reader appends through an anchored
+    /// [`BlockDestination`], and a bare conversation id records no anchor.
     ///
     /// # Errors
     ///
     /// If the insert fails or the store's actor has stopped.
     pub async fn insert_streaming_block(
         &self,
-        conversation_id: i64,
+        dest: impl Into<BlockDestination>,
         role: Role,
     ) -> Result<i64, StoreError> {
+        let dest = dest.into();
         self.run(move |conn| {
             transact(conn, |tx| {
-                let block_id = insert_block(tx, conversation_id, "streaming")?;
+                let block_id = insert_block(tx, dest, "streaming")?;
                 tx.execute(
                     "INSERT INTO block_text (block_id, role, content) VALUES (?1, ?2, '')",
                     params![block_id, role.as_str()],
@@ -328,19 +409,21 @@ impl Store {
         .await
     }
 
-    /// Open a streaming thinking tail.
+    /// Open a streaming thinking tail. The streaming reader appends through an
+    /// anchored [`BlockDestination`]; a bare conversation id records no anchor.
     ///
     /// # Errors
     ///
     /// If the insert fails or the store's actor has stopped.
     pub async fn insert_streaming_thinking_block(
         &self,
-        conversation_id: i64,
+        dest: impl Into<BlockDestination>,
         role: Role,
     ) -> Result<i64, StoreError> {
+        let dest = dest.into();
         self.run(move |conn| {
             transact(conn, |tx| {
-                let block_id = insert_block(tx, conversation_id, "streaming_thinking")?;
+                let block_id = insert_block(tx, dest, "streaming_thinking")?;
                 tx.execute(
                     "INSERT INTO block_thinking (block_id, role, content) VALUES (?1, ?2, '')",
                     params![block_id, role.as_str()],
@@ -358,24 +441,27 @@ impl Store {
     /// finalization INSERT; there is no UPDATE path.
     ///
     /// `replaces_streaming` is the streamed tail this final replaces, deleted
-    /// in the SAME transaction.
+    /// in the SAME transaction. The streaming reader's finalization appends
+    /// through an anchored [`BlockDestination`]; a bare conversation id
+    /// records no anchor.
     ///
     /// # Errors
     ///
     /// If the transaction fails or the store's actor has stopped.
     pub async fn insert_thinking_block_with_content(
         &self,
-        conversation_id: i64,
+        dest: impl Into<BlockDestination>,
         role: Role,
         content: String,
         summary: Option<String>,
         opaque: Option<OpaquePayload>,
         replaces_streaming: Option<i64>,
     ) -> Result<i64, StoreError> {
+        let dest = dest.into();
         let descriptors = self.descriptors;
         self.run(move |conn| {
             let tx = conn.transaction()?;
-            let block_id = insert_block(&tx, conversation_id, "thinking")?;
+            let block_id = insert_block(&tx, dest, "thinking")?;
             let (kind, data, item_id) = opaque_columns(opaque.as_ref());
             tx.execute(
                 "INSERT INTO block_thinking (block_id, role, content, summary, opaque_kind, opaque_data, opaque_item_id)
@@ -413,20 +499,27 @@ impl Store {
     /// Append a committed tool call. `replaces_streaming` is the streamed input
     /// tail this final call replaces, deleted in the SAME transaction.
     ///
+    /// The streamed call's finalization appends through an anchored
+    /// [`BlockDestination`] — the fact the dispatch-identity slice exists for:
+    /// a consumer holding a call block reads its summoning message in one
+    /// step, round one and round ten alike. A bare conversation id records no
+    /// anchor.
+    ///
     /// # Errors
     ///
     /// If the transaction fails or the store's actor has stopped.
     pub async fn insert_tool_call_block(
         &self,
-        conversation_id: i64,
+        dest: impl Into<BlockDestination>,
         role: Role,
         call: ToolCallInsert,
         replaces_streaming: Option<i64>,
     ) -> Result<i64, StoreError> {
+        let dest = dest.into();
         let descriptors = self.descriptors;
         self.run(move |conn| {
             let tx = conn.transaction()?;
-            let block_id = insert_block(&tx, conversation_id, "tool_call")?;
+            let block_id = insert_block(&tx, dest, "tool_call")?;
             tx.execute(
                 "INSERT INTO block_tool_call (block_id, role, tool_call_id, name, input, interactive)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -448,21 +541,24 @@ impl Store {
         .await
     }
 
-    /// Open a streaming tool-call tail whose arguments arrive in deltas.
+    /// Open a streaming tool-call tail whose arguments arrive in deltas. The
+    /// streaming reader appends through an anchored [`BlockDestination`]; a
+    /// bare conversation id records no anchor.
     ///
     /// # Errors
     ///
     /// If the insert fails or the store's actor has stopped.
     pub async fn insert_streaming_tool_call_block(
         &self,
-        conversation_id: i64,
+        dest: impl Into<BlockDestination>,
         role: Role,
         tool_call_id: String,
         name: String,
     ) -> Result<i64, StoreError> {
+        let dest = dest.into();
         self.run(move |conn| {
             transact(conn, |tx| {
-                let block_id = insert_block(tx, conversation_id, "streaming_tool_call")?;
+                let block_id = insert_block(tx, dest, "streaming_tool_call")?;
                 tx.execute(
                     "INSERT INTO block_streaming_tool_call (block_id, role, tool_call_id, name, input) VALUES (?1, ?2, ?3, ?4, '')",
                     params![block_id, role.as_str(), tool_call_id, name],
@@ -581,20 +677,24 @@ impl Store {
     // block id. An unconditional insert here would be a second door past the
     // one-outcome-per-call condition.
 
-    /// Append a status block.
+    /// Append a status block. The reader's abnormal-stop statuses and the
+    /// interrupt's status append through an anchored [`BlockDestination`] —
+    /// the turn the status is about is the turn it anchors on; a bare
+    /// conversation id records no anchor.
     ///
     /// # Errors
     ///
     /// If the insert fails or the store's actor has stopped.
     pub async fn insert_status_block(
         &self,
-        conversation_id: i64,
+        dest: impl Into<BlockDestination>,
         status: String,
         subtitle: Option<String>,
     ) -> Result<i64, StoreError> {
+        let dest = dest.into();
         self.run(move |conn| {
             transact(conn, |tx| {
-                let block_id = insert_block(tx, conversation_id, "status")?;
+                let block_id = insert_block(tx, dest, "status")?;
                 tx.execute(
                     "INSERT INTO block_status (block_id, status, subtitle) VALUES (?1, ?2, ?3)",
                     params![block_id, status, subtitle],
@@ -965,6 +1065,13 @@ const BLOCK_REFERENCES: &[(&str, &[&str])] = &[
     ("block_tool_error", &["source_block_id"]),
     // The second ledger's rows name the block they were derived from.
     ("metadata", &["source_block_id"]),
+    // The self-referential arm (2026-08-22, in lockstep with the pinned
+    // predicate literal): a turn product's header names its summoning
+    // frontier through `dispatch_anchor`, and an identity that can dangle is
+    // the refuted shape-walk wearing a column — so an anchored-at block is a
+    // referenced block, and fork-then-delete leaves the anchor target loadable
+    // until its last anchorer is collected.
+    ("blocks", &["dispatch_anchor"]),
 ];
 
 /// **What makes a block an orphan, written once.**

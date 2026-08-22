@@ -17,6 +17,7 @@ fn block(id: i64, block_type: &str, fields: serde_json::Map<String, Value>) -> B
         role: Some(Role::Assistant),
         block_type: block_type.into(),
         created_at: String::new(),
+        dispatch_anchor: None,
         fields,
     }
 }
@@ -61,6 +62,7 @@ fn role_block(id: i64, role: Option<Role>, block_type: &str, pairs: &[(&str, Val
         role,
         block_type: block_type.into(),
         created_at: String::new(),
+        dispatch_anchor: None,
         fields: m,
     }
 }

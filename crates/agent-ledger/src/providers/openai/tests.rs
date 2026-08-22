@@ -24,6 +24,7 @@ mod request_goldens {
             role,
             block_type: ty.into(),
             created_at: String::new(),
+            dispatch_anchor: None,
             fields: m,
         }
     }
@@ -716,6 +717,7 @@ mod replay {
                 role: Some(Role::Assistant),
                 block_type: "thinking".into(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields: thinking,
             },
             Block {
@@ -723,6 +725,7 @@ mod replay {
                 role: Some(Role::Assistant),
                 block_type: "tool_call".into(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields: tool_call,
             },
             Block {
@@ -730,6 +733,7 @@ mod replay {
                 role: Some(Role::Assistant),
                 block_type: "tool_result".into(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields: tool_result,
             },
         ]
@@ -790,6 +794,7 @@ mod replay {
                 role: Some(Role::Assistant),
                 block_type: block_type.into(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields,
             }
         };
@@ -809,6 +814,7 @@ mod replay {
                 role: Some(Role::Assistant),
                 block_type: "thinking".into(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields,
             }
         };

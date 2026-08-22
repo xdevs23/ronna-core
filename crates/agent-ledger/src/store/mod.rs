@@ -57,7 +57,7 @@ pub use descriptors::{
     concat_descriptors, descriptor_count,
 };
 pub use drafts::DraftBlock;
-pub use messages::ToolCallInsert;
+pub use messages::{BlockDestination, ToolCallInsert};
 pub use models::ModelEntry;
 pub use providers::ProviderInstance;
 
@@ -1375,6 +1375,148 @@ mod tests {
         s.delete_conversation(c1).await.unwrap();
         let cleaned = s.gc_orphan_blocks().await.unwrap();
         assert_eq!(cleaned, 2);
+    }
+
+    /// AC8-6, the fork half: the deep-copy cloner — the one mechanism every
+    /// fork path clones through — treats the dispatch anchor as a real
+    /// reference. Cloned beside its target, the copy's anchor is REMAPPED to
+    /// the target's clone; cloned without it, the anchor is KEPT by
+    /// reference.
+    #[tokio::test]
+    async fn a_deep_copy_remaps_the_anchor_where_its_target_was_cloned() {
+        let s = store();
+        let c1 = make_conv(&s, "p1", "model").await;
+        let msg = s
+            .insert_text_block(c1, Role::User, "summon".into())
+            .await
+            .unwrap();
+        let answer = s
+            .insert_final_text_block(
+                BlockDestination::anchored(c1, Some(msg)),
+                Role::Assistant,
+                "answered".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Both cloned, target first: the answer's anchor follows the clone.
+        let c2 = make_conv(&s, "p1", "model").await;
+        let descriptors = s.descriptors;
+        let (msg_clone, answer_clone) = s
+            .run(move |conn| {
+                let mut cloner = block_cloner::BlockCloner::new(conn, descriptors);
+                let m = cloner.clone_linked(msg, c2)?;
+                let a = cloner.clone_linked(answer, c2)?;
+                Ok((m, a))
+            })
+            .await
+            .unwrap();
+        let remapped = s.find_block(answer_clone).await.unwrap().unwrap();
+        assert_eq!(
+            remapped.dispatch_anchor,
+            Some(msg_clone),
+            "the anchor is remapped to the target's clone"
+        );
+
+        // The answer alone: the anchor is kept, naming the source's block.
+        let c3 = make_conv(&s, "p1", "model").await;
+        let kept_clone = s
+            .run(move |conn| {
+                let mut cloner = block_cloner::BlockCloner::new(conn, descriptors);
+                cloner.clone_linked(answer, c3)
+            })
+            .await
+            .unwrap();
+        let kept = s.find_block(kept_clone).await.unwrap().unwrap();
+        assert_eq!(
+            kept.dispatch_anchor,
+            Some(msg),
+            "an uncloned target's anchor is kept by reference"
+        );
+    }
+
+    /// AC8-6, the collection half, under the erasure rule (2026-08-22): an
+    /// anchored-at block is a REFERENCED block while its conversation lives —
+    /// the shared rerun fork proves the kept anchor keeps resolving. Deleting
+    /// a conversation NULLS the anchors pointing into it in the same
+    /// transaction, so fork-then-delete leaves no dangling anchor AND leaves
+    /// nothing uncollectable: the fork's clone reads the documented null, and
+    /// the deleted conversation's blocks collect instead of being pinned
+    /// forever by a cross-conversation reference erasure can never release.
+    #[tokio::test]
+    async fn deleting_a_conversation_nulls_anchors_into_it_and_collection_proceeds() {
+        let s = store();
+        let c1 = make_conv(&s, "p1", "model").await;
+        let msg = s
+            .insert_text_block(c1, Role::User, "summon".into())
+            .await
+            .unwrap();
+        let answer = s
+            .insert_final_text_block(
+                BlockDestination::anchored(c1, Some(msg)),
+                Role::Assistant,
+                "answered".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A rerun fork SHARES the history by junction: deleting the source
+        // must not null the fork's anchors, because their target stays the
+        // fork's own readable history.
+        let shared_fork = s
+            .fork_conversation(c1, answer, ModelOverride::default())
+            .await
+            .unwrap();
+
+        // A deep-copied clone in another conversation KEEPS the anchor by
+        // reference — the cross-conversation shape deletion has to null.
+        let c2 = make_conv(&s, "p1", "model").await;
+        let descriptors = s.descriptors;
+        let fork_answer = s
+            .run(move |conn| {
+                let mut cloner = block_cloner::BlockCloner::new(conn, descriptors);
+                cloner.clone_linked(answer, c2)
+            })
+            .await
+            .unwrap();
+
+        // Deleting the shared fork first: the source still junctions the
+        // target, so every anchor at it stays intact.
+        s.delete_conversation(shared_fork).await.unwrap();
+        assert_eq!(
+            s.find_block(answer).await.unwrap().unwrap().dispatch_anchor,
+            Some(msg),
+            "a target the source still junctions keeps its anchors"
+        );
+
+        // Deleting the source nulls the clone's cross-conversation anchor in
+        // the same transaction, and collection then takes the whole deleted
+        // history — nothing survives uncollectable behind a kept reference.
+        s.delete_conversation(c1).await.unwrap();
+        let cloned = s.find_block(fork_answer).await.unwrap().unwrap();
+        assert_eq!(
+            cloned.dispatch_anchor, None,
+            "the clone reads the documented null, not a dangling id"
+        );
+        s.gc_orphan_blocks().await.unwrap();
+        assert!(
+            s.find_block(msg).await.unwrap().is_none(),
+            "the deleted conversation's summoner collects"
+        );
+        assert!(
+            s.find_block(answer).await.unwrap().is_none(),
+            "…and its answer collects with it"
+        );
+        assert_eq!(
+            s.find_block(fork_answer)
+                .await
+                .unwrap()
+                .expect("the fork's own block is untouched")
+                .fields["content"],
+            serde_json::json!("answered")
+        );
     }
 
     /// A conversation whose quote target is a detached block, plus a pile of

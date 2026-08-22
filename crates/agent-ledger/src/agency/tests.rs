@@ -67,6 +67,7 @@ fn bare_block(block_type: &str, role: Option<Role>) -> Block {
         role,
         block_type: block_type.into(),
         created_at: String::new(),
+        dispatch_anchor: None,
         fields: serde_json::Map::new(),
     }
 }

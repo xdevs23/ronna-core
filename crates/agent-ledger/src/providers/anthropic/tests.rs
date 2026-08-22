@@ -252,6 +252,7 @@ mod replay_tests {
                 role: Some(Role::Assistant),
                 block_type: "thinking".into(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields: thinking,
             },
             Block {
@@ -259,6 +260,7 @@ mod replay_tests {
                 role: Some(Role::Assistant),
                 block_type: "text".into(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields: text,
             },
             Block {
@@ -266,6 +268,7 @@ mod replay_tests {
                 role: Some(Role::Assistant),
                 block_type: "tool_call".into(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields: tool_call,
             },
         ]
@@ -369,6 +372,7 @@ mod bind_request_golden {
             role: Some(role),
             block_type: block_type.into(),
             created_at: String::new(),
+            dispatch_anchor: None,
             fields,
         }
     }
@@ -434,6 +438,7 @@ mod wire_golden {
             role,
             block_type: ty.into(),
             created_at: String::new(),
+            dispatch_anchor: None,
             fields: m,
         }
     }

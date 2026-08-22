@@ -20,8 +20,12 @@ use super::{DomainGate, StoreError};
 /// descriptor's own table. A kind neither this statement nor a descriptor
 /// knows stays inert, which is the documented fallback for a newer ledger read
 /// by an older build.
+///
+/// 2026-08-22, in lockstep with the pinned literal: the header select gained
+/// `dispatch_anchor` — a header column, not a content join, so every kind's
+/// load carries it for free.
 pub(super) const BLOCKS_QUERY: &str = "SELECT
-            b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at,
+            b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
             bq.role AS bq_role, bq.start_block_id, bq.start_pos, bq.end_block_id, bq.end_pos,
             bc.role AS bc_role, bc.language AS bc_language, bc.content AS bc_content,
@@ -181,6 +185,7 @@ fn row_to_block(row: &rusqlite::Row<'_>) -> Result<Block, StoreError> {
     let id: i64 = row.get("b_id")?;
     let block_type: String = row.get("b_type")?;
     let created_at: String = row.get("b_created_at")?;
+    let dispatch_anchor: Option<i64> = row.get("b_dispatch_anchor")?;
 
     // Split where the source of a block's role differs: `content_payload` and
     // `tool_payload` read a role COLUMN off their content table, and
@@ -196,6 +201,7 @@ fn row_to_block(row: &rusqlite::Row<'_>) -> Result<Block, StoreError> {
         role,
         block_type,
         created_at,
+        dispatch_anchor,
         fields,
     })
 }

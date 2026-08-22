@@ -1,11 +1,42 @@
 //! The metadata tables: the second ledger, driven by the same machinery as the
 //! block ledger and cursored separately.
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use crate::block::Block;
 
+use super::messages::BlockDestination;
 use super::{Store, StoreError};
+
+/// One metadata row surfaced as the block shape the behavior layer drives.
+/// The two ledger reads share this so they cannot drift; the columns are read
+/// by name, so the two SELECTs and this mapping cannot silently disagree on
+/// order.
+///
+/// The surfaced block's `dispatch_anchor` stays `None` on purpose
+/// (2026-08-22): that field is documented as the BLOCK ledger's id space, and
+/// a metadata row's anchor names a metadata row — surfacing it in the shared
+/// field would hand `find_block` a confidently wrong id. The metadata
+/// ledger's anchoring stays stored and is queryable inside the crate through
+/// [`Store::metadata_dispatch_anchor`]; no read path outside the crate
+/// consumes it today.
+fn metadata_row_to_block(row: &rusqlite::Row<'_>) -> rusqlite::Result<Block> {
+    let mut fields = serde_json::Map::new();
+    if let Some(source) = row.get::<_, Option<i64>>("source_block_id")? {
+        fields.insert("source_block_id".into(), source.into());
+    }
+    if let Some(content) = row.get::<_, Option<String>>("content")? {
+        fields.insert("content".into(), content.into());
+    }
+    Ok(Block {
+        id: row.get("id")?,
+        role: None,
+        block_type: row.get("meta_type")?,
+        created_at: row.get("created_at")?,
+        dispatch_anchor: None,
+        fields,
+    })
+}
 
 impl Store {
     /// A conversation's metadata rows in insertion order, surfaced as the same
@@ -30,22 +61,7 @@ impl Store {
                 "SELECT id, meta_type, source_block_id, content, created_at
                  FROM metadata WHERE conversation_id = ?1 ORDER BY id",
             )?;
-            let rows = stmt.query_map([conversation_id], |row| {
-                let mut fields = serde_json::Map::new();
-                if let Some(source) = row.get::<_, Option<i64>>(2)? {
-                    fields.insert("source_block_id".into(), source.into());
-                }
-                if let Some(content) = row.get::<_, Option<String>>(3)? {
-                    fields.insert("content".into(), content.into());
-                }
-                Ok(Block {
-                    id: row.get(0)?,
-                    role: None,
-                    block_type: row.get(1)?,
-                    created_at: row.get(4)?,
-                    fields,
-                })
-            })?;
+            let rows = stmt.query_map([conversation_id], metadata_row_to_block)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
         .await
@@ -67,22 +83,7 @@ impl Store {
                 "SELECT id, meta_type, source_block_id, content, created_at
                  FROM metadata WHERE conversation_id = ?1 ORDER BY id DESC LIMIT 1",
             )?;
-            let mut rows = stmt.query_map([conversation_id], |row| {
-                let mut fields = serde_json::Map::new();
-                if let Some(source) = row.get::<_, Option<i64>>(2)? {
-                    fields.insert("source_block_id".into(), source.into());
-                }
-                if let Some(content) = row.get::<_, Option<String>>(3)? {
-                    fields.insert("content".into(), content.into());
-                }
-                Ok(Block {
-                    id: row.get(0)?,
-                    role: None,
-                    block_type: row.get(1)?,
-                    created_at: row.get(4)?,
-                    fields,
-                })
-            })?;
+            let mut rows = stmt.query_map([conversation_id], metadata_row_to_block)?;
             match rows.next() {
                 Some(row) => Ok(Some(row?)),
                 None => Ok(None),
@@ -134,25 +135,65 @@ impl Store {
 
     /// Append a metadata row to a conversation's second ledger.
     ///
+    /// The metadata worker's response write appends through an anchored
+    /// [`BlockDestination`], naming the request row whose owed fulfillment
+    /// dispatched the derivation stream — that anchor lives in the METADATA
+    /// ledger's own id space. A bare conversation id is the public,
+    /// anchor-less form.
+    ///
     /// # Errors
     ///
     /// If the insert fails or the store's actor has stopped.
     pub async fn insert_metadata(
         &self,
-        conversation_id: i64,
+        dest: impl Into<BlockDestination>,
         meta_type: &str,
         source_block_id: Option<i64>,
         content: Option<&str>,
     ) -> Result<i64, StoreError> {
+        let dest = dest.into();
         let meta_type = meta_type.to_owned();
         let content = content.map(ToOwned::to_owned);
         self.run(move |conn| {
             conn.execute(
-                "INSERT INTO metadata (conversation_id, meta_type, source_block_id, content)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![conversation_id, meta_type, source_block_id, content],
+                "INSERT INTO metadata
+                     (conversation_id, meta_type, source_block_id, content, dispatch_anchor)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    dest.conversation_id(),
+                    meta_type,
+                    source_block_id,
+                    content,
+                    dest.dispatch_anchor()
+                ],
             )?;
             Ok(conn.last_insert_rowid())
+        })
+        .await
+    }
+
+    /// One metadata row's stored dispatch anchor — an id in the metadata
+    /// ledger's OWN space, which is why the surfaced block shape does not
+    /// carry it: `Block::dispatch_anchor` is the block ledger's id space, and
+    /// one field cannot speak two. `None` for a row that is not a derivation
+    /// turn's product, and for an unknown row id.
+    ///
+    /// # Errors
+    ///
+    /// If the query fails or the store's actor has stopped.
+    pub(crate) async fn metadata_dispatch_anchor(
+        &self,
+        metadata_id: i64,
+    ) -> Result<Option<i64>, StoreError> {
+        self.run(move |conn| {
+            conn.query_row(
+                "SELECT dispatch_anchor FROM metadata WHERE id = ?1",
+                [metadata_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(Into::into)
         })
         .await
     }

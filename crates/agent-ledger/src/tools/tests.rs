@@ -24,6 +24,7 @@ use crate::event::CoreEvent;
 use crate::providers::types::ToolDefinition;
 use crate::providers::{BoxFuture, blocks_to_messages};
 use crate::store::Store;
+use crate::tools::CallOrigin;
 use crate::types::ApprovalChoice;
 
 use super::{
@@ -186,7 +187,7 @@ impl GateRig {
                 tool_call_id.into(),
                 "gated_probe".into(),
                 "{}".into(),
-                None,
+                CallOrigin::default(),
             )
             .await
             .unwrap()
@@ -620,7 +621,7 @@ async fn live_tail_siblings_emit_wakeups_before_either_resolves() {
                     id.into(),
                     "read_file".into(),
                     "{}".into(),
-                    None,
+                    CallOrigin::default(),
                 )
                 .await
                 .unwrap(),
@@ -713,7 +714,7 @@ async fn dangling_call_stays_dangling_while_latched_and_heals_on_unlatch() {
             "heal".into(),
             "gated_probe".into(),
             "{}".into(),
-            None,
+            CallOrigin::default(),
         )
         .await
         .unwrap();
@@ -779,7 +780,7 @@ async fn a_wakeup_delivered_while_latched_is_dropped_not_deferred() {
                     id.into(),
                     "gated_probe".into(),
                     "{}".into(),
-                    None,
+                    CallOrigin::default(),
                 )
                 .await
                 .unwrap(),
@@ -894,7 +895,7 @@ async fn interactive_stamp_lands_at_insert_from_the_registry() {
             "iv-1".into(),
             "ask_human".into(),
             "{}".into(),
-            None,
+            CallOrigin::default(),
         )
         .await
         .unwrap();
@@ -983,7 +984,7 @@ async fn an_interactive_call_is_admitted_by_the_human_never_a_gate() {
             "iv-gate".into(),
             "ask_human_gated".into(),
             "{}".into(),
-            None,
+            CallOrigin::default(),
         )
         .await
         .unwrap();
@@ -1126,7 +1127,7 @@ async fn an_unknown_tool_error_names_the_registered_tools() {
             "nope-1".into(),
             "no_such_tool".into(),
             "{}".into(),
-            None,
+            CallOrigin::default(),
         )
         .await
         .unwrap();
@@ -1284,7 +1285,7 @@ async fn overlapping_wakeups_execute_the_body_once_and_record_one_result() {
             "overlap-run".into(),
             "parked_probe".into(),
             "{}".into(),
-            None,
+            CallOrigin::default(),
         )
         .await
         .unwrap();
@@ -1323,7 +1324,7 @@ async fn overlapping_wakeups_append_one_approval_request() {
             "overlap-park".into(),
             "parked_probe".into(),
             "{}".into(),
-            None,
+            CallOrigin::default(),
         )
         .await
         .unwrap();
@@ -1458,7 +1459,7 @@ async fn a_panicking_body_releases_its_claim_for_the_next_wakeup() {
             "will-panic".into(),
             "panic_once".into(),
             "{}".into(),
-            None,
+            CallOrigin::default(),
         )
         .await
         .unwrap();

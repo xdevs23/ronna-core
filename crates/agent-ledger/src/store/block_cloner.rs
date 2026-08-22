@@ -55,11 +55,20 @@ impl<'c> BlockCloner<'c> {
     }
 
     fn clone_inner(&mut self, src_block_id: i64, link_to: Option<i64>) -> Result<i64, StoreError> {
-        let (block_type, created_at): (String, String) = self.conn.query_row(
-            "SELECT block_type, created_at FROM blocks WHERE id = ?1",
-            [src_block_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        let (block_type, created_at, src_anchor): (String, String, Option<i64>) =
+            self.conn.query_row(
+                "SELECT block_type, created_at, dispatch_anchor FROM blocks WHERE id = ?1",
+                [src_block_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        // The dispatch anchor is a real reference and rides the same remap as
+        // every other one (2026-08-22, in lockstep with the header insert):
+        // rewritten to the clone's id where the anchor's target was cloned,
+        // kept by reference where it was not — and the kept reference holds
+        // its source block alive through the collector's reference union, so
+        // fork-then-delete leaves no dangling anchor.
+        let dispatch_anchor =
+            src_anchor.map(|anchor| self.remap.get(&anchor).copied().unwrap_or(anchor));
 
         // A descriptor-claimed kind is copied generically from its declared
         // columns; the library's own kinds keep the typed content path,
@@ -78,8 +87,8 @@ impl<'c> BlockCloner<'c> {
         };
 
         self.conn.execute(
-            "INSERT INTO blocks (block_type, created_at) VALUES (?1, ?2)",
-            params![block_type, created_at],
+            "INSERT INTO blocks (block_type, created_at, dispatch_anchor) VALUES (?1, ?2, ?3)",
+            params![block_type, created_at, dispatch_anchor],
         )?;
         let new_block_id = self.conn.last_insert_rowid();
 

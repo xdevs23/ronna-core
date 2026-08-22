@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::block::ToolCallResult;
 
-use super::messages::insert_block;
+use super::messages::{BlockDestination, anchor_of, insert_block};
 use super::{Store, StoreError, transact};
 
 /// Whether a result or an error for this call is already recorded in this
@@ -70,7 +70,11 @@ impl Store {
                 if call_resolution_exists(tx, conversation_id, source_block_id)? {
                     return Ok(None);
                 }
-                let block_id = insert_block(tx, conversation_id, "tool_result")?;
+                // The result copies the call's dispatch anchor at the
+                // resolution write — off the durable call row, so a
+                // restart-recovered round is correct for free.
+                let anchor = anchor_of(tx, source_block_id)?;
+                let block_id = insert_block(tx, BlockDestination::anchored(conversation_id, anchor), "tool_result")?;
                 tx.execute(
                     "INSERT INTO block_tool_result (block_id, tool_call_id, content, source_block_id) VALUES (?1, ?2, ?3, ?4)",
                     params![block_id, tool_call_id, result, source_block_id],
@@ -105,7 +109,9 @@ impl Store {
                 if call_resolution_exists(tx, conversation_id, source_block_id)? {
                     return Ok(None);
                 }
-                let block_id = insert_block(tx, conversation_id, "tool_error")?;
+                // Same copy-at-the-resolution-write as the result path.
+                let anchor = anchor_of(tx, source_block_id)?;
+                let block_id = insert_block(tx, BlockDestination::anchored(conversation_id, anchor), "tool_error")?;
                 tx.execute(
                     "INSERT INTO block_tool_error (block_id, tool_call_id, error, source_block_id) VALUES (?1, ?2, ?3, ?4)",
                     params![block_id, tool_call_id, error, source_block_id],
@@ -181,7 +187,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use crate::block::{Role, ToolCallResult};
-    use crate::store::{Store, ToolCallInsert};
+    use crate::store::{BlockDestination, Store, ToolCallInsert};
 
     async fn call_block(store: &Store, conv: i64, tool_call_id: &str) -> i64 {
         store
@@ -287,6 +293,64 @@ mod tests {
             1
         );
         assert!(blocks.iter().all(|b| b.block_type != "tool_error"));
+    }
+
+    /// The copy-from-call writer class: a result and an error copy the
+    /// dispatch anchor from their source call block AT the resolution write —
+    /// off the durable row, so a restart-recovered round is correct with no
+    /// in-memory state surviving to the write. An unanchored call's outcomes
+    /// stay null.
+    #[tokio::test]
+    async fn resolutions_copy_the_dispatch_anchor_from_the_call_row() {
+        let store = Store::in_memory().unwrap();
+        let conv = store
+            .create_conversation("p".into(), "m".into(), "m".into(), String::new())
+            .await
+            .unwrap();
+        let summoner = store
+            .insert_text_block(conv, Role::User, "summon".into())
+            .await
+            .unwrap();
+        let anchored_call = store
+            .insert_tool_call_block(
+                BlockDestination::anchored(conv, Some(summoner)),
+                Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "c1".into(),
+                    name: "read".into(),
+                    input: "{}".into(),
+                    interactive: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let bare_call = call_block(&store, conv, "c2").await;
+
+        let result = store
+            .complete_tool_call_block(conv, "c1".into(), "ok".into(), anchored_call)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = store
+            .fail_tool_call_block(conv, "c2".into(), "broke".into(), bare_call)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let blocks = store.list_blocks(conv).await.unwrap();
+        let anchor_of = |id: i64| blocks.iter().find(|b| b.id == id).unwrap().dispatch_anchor;
+        assert_eq!(anchor_of(anchored_call), Some(summoner));
+        assert_eq!(
+            anchor_of(result),
+            Some(summoner),
+            "the result copies the call's anchor"
+        );
+        assert_eq!(
+            anchor_of(error),
+            None,
+            "an unanchored call's outcome stays null"
+        );
     }
 
     /// The schema's identity invariant, exercised: a model's `tool_call_id` can

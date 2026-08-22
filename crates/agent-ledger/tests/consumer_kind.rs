@@ -311,6 +311,7 @@ fn the_composed_enum_parses_and_concatenates_descriptors() {
         role: Some(Role::User),
         block_type: "chat_message".into(),
         created_at: String::new(),
+        dispatch_anchor: None,
         fields: {
             let mut fields = serde_json::Map::new();
             fields.insert("body".into(), json!("hello"));

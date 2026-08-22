@@ -68,6 +68,7 @@ pub mod actor;
 pub mod agency;
 pub mod block;
 pub mod bus;
+mod dispatch;
 pub mod event;
 mod ingestion;
 mod metadata;
@@ -95,5 +96,7 @@ pub use store::{
     Column, ColumnRef, ColumnType, ContentDescriptor, DomainMigrations, Store, StoreConfig,
     StoreError,
 };
-pub use tools::{ToolContext, ToolHandler, ToolOutcome, ToolRegistry, ToolRunner, submit_approval};
+pub use tools::{
+    CallOrigin, ToolContext, ToolHandler, ToolOutcome, ToolRegistry, ToolRunner, submit_approval,
+};
 pub use types::{ApprovalChoice, Awaiting, InputBlock, StopReason, StreamUsage, denial_error_text};

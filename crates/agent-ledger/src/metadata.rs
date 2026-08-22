@@ -18,7 +18,6 @@
 //!   insertion settles the parked request on the next tick.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::agency::ratchet::{self, MetadataLedger};
@@ -32,7 +31,7 @@ use crate::providers::types::{
 };
 use crate::reactive;
 use crate::reactivity::ReadSignal;
-use crate::store::Store;
+use crate::store::{BlockDestination, Store};
 
 use super::actor::RuntimeContext;
 
@@ -110,6 +109,147 @@ impl FulfillmentThrottle {
 /// Milliseconds for a log field, saturating rather than truncating.
 fn log_millis(delay: Duration) -> u64 {
     u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The fulfillment side's dispatch state — ONE record under ONE lock: which
+/// binding the loop currently dispatches on, and the turns open per opener
+/// binding. The conversation actor's `close_dispatch` is the same
+/// consolidation on the first ledger; here the state must additionally
+/// survive rebinding, because the loop and its ingestion readers are two
+/// tasks and a torn-down predecessor reader can drain a whole turn late.
+///
+/// The generation is what makes the close sound: a turn is opened under the
+/// binding that dispatched it, and only that binding's [`FulfillmentSeam`]
+/// can close it or read its anchor. A predecessor's late `Done` therefore
+/// settles ITS turn — its response still carries its own turn's anchor — and
+/// can neither clear the live turn's in-flight state nor stamp the live
+/// turn's identity. Two unsynchronized halves (a shared flag beside a
+/// per-binding slot) let exactly that interleaving through, which is why the
+/// state is one value.
+pub(crate) struct FulfillmentTurn {
+    state: Arc<std::sync::Mutex<TurnState>>,
+}
+
+/// One binding's handle on the shared state: the reader-side seam. Reads and
+/// closes ONLY the turn its own generation opened.
+#[derive(Clone)]
+pub(crate) struct FulfillmentSeam {
+    state: Arc<std::sync::Mutex<TurnState>>,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct TurnState {
+    /// The binding identity the loop currently dispatches on, bumped at every
+    /// bind.
+    generation: u64,
+    /// The open turns, keyed by the binding that opened each: the live one at
+    /// the current generation, plus at most the just-replaced binding's turn
+    /// still draining. `bind` prunes older entries, so a reader that died
+    /// without its terminal cannot grow the list across rebinds.
+    open: Vec<(u64, Option<i64>)>,
+}
+
+impl TurnState {
+    fn anchor_of(&self, generation: u64) -> Option<i64> {
+        self.open
+            .iter()
+            .find(|(g, _)| *g == generation)
+            .and_then(|(_, anchor)| *anchor)
+    }
+
+    fn close_generation(&mut self, generation: u64) {
+        self.open.retain(|(g, _)| *g != generation);
+    }
+}
+
+impl FulfillmentTurn {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(TurnState::default())),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, TurnState> {
+        // No code runs while the lock is held, so a poisoned lock carries no
+        // broken invariant and is simply taken over.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Open the current binding's turn, before the dispatch goes out — the
+    /// reader may write the response the moment the request lands, and it
+    /// must already read this turn's anchor. `anchor` is `None` only for a
+    /// caller that has no request row to name.
+    fn open(&self, anchor: Option<i64>) {
+        let mut state = self.lock();
+        let generation = state.generation;
+        state.close_generation(generation);
+        state.open.push((generation, anchor));
+    }
+
+    /// Close the CURRENT binding's turn — the loop's own settle path for a
+    /// dispatch that never went out. The readers close through their seams.
+    fn close_unsent(&self) {
+        let mut state = self.lock();
+        let generation = state.generation;
+        state.close_generation(generation);
+    }
+
+    /// Whether the current binding has a turn in flight. A predecessor still
+    /// draining does not hold this — its channel is dead, and the rebind that
+    /// replaced it is the loop's licence to dispatch again.
+    fn is_open(&self) -> bool {
+        let state = self.lock();
+        state.open.iter().any(|(g, _)| *g == state.generation)
+    }
+
+    /// The current binding's open-turn anchor, for the tests that pin the
+    /// live seam across a predecessor's late close.
+    #[cfg(test)]
+    fn anchor(&self) -> Option<i64> {
+        let state = self.lock();
+        state.anchor_of(state.generation)
+    }
+
+    /// A new binding: bump the generation and hand back the reader's seam,
+    /// scoped to it. Turns older than the binding just replaced are pruned —
+    /// their readers are gone; a still-draining predecessor is at most one
+    /// bind behind, because a rebind happens only when its channel is already
+    /// dead.
+    fn bind(&self) -> FulfillmentSeam {
+        let mut state = self.lock();
+        state.generation += 1;
+        let floor = state.generation - 1;
+        state.open.retain(|(g, _)| *g >= floor);
+        FulfillmentSeam {
+            state: Arc::clone(&self.state),
+            generation: state.generation,
+        }
+    }
+}
+
+impl FulfillmentSeam {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TurnState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The anchor of the turn THIS binding opened, `None` when it has none
+    /// open. A predecessor draining late reads its own turn's anchor here,
+    /// never the live one's.
+    fn anchor(&self) -> Option<i64> {
+        self.lock().anchor_of(self.generation)
+    }
+
+    /// Settle the turn this binding opened. Only the opener's generation may
+    /// close: a stale seam's close removes its own entry — or nothing — and
+    /// leaves the live turn open.
+    fn close(&self) {
+        self.lock().close_generation(self.generation);
+    }
 }
 
 /// Spawn the per-conversation metadata subsystem. Returns join handles so the
@@ -268,10 +408,11 @@ pub(crate) async fn fulfillment_loop<K: RuntimeKind, E: RuntimeEvent + AsCoreEve
     throttle: Arc<FulfillmentThrottle>,
 ) {
     let store = ctx.store().clone();
-    // Same-process concurrency guard — wakeups re-arrive while a stream is in
-    // flight; the ingestion reader clears it when the stream settles. The
-    // ledger check below is the correctness guard.
-    let streaming = Arc::new(AtomicBool::new(false));
+    // The dispatch state, one record: the request row is the frontier owing
+    // the derivation (a policy append carries no anchor of its own, so it
+    // starts the identity), and the binding's own ingestion reader closes
+    // the turn through its seam when the stream settles.
+    let turn = FulfillmentTurn::new();
 
     loop {
         match rx.recv().await {
@@ -302,7 +443,7 @@ pub(crate) async fn fulfillment_loop<K: RuntimeKind, E: RuntimeEvent + AsCoreEve
                     );
                     continue;
                 }
-                if streaming.load(Ordering::Relaxed) {
+                if turn.is_open() {
                     continue;
                 }
 
@@ -316,19 +457,30 @@ pub(crate) async fn fulfillment_loop<K: RuntimeKind, E: RuntimeEvent + AsCoreEve
                         continue;
                     }
                 };
-                let request = ledger
-                    .iter()
-                    .find(|b| b.id == request_id)
-                    .map(BlockKind::from_block);
-                let Some(BlockKind::MetadataTitleRequest(request)) = request else {
+                let Some(request_block) = ledger.iter().find(|b| b.id == request_id) else {
+                    continue;
+                };
+                let BlockKind::MetadataTitleRequest(request) = BlockKind::from_block(request_block)
+                else {
                     continue;
                 };
                 if request.settled_in(&ledger) {
                     continue;
                 }
+                // The dispatch's anchor: the request row starts the identity
+                // (a policy append carries no anchor of its own), and a
+                // request that somehow carried one would inherit it — the
+                // same rule the conversation dispatch follows. Read off the
+                // metadata ledger's own column, because the surfaced block
+                // shape deliberately does not carry the metadata id space.
+                let request_anchor = store
+                    .metadata_dispatch_anchor(request_id)
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or(request_block.id);
 
                 let Some(tx) =
-                    ensure_provider(conv_id, &ctx, &mut provider_tx, &streaming, &throttle).await
+                    ensure_provider(conv_id, &ctx, &mut provider_tx, &turn, &throttle).await
                 else {
                     // A binding failure (deleted/misconfigured provider
                     // config) is as deterministic as a delisted model —
@@ -354,17 +506,18 @@ pub(crate) async fn fulfillment_loop<K: RuntimeKind, E: RuntimeEvent + AsCoreEve
                         "fulfillment retry"
                     );
                 }
-                // The flag is set BEFORE the dispatch and rolled back on a
-                // failed one. The ingestion reader in the OTHER task clears it
-                // when the stream settles, so a set placed after the dispatch
-                // races that clear: a fast failure could clear first, the late
-                // set would then read true forever, and no title would ever be
-                // derived again for the life of the process. (The conversation
-                // actor's streaming flag is set after its dispatch and is safe
-                // only because one task owns both writes.)
-                streaming.store(true, Ordering::Relaxed);
+                // The turn opens BEFORE the dispatch and closes again on a
+                // failed one. The ingestion reader in the OTHER task closes
+                // it when the stream settles, so an open placed after the
+                // dispatch races that close: a fast failure could close
+                // first, the late open would then read in-flight forever,
+                // and no title would ever be derived again for the life of
+                // the process. (The conversation actor's streaming flag is
+                // set after its dispatch and is safe only because one task
+                // owns both writes.)
+                turn.open(Some(request_anchor));
                 if !request_title_stream::<K>(&store, conv_id, &tx).await {
-                    streaming.store(false, Ordering::Relaxed);
+                    turn.close_unsent();
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -420,6 +573,7 @@ async fn request_title_stream<K: RuntimeKind>(
         role: Some(Role::User),
         block_type: "text".into(),
         created_at: String::new(),
+        dispatch_anchor: None,
         fields: {
             let mut m = serde_json::Map::new();
             m.insert(
@@ -451,7 +605,7 @@ pub(crate) async fn run_fulfillment_ingestion<K: RuntimeKind, E: RuntimeEvent>(
     conv_id: i64,
     ctx: RuntimeContext<K, E>,
     mut provider_rx: ProviderRx,
-    streaming: Arc<AtomicBool>,
+    seam: FulfillmentSeam,
     throttle: Arc<FulfillmentThrottle>,
 ) {
     let store = ctx.store();
@@ -514,8 +668,16 @@ pub(crate) async fn run_fulfillment_ingestion<K: RuntimeKind, E: RuntimeEvent>(
                     // a success would broadcast a title the store does not
                     // have, and — unrecorded — would retry unthrottled every
                     // tick. A failed persist is a failed attempt.
+                    // The response is the derivation turn's product: it
+                    // carries the seam's anchor — the request row's id in its
+                    // own ledger.
                     match store
-                        .insert_metadata(conv_id, "title_response", source_block_id, Some(trimmed))
+                        .insert_metadata(
+                            BlockDestination::anchored(conv_id, seam.anchor()),
+                            "title_response",
+                            source_block_id,
+                            Some(trimmed),
+                        )
                         .await
                     {
                         Ok(_) => {
@@ -544,7 +706,7 @@ pub(crate) async fn run_fulfillment_ingestion<K: RuntimeKind, E: RuntimeEvent>(
                 }
 
                 title.clear();
-                streaming.store(false, Ordering::Relaxed);
+                seam.close();
             }
             ProviderResponse::Error(e) => {
                 // The streaming flag clears and the still-parked request
@@ -559,7 +721,7 @@ pub(crate) async fn run_fulfillment_ingestion<K: RuntimeKind, E: RuntimeEvent>(
                     "title derivation error — backing off"
                 );
                 title.clear();
-                streaming.store(false, Ordering::Relaxed);
+                seam.close();
             }
             // The remaining stream events carry no title text.
             ProviderResponse::Event(_) => {}
@@ -573,7 +735,7 @@ async fn ensure_provider<K: RuntimeKind, E: RuntimeEvent>(
     conv_id: i64,
     ctx: &RuntimeContext<K, E>,
     cached_tx: &mut Option<ProviderTx>,
-    streaming: &Arc<AtomicBool>,
+    turn: &FulfillmentTurn,
     throttle: &Arc<FulfillmentThrottle>,
 ) -> Option<ProviderTx> {
     if let Some(tx) = cached_tx.as_ref()
@@ -598,11 +760,17 @@ async fn ensure_provider<K: RuntimeKind, E: RuntimeEvent>(
 
     let (tx, rx) = module.bind(conv_id, conv.model.provider_id.clone(), config);
 
+    // Each bind is a new binding identity, scoped into the reader's seam —
+    // the same rule the conversation actor's bind follows: a torn-down
+    // predecessor reader holds its own generation's seam and can neither
+    // borrow a successor turn's anchor for its late writes nor clear the
+    // live turn at its close.
+    let seam = turn.bind();
     tokio::spawn(run_fulfillment_ingestion(
         conv_id,
         ctx.clone(),
         rx,
-        Arc::clone(streaming),
+        seam,
         Arc::clone(throttle),
     ));
 
@@ -629,10 +797,10 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
 
     use crate::agency::ratchet::oracle::Oracle;
-    use crate::providers::ProviderRegistry;
     use crate::providers::types::Message;
+    use crate::providers::{BoxFuture, LlmError, ModelInfo, ProviderModule, ProviderRegistry};
     use crate::reactivity::{WriteSignal, create_signal};
-    use crate::store::ToolCallInsert;
+    use crate::store::{ProviderInstance, StoreError, ToolCallInsert};
     use crate::tools::ToolRegistry;
 
     use super::*;
@@ -1051,7 +1219,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (throttle, streaming) = run_reader(
+        let (throttle, turn) = run_reader(
             &o,
             vec![
                 ProviderResponse::Event(StreamEvent::TextDelta {
@@ -1067,10 +1235,7 @@ mod tests {
             throttle.suppressed(),
             "the failed persist opened the backoff window, not the success path"
         );
-        assert!(
-            !streaming.load(Ordering::Relaxed),
-            "the in-flight flag is released for the retry"
-        );
+        assert!(!turn.is_open(), "the turn is closed for the retry");
         while let Ok(event) = o.rx.try_recv() {
             assert!(
                 !matches!(event, CoreEvent::TitleUpdated { .. }),
@@ -1080,21 +1245,24 @@ mod tests {
     }
 
     /// The failure signal reaches the throttle from the REAL ingestion
-    /// reader: a provider error opens the window and releases the in-flight
-    /// flag.
+    /// reader: a provider error opens the window and closes the turn.
     #[tokio::test]
     async fn ingestion_error_records_the_failure_and_releases_streaming() {
         let o = Oracle::new().await;
         let ctx = runtime_ctx(&o);
 
         let throttle = Arc::new(FulfillmentThrottle::new());
-        let streaming = Arc::new(AtomicBool::new(true));
+        // In flight with no request row to name: this test never reaches a
+        // response write, so only the open-turn state matters.
+        let turn = FulfillmentTurn::new();
+        let seam = turn.bind();
+        turn.open(None);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let reader = tokio::spawn(run_fulfillment_ingestion(
             o.ctx.conversation_id,
             ctx,
             rx,
-            Arc::clone(&streaming),
+            seam,
             Arc::clone(&throttle),
         ));
 
@@ -1107,10 +1275,7 @@ mod tests {
             throttle.suppressed(),
             "the deterministic failure opened the backoff window"
         );
-        assert!(
-            !streaming.load(Ordering::Relaxed),
-            "the in-flight flag is released for the retry"
-        );
+        assert!(!turn.is_open(), "the turn is closed for the retry");
     }
 
     /// Spawn the real fulfillment ingestion reader over a bare channel and
@@ -1118,16 +1283,20 @@ mod tests {
     async fn run_reader(
         o: &Oracle,
         responses: Vec<ProviderResponse>,
-    ) -> (Arc<FulfillmentThrottle>, Arc<AtomicBool>) {
+    ) -> (Arc<FulfillmentThrottle>, FulfillmentTurn) {
         let ctx = runtime_ctx(o);
         let throttle = Arc::new(FulfillmentThrottle::new());
-        let streaming = Arc::new(AtomicBool::new(true));
+        // In flight with no request row to name — the anchor-specific test
+        // opens the turn on a real request row instead.
+        let turn = FulfillmentTurn::new();
+        let seam = turn.bind();
+        turn.open(None);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let reader = tokio::spawn(run_fulfillment_ingestion(
             o.ctx.conversation_id,
             ctx,
             rx,
-            Arc::clone(&streaming),
+            seam,
             Arc::clone(&throttle),
         ));
         for response in responses {
@@ -1135,7 +1304,7 @@ mod tests {
         }
         drop(tx);
         reader.await.unwrap();
-        (throttle, streaming)
+        (throttle, turn)
     }
 
     async fn recorded_title(o: &Oracle) -> Option<String> {
@@ -1149,13 +1318,227 @@ mod tests {
             .and_then(|b| b.fields["content"].as_str().map(str::to_string))
     }
 
+    /// The second ledger's turn product carries its OWN ledger's anchor: the
+    /// title response names the request row whose owed fulfillment dispatched
+    /// the derivation stream — the same rules as the block ledger's products,
+    /// and the settle clears the seam.
+    #[tokio::test]
+    async fn the_title_response_anchors_on_its_request_row() {
+        let o = Oracle::new().await;
+        let request = title_request(&o).await;
+
+        let ctx = runtime_ctx(&o);
+        let throttle = Arc::new(FulfillmentThrottle::new());
+        let turn = FulfillmentTurn::new();
+        let seam = turn.bind();
+        turn.open(Some(request));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let reader = tokio::spawn(run_fulfillment_ingestion(
+            o.ctx.conversation_id,
+            ctx,
+            rx,
+            seam,
+            Arc::clone(&throttle),
+        ));
+        tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
+            text: "A Title".into(),
+        }))
+        .unwrap();
+        tx.send(ProviderResponse::Done).unwrap();
+        drop(tx);
+        reader.await.unwrap();
+
+        let ledger = o
+            .ctx
+            .store
+            .list_metadata_blocks(o.ctx.conversation_id)
+            .await
+            .unwrap();
+        let response = ledger
+            .iter()
+            .find(|b| b.block_type == "title_response")
+            .expect("the title derived");
+        assert_eq!(
+            o.ctx
+                .store
+                .metadata_dispatch_anchor(response.id)
+                .await
+                .unwrap(),
+            Some(request),
+            "the response anchors on its request row"
+        );
+        assert_eq!(
+            o.ctx.store.metadata_dispatch_anchor(request).await.unwrap(),
+            None,
+            "the request starts the identity — a policy append carries none"
+        );
+        assert_eq!(
+            response.dispatch_anchor, None,
+            "the surfaced block shape never carries the metadata id space"
+        );
+        assert_eq!(turn.anchor(), None, "the settle cleared the seam");
+        assert!(!turn.is_open(), "the settle closed the turn");
+    }
+
+    /// A provider module whose binding is dead on arrival: `bind` drops the
+    /// request end immediately, so the cached tx reports closed and the next
+    /// [`ensure_provider`] call binds fresh. Each binding's response sender is
+    /// captured, which lets the test drive a PREDECESSOR binding's reader
+    /// after a rebind has already happened.
+    struct DeadBindStub {
+        response_ends:
+            Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<ProviderResponse>>>>,
+    }
+
+    impl ProviderModule for DeadBindStub {
+        fn type_id(&self) -> &'static str {
+            "dead-bind-stub"
+        }
+        fn display_name(&self) -> &'static str {
+            "Dead-bind stub"
+        }
+        fn description(&self) -> &'static str {
+            "drops its request end at bind"
+        }
+        fn get_config(
+            &self,
+            _provider_id: String,
+        ) -> BoxFuture<'_, Result<Option<Value>, StoreError>> {
+            Box::pin(async { Ok(Some(serde_json::json!({}))) })
+        }
+        fn save_config(
+            &self,
+            _provider_id: String,
+            _config: Value,
+        ) -> BoxFuture<'_, Result<(), StoreError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn delete_config(&self, _provider_id: String) -> BoxFuture<'_, Result<(), StoreError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn summary(
+            &self,
+            _provider_id: String,
+        ) -> BoxFuture<'_, Result<Option<String>, StoreError>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn list_models(&self, _config: Value) -> BoxFuture<'_, Result<Vec<ModelInfo>, LlmError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn bind(
+            &self,
+            _conversation_id: i64,
+            _provider_id: String,
+            _config: Value,
+        ) -> (ProviderTx, ProviderRx) {
+            let (req_tx, _dropped) = tokio::sync::mpsc::unbounded_channel();
+            let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel();
+            self.response_ends.lock().unwrap().push(resp_tx);
+            (req_tx, resp_rx)
+        }
+    }
+
+    /// The seam is scoped per BINDING — the dispatch state's own rule: the
+    /// bind hands each reader a seam that reads and closes only the turn its
+    /// own generation opened. A predecessor reader draining a full turn late
+    /// therefore writes its OWN turn's anchor, and its close settles its own
+    /// turn — the live turn stays open with its anchor intact.
+    #[tokio::test]
+    async fn a_rebind_replaces_the_seam_against_late_predecessor_writes() {
+        let o = Oracle::new().await;
+        let conv = o.ctx.conversation_id;
+        // The oracle's conversation names provider "p1"; register it as the
+        // dead-bind type so every ensure call binds fresh.
+        o.ctx
+            .store
+            .save_provider_instance(ProviderInstance {
+                id: "p1".into(),
+                provider_type: "dead-bind-stub".into(),
+                name: "Dead-bind stub".into(),
+            })
+            .await
+            .unwrap();
+        let response_ends = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = ProviderRegistry::new();
+        registry.register(Box::new(DeadBindStub {
+            response_ends: Arc::clone(&response_ends),
+        }));
+        let ctx = RuntimeContext::<BlockKind, CoreEvent>::new(
+            o.ctx.store.clone(),
+            Arc::clone(&o.ctx.bus),
+            Arc::new(registry),
+            Arc::new(ToolRegistry::new()),
+        );
+
+        let throttle = Arc::new(FulfillmentThrottle::new());
+        let mut cached_tx = None;
+        let turn = FulfillmentTurn::new();
+
+        // Binding one opens turn one…
+        ensure_provider(conv, &ctx, &mut cached_tx, &turn, &throttle)
+            .await
+            .expect("first bind");
+        turn.open(Some(1));
+        let predecessor = response_ends.lock().unwrap().first().unwrap().clone();
+
+        // …its channel is already dead, so the next delivery re-binds and
+        // turn two opens under the new binding's generation.
+        ensure_provider(conv, &ctx, &mut cached_tx, &turn, &throttle)
+            .await
+            .expect("rebind");
+        turn.open(Some(2));
+
+        // The predecessor's reader drains a whole title turn late.
+        predecessor
+            .send(ProviderResponse::Event(StreamEvent::TextDelta {
+                text: "Late Title".into(),
+            }))
+            .unwrap();
+        predecessor.send(ProviderResponse::Done).unwrap();
+        drop(predecessor);
+
+        // The late reader has no handle to await, so poll for its write.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let response = loop {
+            let ledger = o.ctx.store.list_metadata_blocks(conv).await.unwrap();
+            if let Some(block) = ledger
+                .into_iter()
+                .find(|b| b.block_type == "title_response")
+            {
+                break block;
+            }
+            assert!(Instant::now() < deadline, "the late reader never wrote");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(
+            o.ctx
+                .store
+                .metadata_dispatch_anchor(response.id)
+                .await
+                .unwrap(),
+            Some(1),
+            "the late write carries its own turn's anchor, not the successor's"
+        );
+        assert_eq!(
+            turn.anchor(),
+            Some(2),
+            "the predecessor's close settled its own turn, not the live one"
+        );
+        assert!(
+            turn.is_open(),
+            "the live turn's in-flight state survives the predecessor's close \
+             — a shared flag was exactly what a late close used to clear"
+        );
+    }
+
     /// A reconnect's `Restart` clears the accumulated partial: the
     /// regenerated stream replays the title from its start, so a kept partial
     /// would have the whole replay concatenated onto it.
     #[tokio::test]
     async fn restart_clears_the_partial_title_before_the_replay() {
         let o = Oracle::new().await;
-        let (throttle, _streaming) = run_reader(
+        let (throttle, _turn) = run_reader(
             &o,
             vec![
                 ProviderResponse::Event(StreamEvent::TextDelta {
@@ -1202,7 +1585,7 @@ mod tests {
         assert_eq!(recorded_title(&o).await.as_deref(), Some("A Final Title"));
 
         let o = Oracle::new().await;
-        let (throttle, streaming) = run_reader(
+        let (throttle, turn) = run_reader(
             &o,
             vec![
                 ProviderResponse::Event(StreamEvent::ContentFinal {
@@ -1219,7 +1602,7 @@ mod tests {
             Some("A Restated Title")
         );
         assert!(!throttle.suppressed(), "no failure was recorded");
-        assert!(!streaming.load(Ordering::Relaxed), "the stream settled");
+        assert!(!turn.is_open(), "the stream settled");
     }
 
     /// The title request carries PROSE only: user/assistant text through the

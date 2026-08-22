@@ -61,6 +61,28 @@ pub struct Block {
     pub block_type: String,
     /// Creation timestamp, in the store's text form.
     pub created_at: String,
+    /// The dispatch identity (2026-08-22): the id of the block whose owed turn
+    /// dispatched the stream this block is a product of — for every round of
+    /// one tool conversation, the ORIGINAL summoning frontier, inherited
+    /// across continuation rounds. `None` is the documented answer for
+    /// everything that is not a turn's product: a message, a consumer append,
+    /// an out-of-band tool call. Recorded at insert by the framework's own
+    /// write paths; the public write surface never sets it.
+    ///
+    /// The id is the BLOCK ledger's id space, always: it resolves through
+    /// [`Store::find_block`](crate::store::Store::find_block) and nothing
+    /// else. A row surfaced from the metadata ledger
+    /// ([`Store::list_metadata_blocks`](crate::store::Store::list_metadata_blocks))
+    /// carries `None` here even though its anchoring is stored — its anchor
+    /// names a metadata row, and one field cannot speak two id spaces without
+    /// handing `find_block` a confidently wrong answer.
+    ///
+    /// The anchor names the turn's DISPATCH identity, never the newest author
+    /// in the request: a message absorbed while a turn is open is answered by
+    /// the turn the close dispatches, and that turn's products anchor on the
+    /// PREVIOUS summoning frontier even though the dispatched request carries
+    /// the absorbed text.
+    pub dispatch_anchor: Option<i64>,
     /// The kind-specific payload, flattened into the serialized form.
     pub fields: serde_json::Map<String, Value>,
 }
@@ -71,8 +93,10 @@ pub struct Block {
 /// with a different id, and nothing in the pipeline would report it.
 ///
 /// The set is fixed rather than derived from the header actually written, so a
-/// block whose role is absent is not a hole a payload can fill either.
-pub const RESERVED_FIELD_NAMES: [&str; 4] = ["id", "role", "type", "created_at"];
+/// block whose role is absent is not a hole a payload can fill either — the
+/// dispatch anchor included (2026-08-22): a payload cannot forge a turn
+/// identity the header never recorded.
+pub const RESERVED_FIELD_NAMES: [&str; 5] = ["id", "role", "type", "created_at", "dispatch_anchor"];
 
 impl Serialize for Block {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -84,6 +108,9 @@ impl Serialize for Block {
         }
         map.serialize_entry("type", &self.block_type)?;
         map.serialize_entry("created_at", &self.created_at)?;
+        if let Some(anchor) = self.dispatch_anchor {
+            map.serialize_entry("dispatch_anchor", &anchor)?;
+        }
         for (k, v) in &self.fields {
             if RESERVED_FIELD_NAMES.contains(&k.as_str()) {
                 tracing::warn!(
@@ -199,6 +226,7 @@ mod tests {
         fields.insert("type".into(), Value::from("tool_call"));
         fields.insert("role".into(), Value::from("assistant"));
         fields.insert("created_at".into(), Value::from("1999-12-31T23:59:59Z"));
+        fields.insert("dispatch_anchor".into(), Value::from(7));
         fields.insert("content".into(), Value::from("hello"));
 
         let block = Block {
@@ -206,6 +234,7 @@ mod tests {
             role: Some(Role::User),
             block_type: "text".into(),
             created_at: "2026-08-20T10:00:00Z".into(),
+            dispatch_anchor: None,
             fields,
         };
 
@@ -222,6 +251,10 @@ mod tests {
             value["content"],
             Value::from("hello"),
             "a payload key of its own still travels"
+        );
+        assert!(
+            !value.as_object().unwrap().contains_key("dispatch_anchor"),
+            "a payload cannot forge a turn identity the header never recorded"
         );
 
         // The text form is where the collision actually happened: a duplicate

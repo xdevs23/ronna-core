@@ -13,9 +13,10 @@
 //! library has no installed base**: there is no database anywhere carrying an
 //! older shape, so there is no upgrade path to preserve, and one is not
 //! invented here. The next reader will wonder where the history went, which is
-//! why this paragraph exists. The `user_version` mechanism itself stays: the
-//! moment this library ships to a consumer, step two is appended and the
-//! counter does its job.
+//! why this paragraph exists. The `user_version` mechanism itself stays, and
+//! it earned its keep on 2026-08-22: the library now has an installed base (the
+//! first consumer's ledgers), so the dispatch-anchor column arrived as step
+//! two, and every later change to the shipped schema arrives the same way.
 //!
 //! Six tests that proved the old array's *upgrade* steps could not come across
 //! with it: they replayed historical on-disk shapes that never existed here.
@@ -47,7 +48,9 @@ use rusqlite::Connection;
 ///   - Range-based quoting: start and end block plus character positions.
 ///   - Derived, never stored. A fact that can be folded from the ledger is not
 ///     a column — which is why the conversation row carries no state, no
-///     inactive reason and no title.
+///     inactive reason and no title. One recorded exception (2026-08-22): the
+///     dispatch anchor in v2, an insert-time decision whose derivation from
+///     stored shape was adversarially refuted — see the v2 entry.
 const MIGRATIONS: &[&str] = &[
     // v1: the block-first relational schema.
     "
@@ -318,6 +321,19 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_attachment_ranges_id
         ON attachment_ranges(attachment_id);
     ",
+    // v2 (2026-08-22): the dispatch anchor — one nullable header column naming
+    // the block whose owed turn dispatched this block's stream, plus its
+    // counterpart on the second ledger, where a response row anchors on the
+    // request row of its own ledger. Written by the framework's own insert
+    // paths only; NULL for everything that is not a turn's product. This is a
+    // deliberate exception to "derived, never stored": reconstructing the
+    // summoning frontier from stored shape was adversarially refuted at the
+    // first consumer (three proven escalations closed the question), so the
+    // dispatch decision is recorded at the one moment it is known.
+    "
+    ALTER TABLE blocks ADD COLUMN dispatch_anchor INTEGER REFERENCES blocks(id);
+    ALTER TABLE metadata ADD COLUMN dispatch_anchor INTEGER REFERENCES metadata(id);
+    ",
 ];
 
 /// Apply every unapplied step, advancing `user_version` as each lands.
@@ -472,6 +488,49 @@ mod tests {
             columns.contains(&"last_processed_block_id".to_string()),
             "the two cursors coexist as separate columns"
         );
+    }
+
+    /// A populated v1 database — the shipped shape — upgrades in place: only
+    /// step two runs, the existing rows survive, and every pre-column row
+    /// reads back a NULL anchor. The library's first real upgrade, so the
+    /// version gate is exercised against data, not just a fresh file.
+    #[test]
+    fn a_populated_v1_database_upgrades_to_v2_in_place() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute("INSERT INTO blocks (block_type) VALUES ('text')", [])
+            .unwrap();
+
+        run(&conn).unwrap();
+        assert_eq!(version(&conn), u32::try_from(MIGRATIONS.len()).unwrap());
+        let anchor: Option<i64> = conn
+            .query_row("SELECT dispatch_anchor FROM blocks WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(anchor, None, "a pre-column row is not a turn's product");
+    }
+
+    /// v2: the dispatch anchor rides the block header, and the second ledger
+    /// carries its own — both nullable, both defaulting to NULL, so every row
+    /// that predates the column reads back as "not a turn's product".
+    #[test]
+    fn the_dispatch_anchor_columns_are_present_and_nullable() {
+        let conn = migrated();
+        assert!(table_columns(&conn, "blocks").contains(&"dispatch_anchor".to_string()));
+        assert!(table_columns(&conn, "metadata").contains(&"dispatch_anchor".to_string()));
+
+        // A pre-column row shape — the insert names no anchor — lands as NULL.
+        conn.execute("INSERT INTO blocks (block_type) VALUES ('text')", [])
+            .unwrap();
+        let anchor: Option<i64> = conn
+            .query_row("SELECT dispatch_anchor FROM blocks WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(anchor, None);
     }
 
     /// The date marker's content table.

@@ -211,13 +211,38 @@ impl Store {
     /// blocks shared with a fork survive and are collected by
     /// [`gc_orphan_blocks`](Store::gc_orphan_blocks) once nothing links them.
     ///
+    /// Dispatch anchors pointing INTO the deleted conversation are nulled in
+    /// the same transaction (2026-08-22): a fork's kept cross-conversation
+    /// anchor is a reference the collector honors, so left standing it would
+    /// keep the deleted conversation's blocks alive forever — deletion that
+    /// cannot delete — and let a provenance read cross into a conversation
+    /// that no longer exists. Null is the documented answer a reader already
+    /// folds; an anchor whose target is junction-shared with a SURVIVING
+    /// conversation stays, because its target remains that conversation's
+    /// readable history.
+    ///
     /// # Errors
     ///
     /// If the delete fails or the store's actor has stopped.
     pub async fn delete_conversation(&self, id: i64) -> Result<(), StoreError> {
         self.run(move |conn| {
-            conn.execute("DELETE FROM conversations WHERE id = ?1", [id])?;
-            Ok(())
+            transact(conn, |tx| {
+                tx.execute(
+                    "UPDATE blocks SET dispatch_anchor = NULL
+                     WHERE dispatch_anchor IN (
+                         SELECT cb.block_id FROM conversation_blocks cb
+                         WHERE cb.conversation_id = ?1
+                           AND NOT EXISTS (
+                               SELECT 1 FROM conversation_blocks survivor
+                               WHERE survivor.block_id = cb.block_id
+                                 AND survivor.conversation_id != ?1
+                           )
+                     )",
+                    [id],
+                )?;
+                tx.execute("DELETE FROM conversations WHERE id = ?1", [id])?;
+                Ok(())
+            })
         })
         .await
     }

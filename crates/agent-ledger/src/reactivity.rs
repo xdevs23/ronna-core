@@ -149,6 +149,22 @@ impl<T> WriteSignal<T> {
         *self.inner.value.lock().unwrap() = value;
         wake(&self.inner.subscribers);
     }
+
+    /// Mutate the value in place and wake every subscriber, changed or not.
+    /// For writers that derive the next value from the current one — a
+    /// counter, an accumulation — which a write-half-only holder could
+    /// otherwise not do without shadowing the value beside the signal.
+    ///
+    /// # Panics
+    ///
+    /// If a subscriber list or the value lock was poisoned by a panic.
+    pub fn update(&self, mutate: impl FnOnce(&mut T)) {
+        {
+            let mut guard = self.inner.value.lock().unwrap();
+            mutate(&mut guard);
+        }
+        wake(&self.inner.subscribers);
+    }
 }
 
 impl<T: PartialEq> WriteSignal<T> {

@@ -22,10 +22,36 @@ use tracing::{info, warn};
 use crate::agency::{AgencyCtx, BlockKind, FromBlock, GateDecision, RuntimeKind, ToolCall};
 use crate::block::{Block, Role};
 use crate::bus::RuntimeEvent;
-use crate::store::{StoreError, ToolCallInsert};
+use crate::store::{BlockDestination, StoreError, ToolCallInsert};
 
 use super::admission::{ApprovalState, approval_state};
 use super::{ToolContext, ToolHandler, ToolOutcome, ToolRegistry};
+
+/// Where a recorded call came from — the second half of the runner's insert
+/// seam beside the call's own facts.
+///
+/// The default is the public out-of-band form: no streamed tail to replace,
+/// no dispatch anchor — the anchor is written by the framework's own paths
+/// only, and NULL is the documented out-of-band answer. The streamed form is
+/// `pub(crate)` by construction: only the streaming reader can name the tail
+/// its final call replaces and the anchor its per-turn seam holds.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CallOrigin {
+    pub(crate) replaces_streaming: Option<i64>,
+    pub(crate) dispatch_anchor: Option<i64>,
+}
+
+impl CallOrigin {
+    /// The streaming reader's finalization: the streamed-input tail this
+    /// final call replaces (deleted in the same transaction), and the open
+    /// turn's dispatch anchor.
+    pub(crate) fn streamed(replaces_streaming: Option<i64>, dispatch_anchor: Option<i64>) -> Self {
+        Self {
+            replaces_streaming,
+            dispatch_anchor,
+        }
+    }
+}
 
 /// The admission chokepoint, holding the registry it resolves calls against.
 ///
@@ -153,8 +179,11 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
     /// is not orchestration. The call dangles until the next unlatched tick,
     /// where the cursor's re-drive heals it.
     ///
-    /// `replaces_streaming` is the streamed-input tail this final call replaces,
-    /// deleted in the same transaction.
+    /// `origin` carries where the call came from: the default is the public
+    /// out-of-band form, which opened no streamed tail and records no anchor —
+    /// the documented NULL a consumer folds to its floor. The streaming
+    /// reader's finalization constructs the crate-only streamed form, naming
+    /// the tail it replaces and the turn's anchor from its per-turn seam.
     ///
     /// # Errors
     ///
@@ -167,7 +196,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
         tool_call_id: String,
         name: String,
         input: String,
-        replaces_streaming: Option<i64>,
+        origin: CallOrigin,
     ) -> Result<i64, StoreError> {
         let interactive = self
             .registry
@@ -176,7 +205,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
         let block_id = ctx
             .store
             .insert_tool_call_block(
-                ctx.conversation_id,
+                BlockDestination::anchored(ctx.conversation_id, origin.dispatch_anchor),
                 Role::Assistant,
                 ToolCallInsert {
                     tool_call_id,
@@ -184,7 +213,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
                     input,
                     interactive,
                 },
-                replaces_streaming,
+                origin.replaces_streaming,
             )
             .await?;
         if latched {

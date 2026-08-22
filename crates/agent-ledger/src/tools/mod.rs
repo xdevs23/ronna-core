@@ -65,7 +65,7 @@ pub mod admission;
 pub mod runner;
 
 pub use admission::submit_approval;
-pub use runner::ToolRunner;
+pub use runner::{CallOrigin, ToolRunner};
 
 /// What one invocation of a tool handler produced.
 pub enum ToolOutcome {

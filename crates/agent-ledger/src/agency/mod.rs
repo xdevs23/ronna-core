@@ -313,6 +313,7 @@ pub fn check_descriptor_durability<K: Agency + FromBlock>(
                 role: None,
                 block_type: (*kind).to_owned(),
                 created_at: String::new(),
+                dispatch_anchor: None,
                 fields: serde_json::Map::new(),
             };
             let durable = K::from_block(&synthetic).durable();

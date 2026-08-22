@@ -168,6 +168,25 @@ pub struct Outcome {
     pub awaiting: Option<Awaiting>,
 }
 
+/// The owed-turn decision over one tail block, written once: `Some` with the
+/// dispatch's anchor when the tail awaits the model — a turn product's own
+/// anchor inherited, a null-anchored frontier (a message, a consumer append)
+/// starting a new identity — and `None` when the tail owes nothing.
+///
+/// Two sites answer with this rule and they are the same rule ON DIFFERENT
+/// SNAPSHOTS by design (2026-08-22): the scheduler's drive decides it on the
+/// fresh post-drive tail to know whether to signal, and the actor's delivery
+/// re-decides it on the very snapshot the model request is built from —
+/// which is where a signal that went stale stands down. Carrying the drive's
+/// answer to the delivery inside the signal was rejected in the slice's
+/// decision record: the ledger can move between the two reads, and a
+/// signal-borne value races the very appends the dispatch identity exists to
+/// record.
+pub(crate) fn frontier_owes_turn<K: RuntimeKind>(tail: &Block) -> Option<i64> {
+    (K::from_block(tail).awaiting() == Some(Awaiting::Model))
+        .then(|| tail.dispatch_anchor.unwrap_or(tail.id))
+}
+
 /// The conversation instantiation of [`drive_ledger`] — the turn scheduler's
 /// drive.
 ///
@@ -257,12 +276,17 @@ pub async fn drive_ledger<K: RuntimeKind, E: RuntimeEvent>(
 
     // The frontier, off the ledger as it stands NOW — not off the snapshot the
     // loop above walked. `parked` stays the drive's own answer: it is a fact
-    // about what this drive reached, not about the current tail.
-    let awaiting = source
-        .tail(ctx)
-        .await?
-        .and_then(|tail| K::from_block(&tail).awaiting());
-    let owes_turn = !parked && awaiting == Some(Awaiting::Model);
+    // about what this drive reached, not about the current tail. The owed
+    // turn itself is the shared frontier rule, so this site and the actor's
+    // delivery-time re-check cannot drift.
+    let tail = source.tail(ctx).await?;
+    let awaiting = tail
+        .as_ref()
+        .and_then(|tail| K::from_block(tail).awaiting());
+    let owes_turn = !parked
+        && tail
+            .as_ref()
+            .is_some_and(|tail| frontier_owes_turn::<K>(tail).is_some());
 
     Ok(Outcome {
         cursor,

@@ -5,7 +5,7 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::types::{ApprovalChoice, denial_error_text};
 
-use super::messages::insert_block;
+use super::messages::{BlockDestination, anchor_of, insert_block};
 use super::tool_calls::call_resolution_exists;
 use super::{Store, StoreError, transact};
 
@@ -61,7 +61,14 @@ impl Store {
                 if already_covered {
                     return Ok(None);
                 }
-                let block_id = insert_block(tx, conversation_id, "approval_request")?;
+                // The approval chain is a turn product of the call it covers:
+                // the request copies the call's dispatch anchor at the write.
+                let anchor = anchor_of(tx, for_block_id)?;
+                let block_id = insert_block(
+                    tx,
+                    BlockDestination::anchored(conversation_id, anchor),
+                    "approval_request",
+                )?;
                 tx.execute(
                     "INSERT INTO block_approval_request (block_id, for_block_id) VALUES (?1, ?2)",
                     params![block_id, for_block_id],
@@ -175,7 +182,11 @@ impl Store {
                 })
                 .transpose()?;
 
-            let block_id = insert_block(&tx, conversation_id, "approval_decision")?;
+            // The decision copies the covered call's anchor — the same
+            // identity the request carries, read from the call row itself so
+            // the two cannot drift.
+            let anchor = anchor_of(&tx, call_block_id)?;
+            let block_id = insert_block(&tx, BlockDestination::anchored(conversation_id, anchor), "approval_decision")?;
             tx.execute(
                 "INSERT INTO block_approval_decision
                      (block_id, for_block_id, decision, system_reason, user_reason)
@@ -190,7 +201,7 @@ impl Store {
             )?;
 
             if let (Some(error), Some(tool_call_id)) = (denial_error, denied_call) {
-                let error_block_id = insert_block(&tx, conversation_id, "tool_error")?;
+                let error_block_id = insert_block(&tx, BlockDestination::anchored(conversation_id, anchor), "tool_error")?;
                 tx.execute(
                     "INSERT INTO block_tool_error (block_id, tool_call_id, error, source_block_id)
                      VALUES (?1, ?2, ?3, ?4)",
@@ -210,7 +221,7 @@ mod tests {
     use serde_json::Value;
 
     use crate::block::Role;
-    use crate::store::{Store, ToolCallInsert};
+    use crate::store::{BlockDestination, Store, ToolCallInsert};
     use crate::types::ApprovalChoice;
 
     async fn fixture() -> (Store, i64, i64) {
@@ -272,6 +283,67 @@ mod tests {
         assert_eq!(dec.fields["decision"], Value::from("approved"));
         assert_eq!(dec.fields["system_reason"], Value::Null);
         assert_eq!(dec.fields["user_reason"], Value::from("looks safe"));
+    }
+
+    /// The copy-from-call writer class over the approval chain: the request,
+    /// the decision and a denial's tool error all copy the covered call's
+    /// dispatch anchor at their writes — one identity per turn, read off the
+    /// durable call row each time so the three cannot drift.
+    #[tokio::test]
+    async fn the_approval_chain_copies_the_calls_dispatch_anchor() {
+        let store = Store::in_memory().unwrap();
+        let conv = store
+            .create_conversation("p".into(), "m".into(), "m".into(), String::new())
+            .await
+            .unwrap();
+        let summoner = store
+            .insert_text_block(conv, Role::User, "summon".into())
+            .await
+            .unwrap();
+        let call = store
+            .insert_tool_call_block(
+                BlockDestination::anchored(conv, Some(summoner)),
+                Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call_1".into(),
+                    name: "danger".into(),
+                    input: "{}".into(),
+                    interactive: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let request = store
+            .insert_approval_request_block(conv, call)
+            .await
+            .unwrap()
+            .expect("the first request writes");
+        let decision = store
+            .insert_approval_decision_block(
+                conv,
+                request,
+                ApprovalChoice::Denied,
+                None,
+                Some("not like this".into()),
+            )
+            .await
+            .unwrap();
+
+        let blocks = store.list_blocks(conv).await.unwrap();
+        let anchor_of = |id: i64| blocks.iter().find(|b| b.id == id).unwrap().dispatch_anchor;
+        assert_eq!(anchor_of(request), Some(summoner), "the request copies");
+        assert_eq!(anchor_of(decision), Some(summoner), "the decision copies");
+        let error = blocks
+            .iter()
+            .find(|b| b.block_type == "tool_error")
+            .expect("the denial resolved the call");
+        assert_eq!(
+            error.dispatch_anchor,
+            Some(summoner),
+            "the denial's error copies too"
+        );
     }
 
     /// The conditional append: a second decision on the same request fails
