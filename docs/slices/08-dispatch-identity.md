@@ -40,6 +40,17 @@ turn, which is why they are one slice.
   consumer's one-step read holds for round one and round ten alike. Rejected: a
   per-dispatch anchor with chase-the-chain reads (re-imports the shape walking
   this slice exists to end).
+  Amended 2026-08-22, after the consumer's adversarial verification proved the
+  tail-derived inheritance insufficient: a message absorbed between a round's
+  result and the continuation dispatch becomes the tail, the continuation
+  re-anchors on it, and the original summoner falls out of the turn's identity —
+  a proven escalation in the consumer's gate. The inheritance is therefore
+  ACTOR STATE, as this decision's own wording anticipated: the actor holds the
+  open turn's anchor from its first dispatch until a close that ends the turn
+  (an end-turn stop, the error edge, the interrupt teardown — a tool-use stop
+  closes the stream but leaves the turn open), and every continuation dispatch
+  reuses the held anchor regardless of what the tail is. A fresh turn resolves
+  from the tail as before.
 - **One nullable header column, written per writer class, 2026-08-22.**
   `dispatch_anchor` on the block header, written at insert through the shared
   header helper, null for everything that is not a turn's product. Per class:
