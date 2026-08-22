@@ -51,6 +51,74 @@ turn, which is why they are one slice.
   closes the stream but leaves the turn open), and every continuation dispatch
   reuses the held anchor regardless of what the tail is. A fresh turn resolves
   from the tail as before.
+  Refined 2026-08-22, after the consumer's fifth adversarial break proved the
+  unconditional hold leaks: the close is the identity's only release site, so
+  a tool-use close whose continuation never comes — a truncated tool
+  lifecycle the reader discards records nothing owing — held the identity
+  forever, and the next UNRELATED summons inherited it (over-declined tool
+  admission, and an idle interrupt stamping a dead turn's summoner). A
+  tool-use close therefore keeps the identity only while a continuation is
+  genuinely due on the close's own snapshot: an unresolved tool call bearing
+  this turn's anchor exists — a recorded call whose result is pending resumes
+  the turn, so a message absorbed before the result cannot re-anchor it — or
+  the frontier owes the model; otherwise the close ends the turn like every
+  other edge, and a truncated lifecycle that recorded no call ends it.
+  Rejected: reusing the held anchor only for turn-product frontiers — the
+  absorbed message is exactly a non-turn-product frontier, so that re-opens
+  the proven escalation the hold exists to close.
+  Amended 2026-08-23, after the consumer's sixth adversarial break proved the
+  refinement's two arms leak in both directions. The frontier arm held a dead
+  identity for someone ELSE'S fresh summons: a truncated round with a message
+  absorbed in its window makes the absorbed message the close's tail, the
+  tail owes the model, and the arm kept the identity on exactly that — so the
+  fresh summons' answer anchored on the dead turn. And the unresolved-call
+  arm counted a parked INTERACTIVE call — and a call with an empty id, which
+  no outcome can ever match — as an owed continuation forever, pinning the
+  identity indefinitely. The release rule replacing both arms: a tool-use
+  close keeps the identity iff the count of tool results and tool errors
+  anchored on the turn exceeds the count its dispatches have already
+  answered — the actor records that mark beside the held identity, from each
+  dispatch's own snapshot — or an unresolved, non-interactive tool call with
+  a non-empty call id, anchored on the turn, exists in the close's snapshot.
+  The frontier arm is deleted: a model-owed tail is someone's summons, not
+  evidence of our continuation. A parked interactive call ends the identity;
+  when its approval later resolves, the outcome carries the turn's anchor and
+  the tail inheritance re-attaches. The answered mark is kept in outcome
+  units, not as a dispatch tally (decided at implementation, 2026-08-23): one
+  dispatch can answer several outcomes at once, and a turn resumed off its
+  outcome tail — an approval resolution, a restart recovery — has that
+  outcome answered by the resuming dispatch itself; a per-dispatch increment
+  undercounts the first and overcounts the second, and each error re-opens a
+  proven leak shape. Rejected: keeping the frontier arm for turn-product
+  tails only (the parked shapes still pin the identity forever); ending on
+  every tool-use close (re-opens the escalation the hold exists to close).
+  Amended 2026-08-23, after the consumer's seventh verified break — a
+  regression the sixth fix's release opened, plus a pre-existing restart
+  hole — proved the FRESH-turn resolution reads too little. It read only
+  the tail, so a released turn — a parked interactive call resumed by its
+  approval, a restart recovering a round — lost its identity whenever a
+  message was absorbed behind its outcome: the continuation anchored on
+  the absorbed line, and in the consumer that is the original escalation
+  again. The fresh resolution is now LEDGER-FIRST: at a dispatch with no
+  held identity, a model-owed tail carrying a null anchor walks the
+  dispatch snapshot backward for the newest tool outcome (a result or an
+  error), and if that outcome's turn is UNANSWERED — no assistant text
+  block and no status block with the same anchor after it in the
+  snapshot — the dispatch inherits the outcome's anchor; otherwise the
+  tail starts a fresh identity as before. A non-null-anchored tail
+  inherits as before. This DEMOTES the held identity to a consistency
+  cache over a ledger-derivable fact: a fresh actor over the same
+  ledger — the restart shape — resolves the same turn a live actor was
+  holding, and the cache's job is consistency within a process, not
+  truth. Accepted residual, documented at the rule: a turn ended by an
+  unstamped store-failure error leaves no status marker, so its outcome
+  may over-attach one later summons — over-decline direction in the
+  consumer's authority fold, self-healing at that turn's close, whose own
+  text or status stamps the anchor. Rejected: re-holding the identity
+  across the parked close (the sixth break proved exactly that hold pins
+  it forever); a persisted turn-state row (a second record of a fact the
+  blocks already decide — the restart shape is the proof the blocks
+  suffice).
 - **One nullable header column, written per writer class, 2026-08-22.**
   `dispatch_anchor` on the block header, written at insert through the shared
   header helper, null for everything that is not a turn's product. Per class:
@@ -88,6 +156,29 @@ turn, which is why they are one slice.
   close deterministically, never by luck. Rejected: closing at message-end (the
   proven defect); a store-level lock (the actor is the one dispatcher);
   first-tool-lifecycle-end as the edge (several ends per turn are legal).
+
+- **Turn closure is a stored fact, 2026-08-23 — the design review's verdict.**
+  Eight adversarial rounds broke every attempt to DERIVE "this turn is over"
+  from side effects: tail shapes, machinery classes, held actor state, outcome
+  counters, and marker-inference each failed on the edge that left no side
+  effect behind (the eighth break's four shapes: a parked call in a later
+  round, a lost later round, the abandoned close, the error edge — every one
+  ends a turn without writing a text or status, stranding its last outcome as
+  "unanswered forever" so it captures the next unrelated summons). The review
+  stops the derivation cycle: when a close ENDS a held identity while the
+  close's snapshot holds an unanswered outcome for that turn, the close
+  appends a status block anchored to the turn — the durable record of the
+  turn's end, the same primitive the first consumer's improvements list has
+  wanted since its live-model unit as the durable failed-turn record. The
+  unanswered-outcome walk already honors status markers, so no resolution
+  rule changes: the one place that knows the truth now writes it down. The
+  approval-resume stays correct by ordering — the marker answers only the
+  outcomes before it, and a later approval's outcome lands after it and
+  inherits as before. A restart mid-round writes no marker because the
+  tool-use close keeps the identity, so recovery inheritance is untouched.
+  Rejected: continuing to infer closure (eight refutations are the record);
+  a separate turn table (the status block IS the ledger's own shape for a
+  machine fact about a turn).
 
 ## What must hold
 
