@@ -47,4 +47,13 @@ decision records arrive with the code they describe.
 
 ## License
 
-GNU General Public License v3.0 or later. See [LICENSE](LICENSE).
+Copyright (C) 2026 Simão Gomes Viana
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See [LICENSE](LICENSE).
+
+The store and orchestration core is ported from
+[ronna-lightspeed](https://github.com/xdevs23/ronna-lightspeed) by the same
+author, relicensed to GPL-3.0-or-later.
