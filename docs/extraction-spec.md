@@ -32,8 +32,8 @@ Recorded here instead of in a changelog because these are the facts the plan now
    a consumer cannot append a block inside its own closure. Revision 1's shared-transaction
    decision named a capability that does not exist — and justified rejecting an alternative by
    an atomicity property the fork and approval paths do not currently implement either.
-4. **Licensing.** The source (ronna-lightspeed) is GPL-3.0; this port is relicensed by its author to GPL-3.0-or-later. Revision 1 declared MPL-2.0 without a
-   relicensing step. **Decided: the library stays GPL-3.0-or-later.** The maintainer's stated
+4. **Licensing.** The source (ronna-lightspeed) is GPL-3.0, and this port keeps it. Revision 1 declared MPL-2.0 without a
+   relicensing step. **Decided: the library is GPL-3.0-only, matching the source.** The maintainer's stated
    need is their own projects, so the adoption argument for weaker copyleft does not apply, and
    keeping the original terms removes the relicensing step and its consent record entirely.
 5. **Four modules were unclassified** and one whole sibling crate was unnamed. Nine
@@ -276,7 +276,7 @@ Stage 2 unless stated.
   provider, no model and no directory. *(Amended 2026-08-21, Stage 3: `open`/`in_memory`
   keep exactly this contract as the core-only form; the configured form `open_with` takes
   the path plus a `StoreConfig` of descriptors and consumer migrations, validated at open.)*
-- **AC11** The manifest declares GPL-3.0-or-later, the license file is present, and no moved
+- **AC11** The manifest declares GPL-3.0-only, the license file is present, and no moved
   file carries a conflicting header.
 - **AC12** *(Stage 2)* No moved test is dropped. Each slice's commit states the test count it
   brought and the running total against the 275 measured, and any test deliberately not ported
