@@ -25,6 +25,14 @@ pub struct HttpProviderConfig {
     pub api_key: String,
     /// An endpoint override, or `None` for the provider's own default.
     pub base_url: Option<String>,
+    /// The model slug for cheap background work — title derivation — or
+    /// `None` to run background work on each request's own main model. It
+    /// sits on the shared shape so every provider on this store persists it
+    /// whole; honoring it is each provider's own bind decision (2026-08-23:
+    /// the gateway provider does, because a hardcoded background slug there
+    /// crossed vendors and regions the operator never chose).
+    #[serde(default)]
+    pub lightweight_model: Option<String>,
 }
 
 /// One HTTP provider type's configuration table.
@@ -57,12 +65,20 @@ impl HttpProviderStore {
                 base_url    TEXT
             )"
         );
+        // v2: the background-work model column, appended instead of folded
+        // into the CREATE — installed bases carry the v1 shape, and the
+        // domain counter runs each domain's list once, in order, so a fresh
+        // database takes both steps and an installed one takes only this.
+        let alter_sql = format!("ALTER TABLE {table} ADD COLUMN lightweight_model TEXT");
         // The migration list is `&'static str` because a migration outlives the
         // handle that submitted it — the actor may still be running it after
         // this call returns. There is one of these per provider type per
         // process, so the leak is bounded by the number of provider types.
-        let leaked: &'static str = Box::leak(create_sql.into_boxed_str());
-        domain_migrate(&tx, domain, vec![leaked]).await?;
+        let migrations = vec![
+            Box::leak(create_sql.into_boxed_str()) as &'static str,
+            Box::leak(alter_sql.into_boxed_str()) as &'static str,
+        ];
+        domain_migrate(&tx, domain, migrations).await?;
         Ok(Self { tx, domain, table })
     }
 
@@ -78,12 +94,13 @@ impl HttpProviderStore {
         let table = self.table;
         domain_run(&self.tx, self.domain, move |conn| {
             conn.prepare(&format!(
-                "SELECT api_key, base_url FROM {table} WHERE provider_id = ?1"
+                "SELECT api_key, base_url, lightweight_model FROM {table} WHERE provider_id = ?1"
             ))?
             .query_row([&provider_id], |row| {
                 Ok(HttpProviderConfig {
                     api_key: row.get(0)?,
                     base_url: row.get(1)?,
+                    lightweight_model: row.get(2)?,
                 })
             })
             .optional()
@@ -106,13 +123,19 @@ impl HttpProviderStore {
         domain_run(&self.tx, self.domain, move |conn| {
             conn.execute(
                 &format!(
-                    "INSERT INTO {table} (provider_id, api_key, base_url)
-                     VALUES (?1, ?2, ?3)
+                    "INSERT INTO {table} (provider_id, api_key, base_url, lightweight_model)
+                     VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(provider_id) DO UPDATE SET
                          api_key = excluded.api_key,
-                         base_url = excluded.base_url"
+                         base_url = excluded.base_url,
+                         lightweight_model = excluded.lightweight_model"
                 ),
-                (&provider_id, &config.api_key, &config.base_url),
+                (
+                    &provider_id,
+                    &config.api_key,
+                    &config.base_url,
+                    &config.lightweight_model,
+                ),
             )?;
             Ok(())
         })

@@ -401,7 +401,15 @@ pub enum ModelSelector {
     /// Whatever this provider considers its cheap background model. The
     /// provider resolves it, because the answer changes as vendors delist
     /// models and a caller has no way to know.
-    Lightweight,
+    Lightweight {
+        /// The model the request's conversation is configured to run on —
+        /// the fallback for a provider with no background model of its own
+        /// to name. The request carries it because a hardcoded provider
+        /// fallback can silently send background work to a vendor or a
+        /// region the operator never chose; the main model is the one slug
+        /// the operator provably accepts.
+        main: String,
+    },
 }
 
 /// What a caller asks of a bound provider.

@@ -1,10 +1,13 @@
 //! The gateway provider: many vendors' models behind one chat-completions
 //! endpoint.
 //!
-//! It composes with the shared chat base and adds exactly two things of its
+//! It composes with the shared chat base and adds exactly three things of its
 //! own: the reasoning echo on assistant request messages, which this endpoint
-//! documents as required for keeping a tool-call chain intact, and a capability
-//! reading taken from each model's published reasoning descriptor.
+//! documents as required for keeping a tool-call chain intact; a capability
+//! reading taken from each model's published reasoning descriptor; and the
+//! background-model resolution — configured per instance, falling back to the
+//! request's own main model — documented on the module's private reader,
+//! `background_model`.
 //!
 //! The ranking headers the source of this code sent — a referring URL and a
 //! product title — are not here. They identify an application to the gateway's
@@ -18,21 +21,43 @@ use super::bind;
 use super::chat::{ChatProvider, WireModel, provider_from_config};
 use super::http_store::{HttpProviderConfig, HttpProviderStore};
 use super::types::{
-    CompletionRequest, LlmError, ModelInfo, ModelSelector, ProviderRx, ProviderTx,
-    ReasoningCapability, ReasoningLevel,
+    CompletionRequest, LlmError, Message, ModelInfo, ModelSelector, ProviderRx, ProviderTx,
+    ReasoningCapability, ReasoningLevel, ToolDefinition,
 };
 use super::{BoxFuture, ProviderModule};
 
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
-/// The slug used for cheap background work, such as deriving a title.
+/// The slug an instance's configuration names for cheap background work —
+/// title derivation — or `None` to run background work on the request's own
+/// main model.
 ///
-/// It must be a CURRENT, live listing. Its predecessor was delisted and then
-/// failed every background request with "no endpoints found" — a deterministic
-/// failure the retry loop hammered, because a delisted model looks exactly like
-/// a temporarily unavailable one. Verify any replacement against the gateway's
-/// public model list before landing it.
-pub const OPENROUTER_LIGHTWEIGHT_MODEL: &str = "google/gemini-3.1-flash-lite";
+/// The fallback is the main model ON PURPOSE (2026-08-23). This gateway
+/// fronts many vendors, so a hardcoded background slug silently sends
+/// background requests to a vendor and a region the operator never chose —
+/// audited in the wild as `google/gemini-3.1-flash-lite`, recorded here only
+/// as the id a deployment pinned to an EU model was shipping its title
+/// traffic to. The main model is the one slug the operator provably accepts,
+/// and background work is rare and small enough that its price on the main
+/// model is noise.
+///
+/// A configured slug must be a CURRENT, live listing. A delisted one fails
+/// every background request with "no endpoints found" — a deterministic
+/// failure the retry loop hammers, because a delisted model looks exactly
+/// like a temporarily unavailable one. Verify a slug against the gateway's
+/// public model list before configuring it.
+///
+/// Read leniently off the raw value the bind path already works on: a
+/// missing key, a non-string and a blank string all mean "not configured",
+/// and a padded slug is trimmed — configuration surfaces upstream own the
+/// loud refusals.
+fn background_model(config: &Value) -> Option<String> {
+    config["lightweight_model"]
+        .as_str()
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+        .map(str::to_string)
+}
 
 /// The chat base configured for this gateway.
 fn openrouter_provider(api_key: String, base_url: Option<String>) -> ChatProvider {
@@ -71,6 +96,35 @@ fn openrouter_reasoning(model: &WireModel) -> ReasoningCapability {
             ReasoningLevel::Medium,
             ReasoningLevel::High,
         ]),
+    }
+}
+
+/// The neutral request one bound turn is opened with.
+///
+/// It lives here, named, instead of inline in the bind closure, because what
+/// the bind path actually sends is exactly what a golden has to be able to
+/// pin — the model resolution above all: a specific selector is obeyed as
+/// spoken, and background work runs on the instance's configured
+/// [`background_model`] where there is one, otherwise on the request's own
+/// main model.
+fn turn_request(
+    selector: ModelSelector,
+    lightweight_model: Option<&str>,
+    messages: Vec<Message>,
+    tools: Vec<ToolDefinition>,
+    reasoning: Option<ReasoningLevel>,
+) -> CompletionRequest {
+    CompletionRequest {
+        model: match selector {
+            ModelSelector::Specific(model) => model,
+            ModelSelector::Lightweight { main } => lightweight_model.map_or(main, str::to_string),
+        },
+        messages,
+        tools,
+        max_tokens: None,
+        temperature: None,
+        stream: true,
+        reasoning,
     }
 }
 
@@ -146,25 +200,20 @@ impl ProviderModule for OpenRouterModule {
 
         let api_key = config["api_key"].as_str().unwrap_or("").to_string();
         let base_url = config["base_url"].as_str().map(String::from);
+        let lightweight_model = background_model(&config);
 
         tokio::spawn(bind::run_http_bind_loop_with_replay(
             req_rx,
             resp_tx,
             move |messages, selector, tools, reasoning, include_reasoning_payloads| {
-                let model = match selector {
-                    ModelSelector::Specific(m) => m,
-                    ModelSelector::Lightweight => OPENROUTER_LIGHTWEIGHT_MODEL.into(),
-                };
                 let provider = openrouter_provider(api_key.clone(), base_url.clone());
-                let request = CompletionRequest {
-                    model,
+                let request = turn_request(
+                    selector,
+                    lightweight_model.as_deref(),
                     messages,
                     tools,
-                    max_tokens: None,
-                    temperature: None,
-                    stream: true,
                     reasoning,
-                };
+                );
                 async move {
                     provider
                         .open_turn(request, include_reasoning_payloads)

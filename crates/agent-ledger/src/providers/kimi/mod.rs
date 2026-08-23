@@ -557,7 +557,7 @@ impl ProviderModule for KimiModule {
             move |messages, selector, tools, reasoning| {
                 let model = match selector {
                     ModelSelector::Specific(m) => m,
-                    ModelSelector::Lightweight => LIGHTWEIGHT_MODEL.into(),
+                    ModelSelector::Lightweight { .. } => LIGHTWEIGHT_MODEL.into(),
                 };
 
                 // The conversation's selected level overrides the instance's.

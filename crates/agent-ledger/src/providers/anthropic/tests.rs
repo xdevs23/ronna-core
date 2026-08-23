@@ -390,7 +390,11 @@ mod bind_request_golden {
         }];
 
         let request = turn_request(
-            ModelSelector::Lightweight,
+            // This vendor's background slug is its own catalog's: the
+            // carried main-model fallback stays unused here.
+            ModelSelector::Lightweight {
+                main: "claude-mainline-test".into(),
+            },
             blocks_to_messages::<crate::agency::BlockKind>(&blocks),
             tools,
             Some(ReasoningLevel::High),

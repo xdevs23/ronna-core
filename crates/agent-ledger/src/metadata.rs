@@ -565,6 +565,15 @@ async fn request_title_stream<K: RuntimeKind>(
     if blocks.is_empty() {
         return false;
     }
+    // The conversation's own configured model rides the selector as the
+    // background fallback: a provider with no background model configured
+    // derives the title on the model the operator provably chose, never on
+    // a slug hardcoded somewhere the operator cannot see. A conversation
+    // the store cannot name a model for has nothing safe to dispatch on —
+    // the parked request retries like any other failed dispatch.
+    let Ok(Some(conversation)) = store.find_conversation(conv_id).await else {
+        return false;
+    };
 
     // Append a title instruction to the conversation's prose.
     let mut title_blocks = blocks;
@@ -590,9 +599,12 @@ async fn request_title_stream<K: RuntimeKind>(
 
     tx.send(ProviderRequest::Stream {
         messages: crate::providers::blocks_to_messages::<K>(&title_blocks),
-        model: ModelSelector::Lightweight,
+        model: ModelSelector::Lightweight {
+            main: conversation.model.external_id,
+        },
         tools: vec![],
-        // Title derivation uses the lightweight model with no reasoning.
+        // Title derivation uses the provider's background model — or the
+        // carried main model — with no reasoning.
         reasoning: None,
     })
     .is_ok()
@@ -921,10 +933,19 @@ mod tests {
         /// The next stream request's neutral messages, awaited up to `window` —
         /// panics if none arrives (the dispatch was expected).
         async fn next_stream_messages(&mut self, window: Duration) -> Vec<Message> {
+            self.next_stream_request(window).await.0
+        }
+
+        /// The next stream request's neutral messages and model selector,
+        /// awaited up to `window` — panics if none arrives (the dispatch was
+        /// expected).
+        async fn next_stream_request(&mut self, window: Duration) -> (Vec<Message>, ModelSelector) {
             let deadline = Instant::now() + window;
             loop {
                 match self.stub_rx.try_recv() {
-                    Ok(ProviderRequest::Stream { messages, .. }) => return messages,
+                    Ok(ProviderRequest::Stream {
+                        messages, model, ..
+                    }) => return (messages, model),
                     Ok(ProviderRequest::Interrupt) => {}
                     Err(_) if Instant::now() < deadline => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1667,6 +1688,26 @@ mod tests {
                 .iter()
                 .all(|m| matches!(m.content, crate::providers::MessageContent::Text(_))),
             "no message renders as native parts — no tool shapes on the wire"
+        );
+    }
+
+    /// The title dispatch names the CONVERSATION'S OWN configured model as
+    /// the background fallback: the selector carries it so a provider with no
+    /// background model of its own derives the title on the model the
+    /// operator chose — never on a slug hardcoded in a provider module.
+    #[tokio::test]
+    async fn the_title_dispatch_carries_the_conversations_main_model() {
+        let mut rig = FulfillmentRig::new(false).await;
+        rig.o.user_text("hello").await;
+        let request = title_request(&rig.o).await;
+
+        rig.send_wakeup(request);
+        let (_, selector) = rig.next_stream_request(Duration::from_secs(2)).await;
+        // The oracle's conversation is created on external id "model".
+        assert!(
+            matches!(&selector, ModelSelector::Lightweight { main } if main == "model"),
+            "the selector carries the conversation's configured model as the \
+             background fallback; got {selector:?}"
         );
     }
 }

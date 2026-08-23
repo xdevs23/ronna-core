@@ -223,7 +223,7 @@ fn turn_request(
     CompletionRequest {
         model: match selector {
             ModelSelector::Specific(m) => m,
-            ModelSelector::Lightweight => LIGHTWEIGHT_MODEL.into(),
+            ModelSelector::Lightweight { .. } => LIGHTWEIGHT_MODEL.into(),
         },
         messages,
         tools,

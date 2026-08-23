@@ -310,7 +310,7 @@ impl ProviderModule for MistralModule {
             move |messages, selector, tools, reasoning, include_reasoning_payloads| {
                 let model = match selector {
                     ModelSelector::Specific(m) => m,
-                    ModelSelector::Lightweight => LIGHTWEIGHT_MODEL.into(),
+                    ModelSelector::Lightweight { .. } => LIGHTWEIGHT_MODEL.into(),
                 };
                 let provider = mistral_provider(api_key.clone(), base_url.clone());
                 let request = CompletionRequest {

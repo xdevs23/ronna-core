@@ -1,20 +1,104 @@
-//! The gateway's pins: the pinned background slug, the capability reading, and
-//! the reasoning echo it rebuilds on request messages.
+//! The gateway's pins: the background-model resolution on the wire body, the
+//! capability reading, and the reasoning echo it rebuilds on request messages.
 
 use serde_json::json;
 
 use super::*;
 use crate::block::{Block, Role};
 use crate::providers::render::blocks_to_messages;
-use crate::providers::types::{OpaquePayload, ReasoningDetailEntry};
+use crate::providers::types::{
+    Message, MessageContent, MessageRole, OpaquePayload, ReasoningDetailEntry,
+};
 
-/// The background slug is pinned so a change to it is a decision someone made,
-/// not a detail that drifted. Re-verify any replacement against the gateway's
-/// public model list before landing it: a delisted slug fails every background
-/// request, deterministically, and looks like an outage.
-#[test]
-fn lightweight_slug_is_pinned() {
-    assert_eq!(OPENROUTER_LIGHTWEIGHT_MODEL, "google/gemini-3.1-flash-lite");
+/// The background-model resolution, pinned on the WIRE REQUEST BODY the bind
+/// path assembles — the exact bytes [`turn_request`] hands `open_turn` for
+/// serialization, so nothing between the selector and the wire can reroute
+/// the model unpinned. The rule under pin (2026-08-23): background work runs
+/// on the instance's configured slug where one is configured, and on the
+/// request's own main model otherwise — NEVER on a hardcoded id, which on
+/// this many-vendor gateway silently sent title traffic to a vendor and a
+/// region the operator did not choose.
+mod background_model_on_the_wire {
+    use super::*;
+
+    /// The serialized wire body for one bound turn, exactly as the bind
+    /// closure builds it.
+    fn wire_body(selector: ModelSelector, configured: Option<&str>) -> Value {
+        let provider = openrouter_provider("test-key".into(), None);
+        let request = turn_request(
+            selector,
+            configured,
+            vec![Message {
+                role: MessageRole::User,
+                content: MessageContent::Text("hello".into()),
+            }],
+            vec![],
+            None,
+        );
+        let (body, _) = provider.build_request_body(&request, true, true);
+        serde_json::to_value(&body).expect("the wire serializes")
+    }
+
+    /// No configured background model: the title request goes out on the
+    /// request's own main model id.
+    #[test]
+    fn an_unconfigured_instance_sends_background_work_on_the_main_model() {
+        let body = wire_body(
+            ModelSelector::Lightweight {
+                main: "eu-vendor/the-pinned-main-model".into(),
+            },
+            None,
+        );
+        assert_eq!(
+            body["model"], "eu-vendor/the-pinned-main-model",
+            "the fallback is the main model the operator chose, not a \
+             hardcoded slug"
+        );
+    }
+
+    /// A configured background model: the title request goes out on exactly
+    /// that slug.
+    #[test]
+    fn a_configured_instance_sends_its_configured_background_model() {
+        let body = wire_body(
+            ModelSelector::Lightweight {
+                main: "eu-vendor/the-pinned-main-model".into(),
+            },
+            Some("cheap-vendor/background-model"),
+        );
+        assert_eq!(body["model"], "cheap-vendor/background-model");
+    }
+
+    /// A specific selector is obeyed as spoken — the background
+    /// configuration cannot reroute a conversation turn.
+    #[test]
+    fn a_specific_selector_ignores_the_background_configuration() {
+        let body = wire_body(
+            ModelSelector::Specific("eu-vendor/the-pinned-main-model".into()),
+            Some("cheap-vendor/background-model"),
+        );
+        assert_eq!(body["model"], "eu-vendor/the-pinned-main-model");
+    }
+
+    /// The lenient read off the raw config value: absent, non-string and
+    /// blank all mean "not configured"; a padded slug is trimmed.
+    #[test]
+    fn the_configured_slug_reads_leniently_off_the_raw_config() {
+        assert_eq!(background_model(&json!({})), None);
+        assert_eq!(
+            background_model(&json!({ "lightweight_model": null })),
+            None
+        );
+        assert_eq!(background_model(&json!({ "lightweight_model": 7 })), None);
+        assert_eq!(
+            background_model(&json!({ "lightweight_model": "  " })),
+            None
+        );
+        assert_eq!(
+            background_model(&json!({ "lightweight_model": " cheap-vendor/background-model " })),
+            Some("cheap-vendor/background-model".into())
+        );
+    }
 }
 
 mod capability {

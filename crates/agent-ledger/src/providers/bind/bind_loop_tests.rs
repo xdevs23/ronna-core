@@ -36,7 +36,9 @@ async fn drive(
     req_tx
         .send(ProviderRequest::Stream {
             messages: vec![],
-            model: ModelSelector::Lightweight,
+            model: ModelSelector::Lightweight {
+                main: "main-model".into(),
+            },
             tools: vec![],
             reasoning: None,
         })
@@ -346,7 +348,9 @@ async fn dropping_the_sender_stops_the_cycle() {
     req_tx
         .send(ProviderRequest::Stream {
             messages: vec![],
-            model: ModelSelector::Lightweight,
+            model: ModelSelector::Lightweight {
+                main: "main-model".into(),
+            },
             tools: vec![],
             reasoning: None,
         })
@@ -423,7 +427,9 @@ async fn a_superseded_turn_sends_no_close() {
 
     let request = || ProviderRequest::Stream {
         messages: vec![],
-        model: ModelSelector::Lightweight,
+        model: ModelSelector::Lightweight {
+            main: "main-model".into(),
+        },
         tools: vec![],
         reasoning: None,
     };
