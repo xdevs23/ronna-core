@@ -254,11 +254,20 @@ impl FulfillmentSeam {
 
 /// Spawn the per-conversation metadata subsystem. Returns join handles so the
 /// conversation actor can abort them on shutdown.
+///
+/// A context with title derivation switched off spawns NOTHING: the decision
+/// lives here, where the subsystem knows itself, so the actor's spawn site
+/// stays a plain call. Without the watcher no request row is ever appended,
+/// without the scheduler and the fulfillment loop nothing could act on one —
+/// zero title traffic by construction, not by a check on the dispatch path.
 pub(crate) fn spawn<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent>(
     conv_id: i64,
     ctx: RuntimeContext<K, E>,
     latched: ReadSignal<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
+    if !ctx.title_derivation() {
+        return Vec::new();
+    }
     // Subscribed here, before the spawn, so no wakeup can slip between the
     // caller's world starting to move and the loop's own subscription.
     let fulfillment_rx = ctx.bus().subscribe();

@@ -86,6 +86,12 @@ pub struct RuntimeContext<K: RuntimeKind, E> {
     bus: Arc<EventBus<E>>,
     providers: Arc<ProviderRegistry>,
     runner: Arc<ToolRunner<K, E>>,
+    /// Whether the metadata worker derives conversation titles. A behavior
+    /// switch, not a collaborator — the context stays the four collaborators
+    /// and no service locator. On by default; a consumer that wants no title
+    /// traffic at all turns it off at construction, and the runtime then
+    /// spawns no metadata worker and dispatches no title request, ever.
+    title_derivation: bool,
 }
 
 impl<K: RuntimeKind, E> Clone for RuntimeContext<K, E> {
@@ -95,6 +101,7 @@ impl<K: RuntimeKind, E> Clone for RuntimeContext<K, E> {
             bus: Arc::clone(&self.bus),
             providers: Arc::clone(&self.providers),
             runner: Arc::clone(&self.runner),
+            title_derivation: self.title_derivation,
         }
     }
 }
@@ -114,7 +121,24 @@ impl<K: RuntimeKind, E> RuntimeContext<K, E> {
             bus,
             providers,
             runner: Arc::new(ToolRunner::new(tools)),
+            title_derivation: true,
         }
+    }
+
+    /// The same context with title derivation switched OFF: the runtime
+    /// spawns no metadata worker for any conversation, so no title request
+    /// row is ever appended and no title stream is ever dispatched. The
+    /// default — untouched contexts — keeps the derivation on.
+    #[must_use]
+    pub fn without_title_derivation(mut self) -> Self {
+        self.title_derivation = false;
+        self
+    }
+
+    /// Whether the metadata worker derives conversation titles.
+    #[must_use]
+    pub fn title_derivation(&self) -> bool {
+        self.title_derivation
     }
 
     /// The store handle.
@@ -3513,6 +3537,9 @@ mod tests {
         /// The second latch, for the scripts that stage TWO holds: notifying
         /// it lets a held turn's end go out. Inert everywhere else.
         finish: Arc<tokio::sync::Notify>,
+        /// Every definition-free derivation request that reached the wire —
+        /// what the title-switch pins count: on, at least one; off, zero.
+        title_requests: Arc<AtomicUsize>,
     }
 
     /// How many answered calls the request's messages already carry — the
@@ -3613,6 +3640,7 @@ mod tests {
             let seen = Arc::clone(&self.seen);
             let release = Arc::clone(&self.release);
             let finish = Arc::clone(&self.finish);
+            let title_requests = Arc::clone(&self.title_requests);
             tokio::spawn(async move {
                 while let Some(request) = req_rx.recv().await {
                     let ProviderRequest::Stream {
@@ -3631,8 +3659,10 @@ mod tests {
                     // The metadata worker shares this provider and its
                     // derivation request is the one carrying no tool
                     // definitions — answer it with a title and keep it out of
-                    // the TURN count, which is what the tests assert on.
+                    // the TURN count, which is what the tests assert on. It
+                    // is counted on its own, for the title-switch pins.
                     if tools.is_empty() {
+                        title_requests.fetch_add(1, Ordering::SeqCst);
                         let _ = resp_tx.send(ProviderResponse::Event(StreamEvent::TextDelta {
                             text: "A derived title".into(),
                         }));
@@ -4004,6 +4034,9 @@ mod tests {
         /// The two-hold scripts' second latch: notify it to let a held turn's
         /// end go out. Inert for every other script.
         finish: Arc<tokio::sync::Notify>,
+        /// How many definition-free title derivation requests reached the
+        /// provider — the title-switch pins' counter.
+        title_requests: Arc<AtomicUsize>,
     }
 
     /// The scripted context WITHOUT the reactor: for tests that construct or
@@ -4035,6 +4068,7 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let release = Arc::new(tokio::sync::Notify::new());
         let finish = Arc::new(tokio::sync::Notify::new());
+        let title_requests = Arc::new(AtomicUsize::new(0));
         let mut providers = ProviderRegistry::new();
         providers.register(Box::new(ScriptedProvider {
             script,
@@ -4043,6 +4077,7 @@ mod tests {
             seen: Arc::clone(&seen),
             release: Arc::clone(&release),
             finish: Arc::clone(&finish),
+            title_requests: Arc::clone(&title_requests),
         }));
         let mut tools = ToolRegistry::new();
         tools.register("echo", EchoTool);
@@ -4069,6 +4104,7 @@ mod tests {
                 seen,
                 release,
                 finish,
+                title_requests,
             },
         )
     }
@@ -4155,6 +4191,88 @@ mod tests {
             blocks
                 .iter()
                 .all(|b| !b.block_type.starts_with("streaming"))
+        );
+    }
+
+    /// The title switch, OFF: a context built with
+    /// [`RuntimeContext::without_title_derivation`] runs a whole conversation
+    /// flow — append, owed turn, streamed answer — and ZERO title requests
+    /// reach the provider. The metadata ledger stays empty too: nothing is
+    /// parked that could fire a derivation later, because no metadata worker
+    /// was spawned at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_context_without_title_derivation_dispatches_no_title_request() {
+        let (ctx, conv, probe) = scripted_context(Script::Prose).await;
+        let ctx = ctx.without_title_derivation();
+        spawn_reactor(ctx.clone());
+
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "hi".into(),
+            }],
+        });
+        await_ledger(&ctx, conv, "the answered turn", |blocks| {
+            blocks
+                .last()
+                .is_some_and(|b| b.block_type == "text" && b.fields["content"] == json!("answered"))
+        })
+        .await;
+
+        // The assistant has spoken and the conversation is small — exactly
+        // the state the policy watcher inserts its request in. Hold the
+        // window open, then pin the silence on every surface.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            probe.title_requests.load(Ordering::SeqCst),
+            0,
+            "no title request reaches the provider with the switch off"
+        );
+        assert!(
+            !ctx.store.has_metadata(conv, "title_request").await.unwrap(),
+            "no request row is ever appended — nothing parked to fire later"
+        );
+        assert!(
+            !ctx.store
+                .has_metadata(conv, "title_response")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The title switch's default, ON: the same flow over an untouched
+    /// context derives the title as it always has — the switch changes
+    /// nothing for existing consumers. The derivation's inner behavior keeps
+    /// its own pins in the metadata module; this is the seam-level pair to
+    /// the off pin above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_default_context_keeps_deriving_titles() {
+        let (ctx, conv, probe) = composed_runtime(Script::Prose).await;
+        assert!(ctx.title_derivation(), "the default is on");
+
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "hi".into(),
+            }],
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ctx
+            .store
+            .has_metadata(conv, "title_response")
+            .await
+            .unwrap()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the default context derives the title"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            probe.title_requests.load(Ordering::SeqCst) >= 1,
+            "the derivation reached the provider"
         );
     }
 
