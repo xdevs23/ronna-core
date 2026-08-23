@@ -3,11 +3,18 @@
 //!
 //! The provider channel deliberately carries neutral values and never ledger
 //! identity, so the anchor cannot travel with the stream. Instead the actor —
-//! the one dispatcher — resolves the anchor from the dispatch's own snapshot,
-//! sets it here at dispatch and clears it at the turn's close, and the
-//! ingestion reader on the same binding reads it at every insert. One slot per
-//! binding: a torn-down reader keeps its own, already-cleared slot, so its
-//! late writes can never borrow a successor turn's identity.
+//! the one dispatcher — sets the dispatched turn's anchor here at dispatch
+//! and clears it at the stream's close, and the ingestion reader on the same
+//! binding reads it at every insert. One slot per binding: a torn-down
+//! reader keeps its own, already-cleared slot, so its late writes can never
+//! borrow a successor turn's identity.
+//!
+//! The slot is STREAM-scoped, not turn-scoped (amended 2026-08-22): a tool
+//! turn spans several streams — one per round — and the identity that spans
+//! them is actor state, held by the dispatcher from the turn's first
+//! dispatch until a close that ends the turn and re-set here at every
+//! continuation dispatch. The seam never decides whose turn is open; it only
+//! carries the open dispatch's answer to the reader.
 //!
 //! A per-turn VALUE handed to the reader was considered and rejected
 //! (2026-08-22): the reader consumes exactly one channel, and a second
@@ -42,7 +49,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// One binding's seam state, behind the shared lock.
 #[derive(Default)]
 struct Seam {
-    /// The open turn's anchor, `None` between turns.
+    /// The open dispatch's turn anchor, `None` between streams.
     anchor: Option<i64>,
     /// Counts the dispatches on this binding: bumped at every [`TurnAnchor::set`],
     /// so each turn the binding ever carries has a distinct epoch.
@@ -77,13 +84,16 @@ impl TurnAnchor {
         seam.anchor = Some(anchor);
     }
 
-    /// Close the turn. Called by the actor on the closed signal, the error
-    /// signal and the interrupt teardown — the three close edges.
+    /// Close the stream's seam. Called by the actor on the closed signal,
+    /// the error signal and the interrupt teardown — the three close edges.
+    /// Whether the TURN ends there is the actor's own decision, held outside
+    /// this slot (amended 2026-08-22): a continuation round re-sets the same
+    /// anchor at its dispatch.
     pub(crate) fn clear(&self) {
         self.lock().anchor = None;
     }
 
-    /// The open turn's anchor, `None` between turns.
+    /// The open dispatch's turn anchor, `None` between streams.
     pub(crate) fn get(&self) -> Option<i64> {
         self.lock().anchor
     }

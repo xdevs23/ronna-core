@@ -179,6 +179,50 @@ turn, which is why they are one slice.
   Rejected: continuing to infer closure (eight refutations are the record);
   a separate turn table (the status block IS the ledger's own shape for a
   machine fact about a turn).
+  Amended 2026-08-23, after the verified burial defect (the marker's own
+  liveness hole): a turn-end marker written by a NON-LATCHING closed-edge
+  close capped the frontier, so an addressed message absorbed into the dead
+  turn's window — sitting behind the marker in ledger order — was silently
+  lost forever: the closed edge, unlike the latching error edge whose
+  release re-engages, re-checks exactly once, and that re-check read the
+  marker as the tail and rested. The frontier decision is now TRANSPARENT
+  over exactly the turn-closure machine keys: the owed-turn read skips
+  trailing turn-ended status blocks, so the absorbed message still owes and
+  the close's re-check dispatches its turn — anchored on itself, since the
+  marker also answers the dead turn's outcome for the inheritance walk. The
+  transparency is bounded by what the skipped markers answer: a block
+  anchored on a skipped marker's own turn — the dead turn's outcome — never
+  summons through it, so the stand-down still rests when nothing owed sits
+  behind the marker. The interrupt's status stays opaque; its capping under
+  the latch is that path's recorded semantics. Transparency is a kind-level
+  answer on the agency trait, delegated like every other hook — the ratchet
+  still names no block type. Rejected: a synthetic re-signal past an opaque
+  marker (the drive is the one producer of owed-turn signals, and a signal
+  with no owed frontier is the blind-close redispatch defect again);
+  skipping every status block (the interrupt's cap and consumer statuses
+  are not turn ends); suppressing the marker when a message was absorbed
+  (re-opens the captured-summons shape the marker exists to close).
+  Amended 2026-08-23, after the verified regression on the transparency's
+  first cut: reading through the trailing MARKERS alone still buried the
+  tool-execution window. A message absorbed between the dead turn's call
+  and its result sits under the outcome-plus-marker pair, the read stopped
+  on the outcome — the last block that is not a marker — found the marker
+  answering it, and rested; a message the pre-marker runtime answered was
+  silently lost. The
+  frontier decision now reads through the dead turn's whole trailing run:
+  every consecutive trailing block that is a turn-closure marker or is
+  anchored on a turn a skipped marker disowns is transparent, so a
+  model-owed message absorbed anywhere in the window is the frontier and
+  dispatches anchored on itself — the marker still answers the dead turn's
+  outcome for the inheritance walk. The bounds hold on both sides: a block
+  anchored on a turn no skipped marker disowns stays opaque, which keeps a
+  late approval's outcome — behind the marker in ledger order — summoning
+  its resumption; and a walk that comes out on a disowned turn's own
+  summons rests, because owing the block whose turn the marker recorded as
+  ended is the redispatch the marker exists to prevent. Rejected: answering
+  from the last non-marker block alone (the regression above); making the
+  dead turn's products transparent without the summons bound (the rest
+  shape then re-owes the dead turn's own summoner and redispatches it).
 
 ## What must hold
 

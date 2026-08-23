@@ -14,21 +14,58 @@ use crate::block::{Block, Role};
 use super::{Agency, LeafKind, Projection};
 
 /// Caps the frontier by HAVING no ask — no turn fires past an interrupt.
+///
+/// One family of status rows is the exception (2026-08-23, the verified
+/// burial defect): a stored turn-closure marker is TRANSPARENT to the
+/// frontier decision instead of capping it. The marker is appended by a
+/// close that ends a turn over an unanswered outcome, so an addressed
+/// message absorbed into that turn's window sits behind it — and an opaque
+/// marker buried the message forever, because the non-latching closed edge
+/// re-checks exactly once. The interrupt's status keeps the cap: the latch
+/// it rides re-checks at its own release.
 #[derive(Debug, Clone)]
 pub struct Status {
     /// The role the row carries, under which the record groups.
     pub role: Option<Role>,
+    /// The stored machine key — what the row records, read by the
+    /// transparency decision below and by any consumer fold over markers.
+    pub status: String,
+}
+
+impl Status {
+    /// The machine key a closed-edge close records for a turn it ended over
+    /// an unanswered outcome (2026-08-23, turn closure is a stored fact).
+    pub const TURN_ENDED_CLOSED: &'static str = "turn_ended:closed";
+    /// The error edge's counterpart of [`Self::TURN_ENDED_CLOSED`].
+    pub const TURN_ENDED_ERRORED: &'static str = "turn_ended:errored";
+
+    /// Whether this row is a stored turn-closure marker — the exact two
+    /// machine keys the close writes, nothing broader: the interrupt's
+    /// `interrupted` status and every consumer status stay opaque.
+    fn records_turn_end(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            Self::TURN_ENDED_CLOSED | Self::TURN_ENDED_ERRORED
+        )
+    }
 }
 
 impl LeafKind for Status {
     const KINDS: &'static [&'static str] = &["status"];
 
     fn parse(block: &Block) -> Self {
-        Self { role: block.role }
+        Self {
+            role: block.role,
+            status: super::string_field(block, "status"),
+        }
     }
 }
 
-impl Agency for Status {}
+impl Agency for Status {
+    fn frontier_transparent(&self) -> bool {
+        self.records_turn_end()
+    }
+}
 
 impl Projection for Status {
     fn group_role(&self) -> Option<Role> {

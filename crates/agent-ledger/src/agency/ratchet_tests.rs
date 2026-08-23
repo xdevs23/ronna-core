@@ -540,6 +540,222 @@ async fn user_message_after_a_status_cap_fires_again() {
     assert_eq!(outcome.cursor, user);
 }
 
+/// One anchored, resolved tool round under `summons`: the call carries the
+/// turn's identity and the resolution write copies it onto the result — the
+/// floor the turn-closure marker shapes below stand on.
+async fn anchored_round(o: &Oracle, summons: i64) {
+    let call = o
+        .ctx
+        .store
+        .insert_tool_call_block(
+            crate::store::BlockDestination::anchored(o.ctx.conversation_id, Some(summons)),
+            Role::Assistant,
+            crate::store::ToolCallInsert {
+                tool_call_id: "c1".into(),
+                name: "read_file".into(),
+                input: "{}".into(),
+                interactive: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    o.ctx
+        .store
+        .complete_tool_call_block(o.ctx.conversation_id, "c1".into(), "ok".into(), call)
+        .await
+        .unwrap()
+        .expect("the call is unresolved");
+}
+
+/// The frontier transparency (2026-08-23, the verified burial defect): a
+/// model-owed message absorbed into a dead turn's window sits BEHIND that
+/// turn's closure marker, and an opaque marker buried it forever — the
+/// non-latching closed edge re-checks exactly once, and that re-check read
+/// the marker as the tail and rested. The marker is transparent to the owed
+/// decision, so the absorbed message still owes and the re-check's drive
+/// signals its turn.
+#[tokio::test]
+async fn a_model_owed_message_behind_a_turn_end_marker_still_owes() {
+    let o = Oracle::new().await;
+    let summons = o.user_text("go").await;
+    anchored_round(&o, summons).await;
+    o.user_text("absorbed").await;
+    let marker = o
+        .ctx
+        .store
+        .insert_status_block(
+            crate::store::BlockDestination::anchored(o.ctx.conversation_id, Some(summons)),
+            "turn_ended:closed".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let outcome = o.drive().await;
+    assert!(
+        outcome.owes_turn,
+        "the marker is transparent — the absorbed message still owes"
+    );
+    assert_eq!(
+        outcome.awaiting,
+        Some(crate::types::Awaiting::Model),
+        "the published ask is the absorbed message's own"
+    );
+    assert!(
+        !outcome.parked,
+        "everything behind the frontier is confirmed"
+    );
+    assert_eq!(
+        outcome.cursor, marker,
+        "the cursor still drains through the marker"
+    );
+}
+
+/// The transparency's bound: the dead turn's own outcome, directly behind
+/// its marker, never owes — the marker ANSWERS it, and reading past the
+/// marker onto the outcome would redispatch the very turn the marker
+/// recorded as ended. With nothing owed behind the marker the frontier
+/// rests, exactly as the stored closure requires.
+#[tokio::test]
+async fn a_dead_turns_outcome_behind_its_marker_rests() {
+    let o = Oracle::new().await;
+    let summons = o.user_text("go").await;
+    anchored_round(&o, summons).await;
+    let marker = o
+        .ctx
+        .store
+        .insert_status_block(
+            crate::store::BlockDestination::anchored(o.ctx.conversation_id, Some(summons)),
+            "turn_ended:closed".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let outcome = o.drive().await;
+    assert!(
+        !outcome.owes_turn,
+        "an outcome the marker answers never summons through it"
+    );
+    assert_eq!(outcome.awaiting, None, "the frontier rests on the marker");
+    assert!(!outcome.parked);
+    assert_eq!(outcome.cursor, marker);
+}
+
+/// The tool-execution window under the marker: a message absorbed between
+/// the dead turn's CALL and its RESULT, so the whole outcome-plus-marker
+/// pair sits on top of it in ledger order. Verified regression on the
+/// transparency's first cut (2026-08-23): a frontier read that skips only
+/// the trailing markers stops on the outcome, reads it as answered and
+/// rests — burying the absorbed message exactly as the opaque marker did.
+/// The dead turn's whole trailing run is transparent — the marker and every
+/// consecutive trailing block anchored on the turn it disowns — so the
+/// absorbed message is the frontier wherever in the window it was absorbed.
+async fn tool_window_burial(marker_key: &str) -> (Oracle, i64) {
+    let o = Oracle::new().await;
+    let summons = o.user_text("go").await;
+    let call = o
+        .ctx
+        .store
+        .insert_tool_call_block(
+            crate::store::BlockDestination::anchored(o.ctx.conversation_id, Some(summons)),
+            Role::Assistant,
+            crate::store::ToolCallInsert {
+                tool_call_id: "c1".into(),
+                name: "read_file".into(),
+                input: "{}".into(),
+                interactive: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    o.user_text("absorbed").await;
+    o.ctx
+        .store
+        .complete_tool_call_block(o.ctx.conversation_id, "c1".into(), "ok".into(), call)
+        .await
+        .unwrap()
+        .expect("the call is unresolved");
+    let marker = o
+        .ctx
+        .store
+        .insert_status_block(
+            crate::store::BlockDestination::anchored(o.ctx.conversation_id, Some(summons)),
+            marker_key.into(),
+            None,
+        )
+        .await
+        .unwrap();
+    (o, marker)
+}
+
+#[tokio::test]
+async fn a_message_absorbed_in_the_tool_window_owes_behind_a_closed_marker() {
+    let (o, marker) = tool_window_burial("turn_ended:closed").await;
+
+    let outcome = o.drive().await;
+    assert!(
+        outcome.owes_turn,
+        "the dead turn's trailing run is transparent — the absorbed message still owes"
+    );
+    assert_eq!(
+        outcome.awaiting,
+        Some(crate::types::Awaiting::Model),
+        "the published ask is the absorbed message's own"
+    );
+    assert!(!outcome.parked, "the resolved round parks nothing");
+    assert_eq!(
+        outcome.cursor, marker,
+        "the cursor still drains through the marker"
+    );
+}
+
+#[tokio::test]
+async fn a_message_absorbed_in_the_tool_window_owes_behind_an_errored_marker() {
+    let (o, marker) = tool_window_burial("turn_ended:errored").await;
+
+    let outcome = o.drive().await;
+    assert!(
+        outcome.owes_turn,
+        "both marker keys are transparent — the absorbed message still owes"
+    );
+    assert_eq!(outcome.awaiting, Some(crate::types::Awaiting::Model));
+    assert!(!outcome.parked);
+    assert_eq!(outcome.cursor, marker);
+}
+
+/// The transparency's scope: exactly the turn-closure machine keys. The
+/// interrupt's status stays opaque even in the burial shape — its capping
+/// under the latch is that path's recorded semantics, and the latch's own
+/// release re-checks there.
+#[tokio::test]
+async fn an_interrupted_status_stays_opaque_over_an_absorbed_message() {
+    let o = Oracle::new().await;
+    let summons = o.user_text("go").await;
+    anchored_round(&o, summons).await;
+    o.user_text("absorbed").await;
+    let cap = o
+        .ctx
+        .store
+        .insert_status_block(
+            crate::store::BlockDestination::anchored(o.ctx.conversation_id, Some(summons)),
+            "interrupted".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let outcome = o.drive().await;
+    assert!(
+        !outcome.owes_turn,
+        "the interrupt's status keeps its cap — transparency is key-scoped"
+    );
+    assert_eq!(outcome.awaiting, None);
+    assert_eq!(outcome.cursor, cap);
+}
+
 /// An approval-request tail rests: an out-of-band ask parks the turn axis
 /// without parking the cursor. The covered call here is already resolved, so
 /// only the tail's own ask is in play.

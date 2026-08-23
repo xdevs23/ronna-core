@@ -695,6 +695,13 @@ fn agency_impl(name: &Ident, composition: &Composition<'_>) -> proc_macro2::Toke
                 }
             }
 
+            fn frontier_transparent(&self) -> bool {
+                match self {
+                    #( Self::#all_ident(kind) =>
+                        #krate::agency::Agency::frontier_transparent(kind), )*
+                }
+            }
+
             async fn gate<__E: #krate::RuntimeEvent>(
                 &self,
                 ctx: &#krate::AgencyCtx<__E>,

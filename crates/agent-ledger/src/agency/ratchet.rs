@@ -16,7 +16,7 @@ use crate::bus::RuntimeEvent;
 use crate::store::StoreError;
 use crate::types::Awaiting;
 
-use super::{AgencyCtx, RuntimeKind};
+use super::{AgencyCtx, RuntimeKind, ToolCall};
 
 /// The drive's one seam onto persistence: list the ledger, read its cursor,
 /// persist its cursor.
@@ -150,28 +150,32 @@ pub struct Outcome {
     /// [`Agency::durable`](super::Agency::durable).
     pub cursor: i64,
     /// The frontier gate: the drive confirmed its whole SNAPSHOT without
-    /// parking, AND the tail — read fresh after the drive — awaits the model.
-    /// Never a backward scan. The fresh tail can include blocks appended after
-    /// the snapshot that the drive never ran; every kind that answers a model
-    /// ask has an inert `run()`, so nothing is skipped by firing on one, and
-    /// the next drive confirms them.
+    /// parking, AND the tail — read fresh after the drive, through a dead
+    /// turn's trailing closure run (`frontier_block`, 2026-08-23) —
+    /// awaits the model. Never a backward scan beyond that scoped skip. The
+    /// fresh tail can include blocks appended after the snapshot that the
+    /// drive never ran; every kind that answers a model ask has an inert
+    /// `run()`, so nothing is skipped by firing on one, and the next drive
+    /// confirms them.
     pub owes_turn: bool,
     /// The drive stopped before confirming the tail — a block reported
     /// not-done, or its `run()` failed. A fresh tick re-drives it.
     pub parked: bool,
-    /// The tail block's own ask, straight off
+    /// The frontier block's own ask, straight off
     /// [`Agency::awaiting`](super::Agency::awaiting), read from
-    /// the same fresh tail `owes_turn` is decided on. Published on
+    /// the same fresh frontier `owes_turn` is decided on. Published on
     /// conversation state so a consumer can tell an out-of-band ask from a
     /// chat reply. Orthogonal to `owes_turn`, which additionally requires the
     /// drive to have finished unparked.
     pub awaiting: Option<Awaiting>,
 }
 
-/// The owed-turn decision over one tail block, written once: `Some` with the
-/// dispatch's anchor when the tail awaits the model — a turn product's own
-/// anchor inherited, a null-anchored frontier (a message, a consumer append)
-/// starting a new identity — and `None` when the tail owes nothing.
+/// The owed-turn decision over one tail block, written once: does the tail
+/// await the model? (Amended 2026-08-23: the anchor half this function used
+/// to carry moved to [`fresh_turn_anchor`], because the seventh break
+/// proved a fresh dispatch's anchor is a fact about the SNAPSHOT, not about
+/// the tail alone — the owed decision is the one thing the tail answers by
+/// itself.)
 ///
 /// Two sites answer with this rule and they are the same rule ON DIFFERENT
 /// SNAPSHOTS by design (2026-08-22): the scheduler's drive decides it on the
@@ -181,10 +185,113 @@ pub struct Outcome {
 /// answer to the delivery inside the signal was rejected in the slice's
 /// decision record: the ledger can move between the two reads, and a
 /// signal-borne value races the very appends the dispatch identity exists to
-/// record.
-pub(crate) fn frontier_owes_turn<K: RuntimeKind>(tail: &Block) -> Option<i64> {
-    (K::from_block(tail).awaiting() == Some(Awaiting::Model))
-        .then(|| tail.dispatch_anchor.unwrap_or(tail.id))
+/// record. Both sites hand this rule the block [`frontier_block`] resolves —
+/// the tail read through a dead turn's trailing closure run (2026-08-23),
+/// so the transparency cannot drift between them either.
+pub(crate) fn frontier_owes_turn<K: RuntimeKind>(tail: &Block) -> bool {
+    K::from_block(tail).awaiting() == Some(Awaiting::Model)
+}
+
+/// The block the frontier decision reads over one snapshot: the tail, read
+/// THROUGH a dead turn's trailing closure run — its stored turn-closure
+/// markers and the trailing blocks those markers answer
+/// (2026-08-23, the verified burial defect). An opaque marker at the
+/// tail buried an addressed message absorbed into the dead turn's window:
+/// the close's re-check read the marker, decided nothing owed, and rested —
+/// and the non-latching closed edge re-checks exactly once, so no turn ever
+/// fired for the message. The latching error edge never had the hole: the
+/// latch's release re-engages there.
+///
+/// The walk reads through the dead turn's WHOLE trailing run, not through
+/// the markers alone (amended 2026-08-23, the verified regression on the
+/// transparency's first cut): a message absorbed between the turn's call
+/// and its RESULT — the tool-execution window — sits under the
+/// outcome-plus-marker pair, and a read that skipped only the markers
+/// stopped on the outcome, found it answered, and rested — the same burial
+/// wearing one more block. Three rules, all scoped to the markers the walk
+/// has skipped:
+///
+/// - A trailing turn-closure marker is skipped, and the turn it is anchored
+///   on is disowned from here back.
+/// - A trailing block anchored on a disowned turn — the dead turn's own
+///   product, wherever it sits in the trailing run — is skipped too: the
+///   marker recorded that turn's end, and stopping on its outcome would
+///   either bury what the outcome hides or redispatch the turn the marker
+///   exists to close. A block anchored on a turn no skipped marker disowns
+///   stays opaque, which is what lets an outcome landing AFTER the marker —
+///   an approval resolving late — summon its resumption as before.
+/// - The first block outside the run is the frontier — a model-owed message
+///   absorbed anywhere in the dead turn's window owes, and dispatches
+///   anchored on itself. One bound: a stop on a disowned turn's own SUMMONS
+///   rests on the tail instead — that block's turn is the very one the
+///   marker recorded as ended, and owing it again would redispatch it.
+///
+/// Transparency is a kind-level answer
+/// ([`Agency::frontier_transparent`](super::Agency::frontier_transparent)),
+/// scoped to exactly the turn-closure machine keys; the interrupt's status
+/// stays opaque, and its capping under the latch is that path's recorded
+/// semantics.
+pub(crate) fn frontier_block<K: RuntimeKind>(snapshot: &[Block]) -> Option<&Block> {
+    let tail = snapshot.last()?;
+    let mut disowned: Vec<i64> = Vec::new();
+    for block in snapshot.iter().rev() {
+        if K::from_block(block).frontier_transparent() {
+            if let Some(anchor) = block.dispatch_anchor
+                && !disowned.contains(&anchor)
+            {
+                disowned.push(anchor);
+            }
+            continue;
+        }
+        if block
+            .dispatch_anchor
+            .is_some_and(|anchor| disowned.contains(&anchor))
+        {
+            continue;
+        }
+        if disowned.contains(&block.id) {
+            // The dead turn's own summons: answered by the marker's record,
+            // so the frontier rests on the tail — the marker, which asks
+            // nothing.
+            return Some(tail);
+        }
+        return Some(block);
+    }
+    // Nothing but the dead turn's trailing run: nothing sits behind it, the
+    // tail rests.
+    Some(tail)
+}
+
+/// The FRESH-dispatch anchor resolution, over the dispatch's own snapshot
+/// (2026-08-22; amended 2026-08-23, the verified seventh break — the
+/// resolution is ledger-first). `tail` is `snapshot`'s own model-owed tail,
+/// the block [`frontier_owes_turn`] just answered on. Consulted only when
+/// the actor holds no open turn: a dispatch while a turn is open is that
+/// turn's continuation and reuses the held identity. Three arms, in order:
+///
+/// - **A turn product inherits its own anchor.** A non-null-anchored tail —
+///   a tool result, a status — is itself some turn's product, and the
+///   dispatch it summons is that turn's continuation.
+/// - **A null-anchored tail inherits the newest unanswered outcome's
+///   anchor** ([`ToolCall::unanswered_outcome_anchor`]). A released turn —
+///   a parked interactive call resumed by its approval, a restart
+///   recovering a round — is owed its continuation by the LEDGER, not by
+///   any actor's memory, and a message absorbed behind the outcome must not
+///   capture that continuation's identity.
+/// - **Otherwise the tail starts a new identity**, anchored on itself: a
+///   message, a consumer append, summoning a turn of its own.
+///
+/// The seventh break, for the record: this resolution read only the tail,
+/// so a released turn lost its identity whenever a message was absorbed
+/// behind its outcome — the continuation anchored on the absorbed line, the
+/// consumer's original escalation. The middle arm closes both proven
+/// shapes, and it demotes the actor's held identity to a consistency cache
+/// over a ledger-derivable fact: a fresh actor over the same ledger — the
+/// restart shape — resolves the same turn the live actor was holding.
+pub(crate) fn fresh_turn_anchor(snapshot: &[Block], tail: &Block) -> i64 {
+    tail.dispatch_anchor
+        .or_else(|| ToolCall::unanswered_outcome_anchor(snapshot))
+        .unwrap_or(tail.id)
 }
 
 /// The conversation instantiation of [`drive_ledger`] — the turn scheduler's
@@ -278,15 +385,22 @@ pub async fn drive_ledger<K: RuntimeKind, E: RuntimeEvent>(
     // loop above walked. `parked` stays the drive's own answer: it is a fact
     // about what this drive reached, not about the current tail. The owed
     // turn itself is the shared frontier rule, so this site and the actor's
-    // delivery-time re-check cannot drift.
+    // delivery-time re-check cannot drift. A transparent tail — a stored
+    // turn-closure marker — costs one extra full read here: the one-row tail
+    // cannot see behind itself, and [`frontier_block`] needs the snapshot to
+    // decide what the marker buried. The common shapes keep the one-row read.
     let tail = source.tail(ctx).await?;
-    let awaiting = tail
+    let frontier = match tail {
+        Some(tail) if K::from_block(&tail).frontier_transparent() => {
+            let snapshot = source.list(ctx).await?;
+            frontier_block::<K>(&snapshot).cloned()
+        }
+        tail => tail,
+    };
+    let awaiting = frontier
         .as_ref()
-        .and_then(|tail| K::from_block(tail).awaiting());
-    let owes_turn = !parked
-        && tail
-            .as_ref()
-            .is_some_and(|tail| frontier_owes_turn::<K>(tail).is_some());
+        .and_then(|block| K::from_block(block).awaiting());
+    let owes_turn = !parked && frontier.as_ref().is_some_and(frontier_owes_turn::<K>);
 
     Ok(Outcome {
         cursor,

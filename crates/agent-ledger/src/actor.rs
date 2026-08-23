@@ -45,7 +45,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::agency::{AgencyCtx, RuntimeKind, ratchet, redispatch};
+use crate::agency::{AgencyCtx, RuntimeKind, ToolCall, ratchet, redispatch};
+use crate::block::Block;
 use crate::bus::{EventBus, RuntimeEvent};
 use crate::dispatch::TurnAnchor;
 use crate::event::{AsCoreEvent, CoreEvent};
@@ -55,7 +56,7 @@ use crate::reactive;
 use crate::reactivity::{ReadSignal, WriteSignal, create_signal};
 use crate::store::Store;
 use crate::tools::{CallOrigin, ToolRegistry, ToolRunner, submit_approval};
-use crate::types::{ApprovalChoice, InputBlock};
+use crate::types::{ApprovalChoice, InputBlock, StopReason};
 
 // ─── The runtime context ─────────────────────────────────────────────────────
 
@@ -257,15 +258,101 @@ struct ConversationActor<K: RuntimeKind, E> {
     /// that stale signal from clearing the streaming flag on a live turn.
     stream_generation: u64,
     /// The CURRENT binding's per-turn dispatch seam: set at dispatch with the
-    /// anchor resolved from the dispatch's own snapshot, cleared at close, and
-    /// read by the binding's ingestion reader at every insert. Replaced at
-    /// every bind, so a torn-down reader keeps its own, already-cleared slot
-    /// and can never stamp a successor turn's identity.
+    /// turn's anchor, cleared at every stream close, and read by the
+    /// binding's ingestion reader at every insert. Replaced at every bind, so
+    /// a torn-down reader keeps its own, already-cleared slot and can never
+    /// stamp a successor turn's identity.
     turn_anchor: TurnAnchor,
+    /// The open TURN's anchor, held by the actor (amended 2026-08-22, after
+    /// the consumer's adversarial verification proved the tail-derived
+    /// inheritance insufficient): set at the turn's first dispatch and held
+    /// until a close that ENDS the turn — the end-turn stop, the error edge,
+    /// the interrupt teardown, or the reader's abandoned mark. A tool-use
+    /// stop closes the STREAM but leaves this held while a continuation is
+    /// genuinely due ([`Self::turn_continuation_due`], refined 2026-08-22,
+    /// amended 2026-08-23),
+    /// and every continuation dispatch reuses it regardless of what the tail
+    /// is — which is what
+    /// keeps a message absorbed between a round's result and the
+    /// continuation dispatch from re-anchoring the turn onto itself, the
+    /// consumer's proven escalation. A fresh turn (nothing held) resolves
+    /// its anchor from the dispatch snapshot through
+    /// [`ratchet::fresh_turn_anchor`] — ledger-first since 2026-08-23, the
+    /// verified seventh break, which DEMOTES this field to a consistency
+    /// cache over a ledger-derivable fact: a released turn's unanswered
+    /// outcome re-attaches the identity at the resuming dispatch even when
+    /// a message was absorbed behind it, and a fresh actor over the same
+    /// ledger — the restart shape — derives the same turn a live actor was
+    /// holding. Distinct from the seam above on purpose:
+    /// the seam is a stream-scoped slot the reader consumes and it dies with
+    /// the binding, while this identity spans every stream of one turn and
+    /// survives a rebind — a continuation recovered on a fresh binding is
+    /// still the same turn. A close that ends this identity while the
+    /// turn's last outcome is unanswered also writes the end into the
+    /// ledger (2026-08-23, [`Self::settle_turn_identity`]): turn closure is
+    /// a stored fact, never re-derived from side effects.
+    open_turn: Option<i64>,
+    /// How many tool outcomes — results and errors — anchored on the open
+    /// turn its dispatches have already answered (2026-08-23, the verified
+    /// sixth break's counting arm): recorded at EVERY dispatch that sets or
+    /// reuses the identity, from the dispatch's own snapshot — the same one
+    /// the request is built from, so the count is exactly the outcomes that
+    /// request carries. The release rule compares the close's outcome count
+    /// against it: an outcome above this mark has not had its continuation
+    /// yet, and that continuation is the one thing a tool-use close still
+    /// owes. Kept in outcome units, not as a dispatch tally, by decision:
+    /// one dispatch can answer several outcomes at once (a multi-call round
+    /// resolving before its continuation), and a turn resumed off its
+    /// outcome tail — an approval resolution, a restart recovery — has that
+    /// outcome answered by the resuming dispatch itself; a per-dispatch
+    /// increment undercounts the first and overcounts the second, and each
+    /// error re-opens a proven leak shape. Meaningless while `open_turn` is
+    /// `None`; rewritten before every read.
+    answered_outcomes: usize,
+    /// The stop reason the open stream reported at its message-end, consumed
+    /// by the close to decide whether the turn's identity survives the
+    /// stream: only a tool-use stop leaves the turn open. Taken at every
+    /// close, so a stale stop can never speak for a later stream.
+    stream_stop: Option<StopReason>,
     /// How long a reader waits for a turn's remaining events after its
     /// message-end. The production value is the ingestion module's named
     /// constant; tests construct short ones to pin the expiry paths.
     drain_deadline: std::time::Duration,
+}
+
+/// Which of the three close edges reached
+/// [`ConversationActor::close_dispatch`]. Every edge settles the stream; the
+/// edge decides what else the close does — the error edge latches, and only
+/// [`CloseEdge::Closed`] can leave the turn's held identity open (when the
+/// stream stopped for tool use, the reader did not abandon it, and the
+/// close's snapshot still owes a continuation).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloseEdge {
+    /// The stream's closed signal: the reader finished the stream, tool
+    /// lifecycles drained.
+    Closed,
+    /// The stream's error signal, from either of its two producers — the
+    /// binding's reader or the actor's own store-failure paths (the
+    /// ownership rule is documented on
+    /// [`ConversationActor::owns_stream_signal`]).
+    Errored,
+    /// The interrupt teardown: the actor tore the binding down itself.
+    Teardown,
+}
+
+impl CloseEdge {
+    /// The machine key the close-marker status records for a turn this edge
+    /// ended — the stored fact of the turn's closure (2026-08-23), naming
+    /// the turn's end and the edge that closed it. `None` for the teardown:
+    /// the interrupt appends its own anchored status as that end's record,
+    /// and a second marker would record one end twice.
+    fn turn_end_key(self) -> Option<&'static str> {
+        match self {
+            CloseEdge::Closed => Some(crate::agency::Status::TURN_ENDED_CLOSED),
+            CloseEdge::Errored => Some(crate::agency::Status::TURN_ENDED_ERRORED),
+            CloseEdge::Teardown => None,
+        }
+    }
 }
 
 impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
@@ -345,8 +432,8 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
                 );
             }
             CoreEvent::StreamDone { stop_reason, .. } => self.handle_stream_done(stop_reason),
-            CoreEvent::StreamError { .. } => self.handle_stream_error(),
-            CoreEvent::StreamClosed { .. } => self.handle_stream_closed(),
+            CoreEvent::StreamError { .. } => self.handle_stream_error().await,
+            CoreEvent::StreamClosed { .. } => self.handle_stream_closed().await,
             _ => {}
         }
     }
@@ -502,12 +589,15 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     async fn handle_interrupt(&mut self) {
         self.write_latched.set(true);
         // The teardown IS the turn's close — the third of the three close
-        // edges. The torn-down reader's own terminal is discarded later by
-        // generation, so this is the one place the interrupted turn's
-        // dispatch state settles. The interrupted turn's anchor is read
-        // before the seam clears: the status block below is ABOUT that turn.
-        let interrupted_anchor = self.turn_anchor.get();
-        self.close_dispatch(false);
+        // edges, and one that ENDS the turn's identity. The torn-down
+        // reader's own terminal is discarded later by generation, so this is
+        // the one place the interrupted turn's dispatch state settles. The
+        // held identity is read before the close ends it: the status block
+        // below is ABOUT that turn — and because the identity is actor
+        // state, not the stream-scoped seam, an interrupt arriving BETWEEN
+        // a tool turn's rounds still names the turn it tore down.
+        let interrupted_anchor = self.open_turn;
+        self.close_dispatch(CloseEdge::Teardown).await;
 
         // TEARDOWN, not a second cleanup channel: cancel, then DROP the
         // provider channel and clear the binding. The cancelled turn's reader
@@ -559,23 +649,26 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         tracing::info!(conversation_id = self.id, "interrupted, latched");
     }
 
-    fn handle_stream_done(&mut self, stop_reason: Option<crate::types::StopReason>) {
+    fn handle_stream_done(&mut self, stop_reason: Option<StopReason>) {
         // Message-end no longer settles the dispatch state (2026-08-22): the
         // turn's tool lifecycles arrive AFTER this signal, and settling here
-        // was the proven duplicate-turn window. Stop reason stays recorded
-        // and surfaced data — it drives no continuation; that derives from
-        // the ledger via the frontier gate — and the turn closes on the
-        // closed signal, which the reader emits after the tool round drains.
+        // was the proven duplicate-turn window. The stop reason is recorded
+        // for the CLOSE, which consumes it to decide whether the turn's
+        // identity survives the stream — it drives no continuation; that
+        // derives from the ledger via the frontier gate — and the turn
+        // closes on the closed signal, which the reader emits after the tool
+        // round drains.
+        self.stream_stop = stop_reason;
         tracing::info!(conversation_id = self.id, ?stop_reason, "stream done");
     }
 
-    fn handle_stream_error(&mut self) {
-        self.close_dispatch(true);
+    async fn handle_stream_error(&mut self) {
+        self.close_dispatch(CloseEdge::Errored).await;
         tracing::info!(conversation_id = self.id, "stream error, latched");
     }
 
-    fn handle_stream_closed(&mut self) {
-        self.close_dispatch(false);
+    async fn handle_stream_closed(&mut self) {
+        self.close_dispatch(CloseEdge::Closed).await;
         tracing::info!(conversation_id = self.id, "stream closed");
     }
 
@@ -609,9 +702,54 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     /// nothing swallowed the close rests: the frontier was last answered by
     /// a gated drive, and a blind re-check here would redispatch a turn that
     /// wrote nothing forever.
-    fn close_dispatch(&mut self, errored: bool) {
+    ///
+    /// Every close settles the STREAM; only a close that ends the TURN
+    /// releases the held identity (amended 2026-08-22). A closed signal
+    /// whose stream stopped for tool use leaves the turn open while a
+    /// continuation is genuinely due — its rounds reuse the held anchor —
+    /// while the end-turn stop, any other or absent stop, the error edge,
+    /// the teardown and the abandoned mark all end it:
+    ///
+    /// - A tool-use close keeps the identity ONLY while
+    ///   [`Self::turn_continuation_due`] holds on the close's own snapshot
+    ///   (refined 2026-08-22, the verified fifth break; amended 2026-08-23,
+    ///   the sixth): this close is the identity's one release site, so a
+    ///   tool-use stop whose continuation never comes — a truncated tool
+    ///   lifecycle the reader discards records nothing owing — held the
+    ///   identity forever, and the next UNRELATED summons inherited it:
+    ///   over-declined tool admission on the consumer's side, and an idle
+    ///   interrupt stamping a dead turn's summoner. The sixth break proved
+    ///   the fifth's two arms leak in both directions — a model-owed tail
+    ///   kept a dead identity for someone else's summons, and a parked
+    ///   interactive or empty-id call kept one forever — so the rule now
+    ///   keeps only for an unanswered outcome or a system-owed call, both
+    ///   documented at the rule. Rejected: reusing the held anchor only for
+    ///   turn-product frontiers — the absorbed message is exactly a
+    ///   non-turn-product frontier, so that re-opens the proven escalation
+    ///   the hold exists to close.
+    /// - The out-of-band store-failure close ends the identity by decision
+    ///   (2026-08-22): it rides the error edge, and the error edge LATCHES —
+    ///   whatever the owner repairs and unlatches, the turn that resumes is
+    ///   a new decision resolved from the tail, and an identity held across
+    ///   the latch would stamp that post-repair turn with a broken turn's
+    ///   summons. Rejected: ending only reader-stamped errors — the two
+    ///   producers share the edge precisely because they share its meaning.
+    /// - The abandoned close ends it even under a tool-use stop: the
+    ///   stalled provider's continuation died with the retired binding, so
+    ///   an identity kept here would leak onto the next summons' turn.
+    ///
+    /// A close that ENDS the identity while the close's snapshot holds an
+    /// unanswered outcome for that turn also WRITES the turn's end down —
+    /// a status block anchored on the turn (2026-08-23, the design review's
+    /// verdict after the eighth break: turn closure is a stored fact). The
+    /// marker append completes before the deferred owed-turn re-check below
+    /// consumes its nudge, so a summons the close's re-check sets in motion
+    /// reads a snapshot that already carries the marker — it can never
+    /// outrun it. The rule itself lives in [`Self::settle_turn_identity`].
+    async fn close_dispatch(&mut self, edge: CloseEdge) {
         self.streaming = false;
-        if self.turn_anchor.is_abandoned() {
+        let abandoned = self.turn_anchor.is_abandoned();
+        if abandoned {
             tracing::info!(
                 conversation_id = self.id,
                 "the reader abandoned this turn at its drain deadline — \
@@ -620,11 +758,191 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             self.provider_tx = None;
         }
         self.turn_anchor.clear();
-        if errored {
+        let continuation_stop = edge == CloseEdge::Closed
+            && !abandoned
+            && self.stream_stop == Some(StopReason::ToolUse);
+        self.stream_stop = None;
+        if let Some(anchor) = self.open_turn {
+            self.settle_turn_identity(anchor, edge, continuation_stop)
+                .await;
+        }
+        if edge == CloseEdge::Errored {
             self.write_latched.set(true);
         }
         if std::mem::take(&mut self.owed_turn_deferred) {
             self.recheck.update(|nudges| *nudges += 1);
+        }
+    }
+
+    /// Whether the open turn held at `anchor` is genuinely owed a
+    /// continuation, decided on `blocks` — the close's own snapshot, read
+    /// once by [`Self::settle_turn_identity`] and shared with the marker
+    /// decision there. The release rule (2026-08-23, the verified sixth
+    /// break, replacing the fifth break's two arms): a tool-use close KEEPS
+    /// the identity iff
+    ///
+    /// - **an outcome is unanswered** — the count of tool results and tool
+    ///   errors anchored on this turn exceeds the count its dispatches have
+    ///   already answered ([`Self::answered_outcomes`]): every outcome
+    ///   summons exactly one continuation, and one above the mark has not
+    ///   had its dispatch yet; or
+    /// - **the system owes an outcome** — an unresolved, NON-interactive
+    ///   tool call with a non-empty call id, anchored on this turn, exists
+    ///   in the snapshot ([`ToolCall::system_owed_call_anchored_in`]): the
+    ///   runner will answer it, and that outcome resumes the turn.
+    ///
+    /// The fifth break's frontier arm — "the tail owes the model keeps the
+    /// identity" — is DELETED: a model-owed tail is someone's summons,
+    /// never evidence of this turn's continuation, and it kept a dead
+    /// turn's identity for exactly the fresh summons the rule exists to
+    /// protect. The unresolved-call arm is narrowed for the same break's
+    /// other shape: an interactive call parks on the user and an empty-id
+    /// call can never resolve, so either one read as owed pinned the
+    /// identity indefinitely. How each proven shape falls out:
+    ///
+    /// - **The truncated round**: no call recorded, no outcome — both arms
+    ///   empty, the close ends the turn, and a message absorbed in the
+    ///   round's window summons a turn of its own.
+    /// - **The parked interactive call**: excluded from the owed arm, no
+    ///   outcome — the close ends the turn. When the approval later
+    ///   resolves, the outcome is written with the call's own anchor, the
+    ///   tail owes the model, and the dispatch off that tail inherits the
+    ///   identity — the turn re-attaches without ever having been held.
+    /// - **The close before the result**: the recorded call is unresolved
+    ///   and the runner owes it — the owed arm keeps the identity, so a
+    ///   message absorbed before the result cannot re-anchor the turn.
+    /// - **The result recorded in the stream's own window, with a message
+    ///   absorbed behind it**: the call is resolved, but the outcome is
+    ///   above the mark — the counting arm keeps the identity, and the
+    ///   continuation the close's re-check dispatches still anchors on the
+    ///   original summons.
+    /// - **The multi-round conversation**: each round's close keeps through
+    ///   whichever arm its snapshot shows — call still owed, or outcome not
+    ///   yet answered — and each continuation dispatch re-marks the
+    ///   answered count from its own snapshot, so the final prose round,
+    ///   with every outcome answered and no call owed, ends the turn.
+    fn turn_continuation_due(&self, blocks: &[Block], anchor: i64) -> bool {
+        ToolCall::outcomes_anchored_in(blocks, anchor) > self.answered_outcomes
+            || ToolCall::system_owed_call_anchored_in(blocks, anchor)
+    }
+
+    /// Settle the held identity at a close, on ONE snapshot — the close's
+    /// own: decide whether the turn survives the stream
+    /// ([`Self::turn_continuation_due`]), and when it ends with its last
+    /// outcome unanswered, write the turn's end DOWN before returning.
+    ///
+    /// The marker (2026-08-23, the design review's verdict — turn closure
+    /// is a stored fact): eight adversarial rounds broke every attempt to
+    /// derive "this turn is over" from side effects, each on an edge that
+    /// left no side effect behind — the eighth break's four shapes (a
+    /// parked interactive call in a later round, a lost later round, the
+    /// abandoned close after a result, the error edge after a result) all
+    /// end a turn without writing a text or status, stranding the turn's
+    /// last outcome as unanswered forever, so it captured the next
+    /// unrelated summons. The one place that knows the truth now records
+    /// it: when this close ends the identity and
+    /// [`ToolCall::unanswered_outcome_anchor`] — the fresh-dispatch walk's
+    /// own predicate — still answers this turn on the close's snapshot, the
+    /// close appends a status block anchored on the turn, through the same
+    /// status write path every other turn record uses. The machine key
+    /// names the turn's end and the closing edge. No resolution rule
+    /// changes: the walk already honors status markers, so the marker is
+    /// read wherever the walk already reads.
+    ///
+    /// Ordering, the property [`Self::close_dispatch`] states: the append
+    /// is awaited here, inside the close, before the close consumes the
+    /// deferred owed-turn nudge — and this actor task is the only
+    /// dispatcher — so every dispatch that follows this close resolves over
+    /// a snapshot that carries the marker. The marker is TRANSPARENT to the
+    /// frontier decision (2026-08-23, the verified burial defect — the
+    /// owed-turn read skips the ended turn's whole trailing closure run,
+    /// [`ratchet::frontier_block`]): a message absorbed into the ended
+    /// turn's window still owes behind the marker, and the close's re-check
+    /// dispatches its turn — anchored on itself, because this same marker
+    /// answers the dead turn's outcome for the inheritance walk. Capping it
+    /// instead buried the message forever: the closed edge never latches,
+    /// so no re-engagement exists past the close's one re-check. With
+    /// nothing owed behind it the marker still rests the frontier — the
+    /// dead turn's own outcome, which the marker answers, never summons
+    /// through it — and the interrupt's status keeps its cap under the
+    /// latch, whose release re-checks there.
+    ///
+    /// The teardown edge writes no marker here: the interrupt appends its
+    /// own status — anchored on the same held identity, read before this
+    /// close ends it — as the turn's durable record, and it does so under
+    /// the latch, before any dispatch can run. A second marker would record
+    /// one end twice.
+    ///
+    /// The approval-resume stays correct by ordering: the marker answers
+    /// only the outcomes before it, and a later approval's outcome lands
+    /// after it and inherits as before. A restart mid-round writes no
+    /// marker because the tool-use close keeps the identity, so recovery
+    /// inheritance is untouched. One residual, over-decline like the rest:
+    /// an outcome committed between this snapshot and the marker's append
+    /// reads as answered by the marker; the turn then rests until the next
+    /// summons instead of resuming.
+    ///
+    /// An unreadable snapshot KEEPS the identity under a continuation stop,
+    /// by decision (2026-08-22): a wrong keep costs one over-declined turn
+    /// and heals at that turn's own close, while a wrong end re-opens the
+    /// proven escalation for a message-tail continuation. Rejected: ending
+    /// on the failed read — it trades a bounded misattribution for an
+    /// unbounded authority defect. On an edge that ends the turn
+    /// regardless, the failed read ends it WITHOUT a marker — the accepted
+    /// unstamped residual documented on the walk.
+    async fn settle_turn_identity(
+        &mut self,
+        anchor: i64,
+        edge: CloseEdge,
+        continuation_stop: bool,
+    ) {
+        let blocks = match self.ctx.store.list_blocks(self.id).await {
+            Ok(blocks) => blocks,
+            Err(e) if continuation_stop => {
+                tracing::error!(
+                    conversation_id = self.id,
+                    error = %e,
+                    "settle_turn_identity: list_blocks failed — keeping the held identity"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::error!(
+                    conversation_id = self.id,
+                    error = %e,
+                    "settle_turn_identity: list_blocks failed — the turn ends unmarked"
+                );
+                self.open_turn = None;
+                return;
+            }
+        };
+        if continuation_stop && self.turn_continuation_due(&blocks, anchor) {
+            return;
+        }
+        self.open_turn = None;
+        let Some(key) = edge.turn_end_key() else {
+            return;
+        };
+        if ToolCall::unanswered_outcome_anchor(&blocks) != Some(anchor) {
+            return;
+        }
+        if let Err(e) = self
+            .ctx
+            .store
+            .insert_status_block(
+                crate::store::BlockDestination::anchored(self.id, Some(anchor)),
+                key.into(),
+                None,
+            )
+            .await
+        {
+            tracing::error!(
+                conversation_id = self.id,
+                anchor,
+                error = %e,
+                "settle_turn_identity: the turn-end marker append failed — \
+                 the turn ends unmarked"
+            );
         }
     }
 
@@ -691,24 +1009,47 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         // stale-signal window this site carried as a dated deferral
         // (2026-08-21, "known window, kept open on purpose"): a queued
         // owed-turn signal outliving its turn now fires against the answered
-        // ledger and dies here instead of dispatching. The tail that DOES
-        // owe is the dispatch's anchor source, per the shared rule's
-        // inheritance.
-        let Some(tail) = blocks.last() else {
+        // ledger and dies here instead of dispatching.
+        // The tail is read through a dead turn's trailing closure run
+        // ([`ratchet::frontier_block`], 2026-08-23, the verified burial
+        // defect): the turn-end marker and the trailing blocks it answers
+        // are transparent here, so an addressed message absorbed anywhere in
+        // the dead turn's window — the tool-execution stretch between a call
+        // and its result included — still owes behind them and the close's
+        // re-check dispatches its turn instead of resting on the marker
+        // forever.
+        let Some(tail) = ratchet::frontier_block::<K>(&blocks) else {
             tracing::warn!(
                 conversation_id = self.id,
                 "handle_blocks_ready: list_blocks returned empty"
             );
             return;
         };
-        let Some(anchor) = ratchet::frontier_owes_turn::<K>(tail) else {
+        if !ratchet::frontier_owes_turn::<K>(tail) {
             tracing::debug!(
                 conversation_id = self.id,
                 tail_block = tail.id,
                 "handle_blocks_ready: the tail no longer owes a turn — standing down"
             );
             return;
-        };
+        }
+        // The turn's identity (amended 2026-08-22; ledger-first 2026-08-23,
+        // the verified seventh break): a dispatch while a turn is open is
+        // that turn's continuation and reuses the held anchor REGARDLESS of
+        // the tail — a message absorbed between a round's result and this
+        // dispatch is the tail, and resolving from it re-anchored the turn
+        // onto the absorbed message, the consumer's proven escalation. The
+        // held identity is a CONSISTENCY CACHE over a ledger-derivable fact
+        // (demoted 2026-08-23): a fresh dispatch resolves the same answer
+        // from the snapshot itself, through [`ratchet::fresh_turn_anchor`] —
+        // the tail's own anchor inherited, a null-anchored tail inheriting
+        // the newest UNANSWERED outcome's anchor, a new identity
+        // otherwise — which is what keeps a released turn (a parked
+        // approval resuming, a restart recovering) anchored on its original
+        // summons even when a message was absorbed behind its outcome.
+        let anchor = self
+            .open_turn
+            .unwrap_or_else(|| ratchet::fresh_turn_anchor(&blocks, tail));
 
         let conv = match store.find_conversation(self.id).await {
             Ok(Some(c)) => c,
@@ -760,8 +1101,11 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             reasoning,
         }) {
             tracing::error!(conversation_id = self.id, error = ?e, "handle_blocks_ready: provider channel closed");
-            // No turn opened: the seam a failed send left set would leak this
-            // identity onto a later binding's first inserts.
+            // No stream opened: the seam a failed send left set would leak
+            // this identity onto a later binding's first inserts. The HELD
+            // identity is untouched on purpose — an open turn stays open
+            // across a failed continuation send and the retried dispatch is
+            // still its round, while a fresh turn was never opened here.
             self.turn_anchor.clear();
             return;
         }
@@ -770,8 +1114,17 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         // handlers that clear it run on this same task, so no clear can slip
         // in between the send above and this set. The metadata fulfillment
         // loop has the same shape across TWO tasks and must set its flag
-        // before dispatching.
+        // before dispatching. The dispatched stream opens with no recorded
+        // stop, and the turn's identity is held from its first dispatch —
+        // a continuation re-holds the same anchor. Every dispatch also
+        // answers the outcomes its own snapshot carries (2026-08-23): the
+        // mark is what the release rule measures new outcomes against, and
+        // recording it from the request's snapshot is what makes a resumed
+        // turn's already-carried outcome count as answered.
         self.streaming = true;
+        self.stream_stop = None;
+        self.answered_outcomes = ToolCall::outcomes_anchored_in(&blocks, anchor);
+        self.open_turn = Some(anchor);
 
         tracing::info!(conversation_id = self.id, "sent stream request to provider");
     }
@@ -845,7 +1198,10 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         // torn-down predecessor's late signal from this binding's. The
         // per-turn seam is fresh per binding for the same reason — a
         // torn-down reader keeps its own, already-cleared slot and can never
-        // stamp a successor turn's anchor on its late writes.
+        // stamp a successor turn's anchor on its late writes. The held turn
+        // identity is deliberately NOT reset here: it is turn state, not
+        // binding state, and a continuation whose channel died mid-turn
+        // rebinds fresh while remaining the same turn.
         self.stream_generation += 1;
         self.turn_anchor = TurnAnchor::new();
         crate::ingestion::spawn_channel(
@@ -1124,6 +1480,9 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> PerConversationActor<K, E>
             owed_turn_deferred: false,
             stream_generation: 0,
             turn_anchor: TurnAnchor::new(),
+            open_turn: None,
+            answered_outcomes: 0,
+            stream_stop: None,
             drain_deadline: crate::ingestion::MESSAGE_END_DRAIN_DEADLINE,
         };
         tokio::spawn(async move {
@@ -1345,7 +1704,7 @@ mod tests {
         BoxFuture, ContentPart, LlmError, Message, MessageContent, ModelInfo, ProviderModule,
         ProviderResponse, ProviderRx, StreamEvent,
     };
-    use crate::store::{ProviderInstance, StoreError};
+    use crate::store::{ProviderInstance, StoreError, ToolCallInsert};
     use crate::tools::{ToolContext, ToolHandler, ToolOutcome};
     use crate::types::StopReason;
 
@@ -1483,7 +1842,7 @@ mod tests {
         );
 
         actor.streaming = true;
-        actor.handle_stream_closed();
+        actor.handle_stream_closed().await;
         assert!(
             actor.provider_tx.is_none(),
             "the close retires the binding on any mark; the epoch is not \
@@ -1522,7 +1881,7 @@ mod tests {
 
         // The closed edge: released, unlatched, and the swallowed signal
         // becomes exactly one scheduler re-check nudge.
-        actor.handle_stream_closed();
+        actor.handle_stream_closed().await;
         assert!(!actor.streaming, "the closed signal is a close edge");
         assert!(
             !actor.read_latched.get(),
@@ -1542,7 +1901,7 @@ mod tests {
         // A close with nothing swallowed rests: no nudge, no signal — the
         // empty turn's unchanged frontier is not re-asked forever.
         actor.streaming = true;
-        actor.handle_stream_closed();
+        actor.handle_stream_closed().await;
         assert_eq!(
             recheck.get(),
             1,
@@ -1551,9 +1910,1183 @@ mod tests {
 
         // The error edge: released AND latched.
         actor.streaming = true;
-        actor.handle_stream_error();
+        actor.handle_stream_error().await;
         assert!(!actor.streaming);
         assert!(actor.read_latched.get(), "only the error edge latches");
+    }
+
+    /// The turn identity's own close rule (amended 2026-08-22): every close
+    /// settles the stream, but only a close that ends the TURN releases the
+    /// held anchor. A tool-use stop leaves it held while a continuation is
+    /// genuinely due — the continuation rounds are the same turn. The
+    /// end-turn stop, a close with no recorded stop, the error edge (which
+    /// the out-of-band store-failure close rides, and which ends the
+    /// identity by decision: it latches, and the turn a repair resumes is a
+    /// new one resolved from the tail), the reader's abandoned mark and the
+    /// interrupt teardown all end it.
+    #[tokio::test]
+    async fn the_turn_identity_survives_only_a_tool_use_close() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        // The turn under close is genuinely owed a continuation: its
+        // recorded call is still unresolved in the close's snapshot.
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        ctx.store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call-open".into(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let (mut actor, _recheck) = bare_actor(conv, ctx, false);
+
+        // The tool-use stop: the stream closes, the turn stays open.
+        actor.streaming = true;
+        actor.open_turn = Some(summons);
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert!(!actor.streaming, "the stream itself closes");
+        assert_eq!(
+            actor.open_turn,
+            Some(summons),
+            "a tool-use stop leaves the turn's identity open"
+        );
+
+        // The stop is consumed per close: a later close of a stream that
+        // never reached its message-end cannot ride the previous stream's
+        // tool-use stop, and a stop-less close ends the turn — even while
+        // the snapshot still owes the continuation.
+        actor.streaming = true;
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            actor.open_turn, None,
+            "a close with no recorded stop ends the turn"
+        );
+
+        // The end-turn stop ends it.
+        actor.streaming = true;
+        actor.open_turn = Some(summons);
+        actor.handle_stream_done(Some(StopReason::EndTurn));
+        actor.handle_stream_closed().await;
+        assert_eq!(actor.open_turn, None, "the end-turn stop ends the turn");
+
+        // The error edge ends it even under a recorded tool-use stop with
+        // the continuation still owed. The actor's own store-failure paths
+        // emit this same edge unstamped, so this line is also the
+        // out-of-band close's pin.
+        actor.streaming = true;
+        actor.open_turn = Some(summons);
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_error().await;
+        assert_eq!(actor.open_turn, None, "the error edge ends the turn");
+        actor.write_latched.set(false);
+
+        // The abandoned mark ends it even under a tool-use stop with the
+        // continuation still owed: the stalled provider's continuation died
+        // with the retired binding, so a held identity would leak onto the
+        // next summons' turn.
+        actor.streaming = true;
+        actor.open_turn = Some(summons);
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.turn_anchor.set(summons);
+        actor.turn_anchor.mark_abandoned(actor.turn_anchor.epoch());
+        actor.handle_stream_closed().await;
+        assert_eq!(actor.open_turn, None, "the abandoned close ends the turn");
+
+        // The interrupt teardown ends it — pinned against a fresh actor,
+        // because the abandoned mark above is a binding-liveness fact and
+        // deliberately survives every later close on that seam.
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let (mut actor, _recheck) = bare_actor(conv, ctx, false);
+        actor.streaming = true;
+        actor.open_turn = Some(11);
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_interrupt().await;
+        assert_eq!(actor.open_turn, None, "the teardown ends the turn");
+    }
+
+    /// The identity-release rule's END side (2026-08-22, the verified fifth
+    /// break): a tool-use close keeps the turn's identity iff a
+    /// continuation is genuinely due in the close's snapshot — an
+    /// unresolved call bearing THIS turn's anchor, or a frontier owing the
+    /// model. A lost tool round — the stop said tool use but the truncated
+    /// lifecycle recorded no call — owes nothing, and before the rule its
+    /// close held the identity forever: the one release site never ran
+    /// again, and the next unrelated summons inherited a dead turn's
+    /// summoner.
+    #[tokio::test]
+    async fn a_tool_use_close_ends_a_turn_owed_no_continuation() {
+        // The lost round: the ledger holds the summons and the turn's prose,
+        // no call, nothing owing. The close ends the turn.
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        ctx.store
+            .insert_text_block(conv, crate::block::Role::Assistant, "hi".into())
+            .await
+            .unwrap();
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.streaming = true;
+        actor.open_turn = Some(summons);
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            actor.open_turn, None,
+            "a tool-use close with nothing owing ends the turn"
+        );
+
+        // Another turn's dangling call keeps nothing: the unresolved call
+        // must bear THIS turn's anchor, not merely exist.
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let other = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "other".into())
+            .await
+            .unwrap();
+        ctx.store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(other)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call-other".into(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.streaming = true;
+        actor.open_turn = Some(other + 1000);
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            actor.open_turn, None,
+            "another turn's unresolved call keeps nothing"
+        );
+    }
+
+    /// The verified sixth break's shape A at the rule level (2026-08-23),
+    /// the unit twin of the end-to-end pin: a lost tool round with a
+    /// message absorbed in its window. The truncated lifecycle recorded
+    /// nothing owing, so the turn is over — but the absorbed message is
+    /// the tail and owes the model, and the deleted frontier arm kept the
+    /// dead identity on exactly that: the absorbed message's OWN turn then
+    /// inherited it. A model-owed tail is someone's summons, never this
+    /// turn's continuation — the close ends the turn, and the dispatch the
+    /// close's re-check fires is the absorbed message's own, anchored on
+    /// itself.
+    #[tokio::test]
+    async fn a_lost_rounds_close_ends_the_turn_even_with_a_model_owed_tail() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        ctx.store
+            .insert_text_block(conv, crate::block::Role::Assistant, "hi".into())
+            .await
+            .unwrap();
+        let absorbed = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "absorbed".into())
+            .await
+            .unwrap();
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.streaming = true;
+        actor.open_turn = Some(summons);
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            actor.open_turn, None,
+            "a lost round's close ends the turn even though the tail owes the model"
+        );
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(absorbed),
+            "the absorbed message's turn anchors on itself, never on the dead summons"
+        );
+        assert_eq!(actor.open_turn, Some(absorbed));
+    }
+
+    /// The verified sixth break's shape B at the rule level (2026-08-23):
+    /// a call the SYSTEM never owes an outcome for must not hold the
+    /// identity. An INTERACTIVE call parks on the user, who may never
+    /// answer — counting it as an owed continuation pinned the identity
+    /// indefinitely, and someone else's fresh summons inherited it. The
+    /// close ends the turn; when the approval later resolves, the outcome
+    /// carries the turn's anchor and the tail inheritance re-attaches. An
+    /// empty-id call is the same shape one step further: no outcome can
+    /// ever match it, so it reads as unresolved forever.
+    #[tokio::test]
+    async fn a_parked_interactive_call_does_not_hold_the_identity() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        ctx.store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call-interactive".into(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: true,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.streaming = true;
+        actor.open_turn = Some(summons);
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            actor.open_turn, None,
+            "a parked interactive call ends the identity"
+        );
+
+        // The user never answers the approval; someone summons a NEW turn.
+        // Its dispatch anchors on itself, never on the parked turn.
+        let fresh = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "fresh".into())
+            .await
+            .unwrap();
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(fresh),
+            "the fresh summons' turn never inherits the parked turn's identity"
+        );
+
+        // The empty-id call: nothing can ever resolve it, so reading it as
+        // an owed continuation pins the identity forever. It ends the turn
+        // the same way.
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        ctx.store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: String::new(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.streaming = true;
+        actor.open_turn = Some(summons);
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            actor.open_turn, None,
+            "a call no outcome can ever match ends the identity"
+        );
+    }
+
+    /// The identity-release rule's KEEP side (2026-08-22; amended
+    /// 2026-08-23, the sixth break), the [`Script::HoldFirstRoundsDone`]
+    /// pin family at the rule level, walking both keep arms and the
+    /// release: a call whose result is pending keeps the identity across
+    /// the close (the owed arm), an outcome above the answered mark keeps
+    /// it for its one continuation (the counting arm) — so a message
+    /// absorbed after the result cannot re-anchor the continuation — and
+    /// once that continuation has answered the outcome, a tool-use close
+    /// ends the turn even over a model-owed tail.
+    #[tokio::test]
+    async fn a_tool_use_close_keeps_the_turn_only_while_a_continuation_is_due() {
+        // The pending result: the turn's own call is unresolved — and the
+        // tail is that call, which owes nobody a model turn, so this
+        // isolates the unresolved-call arm. The close keeps the identity.
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        let call = ctx
+            .store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call-1".into(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.streaming = true;
+        actor.open_turn = Some(summons);
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            actor.open_turn,
+            Some(summons),
+            "an unresolved call bearing the turn's anchor keeps the identity"
+        );
+
+        // The counting arm (2026-08-23, the sixth break's rule): the result
+        // is recorded and a message is absorbed behind it. The call is
+        // resolved, so the owed arm is silent — but the outcome is above
+        // the answered mark, and the close keeps the identity for the one
+        // continuation that outcome still summons.
+        ctx.store
+            .complete_tool_call_block(conv, "call-1".into(), "ok".into(), call)
+            .await
+            .unwrap()
+            .expect("the call is unresolved");
+        ctx.store
+            .insert_text_block(conv, crate::block::Role::User, "absorbed".into())
+            .await
+            .unwrap();
+        actor.streaming = true;
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            actor.open_turn,
+            Some(summons),
+            "an outcome above the answered mark keeps the identity"
+        );
+
+        // The kept case's point (the HoldFirstRoundsDone family, at the
+        // rule level): the continuation's dispatching tail is the absorbed
+        // message, and the continuation still anchors on the held summons,
+        // never on the absorbed message.
+        actor.handle_blocks_ready().await;
+        assert!(actor.streaming, "the continuation dispatched");
+        assert_eq!(
+            actor.open_turn,
+            Some(summons),
+            "the continuation is the held turn's round"
+        );
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(summons),
+            "the absorbed message never re-anchors the continuation"
+        );
+
+        // The continuation answered the outcome — its dispatch re-marked
+        // the answered count from its own snapshot — so a tool-use close
+        // that recorded nothing more ends the turn, even though the tail
+        // still owes the model. The frontier arm is deleted (2026-08-23,
+        // the verified sixth break): a model-owed tail is someone's
+        // summons, never evidence of this turn's continuation.
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            actor.open_turn, None,
+            "with every outcome answered and no call owed, the close ends the turn"
+        );
+    }
+
+    /// The verified seventh break's shape A (2026-08-23), the regression
+    /// half: the parked-interactive resume. The sixth fix releases the
+    /// identity at the parked call's close by design — the approval's later
+    /// outcome re-attaches it at the resuming dispatch. But the fresh
+    /// resolution read ONLY the tail: a message absorbed behind the outcome
+    /// became the tail, and the resumed continuation anchored on the
+    /// absorbed line — the consumer's original escalation, re-opened. The
+    /// resolution is ledger-first now ([`ratchet::fresh_turn_anchor`]): the
+    /// null-anchored tail inherits the newest UNANSWERED outcome's anchor,
+    /// so the continuation anchors the ORIGINAL summons.
+    #[tokio::test]
+    async fn an_approval_resume_keeps_its_summons_past_an_absorbed_message() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        let call = ctx
+            .store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call-appr".into(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: true,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.streaming = true;
+        actor.open_turn = Some(summons);
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            actor.open_turn, None,
+            "the parked interactive close releases the identity"
+        );
+
+        // The approval resolves — the outcome carries the call's own
+        // anchor — and a message is absorbed behind it before the resuming
+        // dispatch fires.
+        ctx.store
+            .complete_tool_call_block(conv, "call-appr".into(), "approved".into(), call)
+            .await
+            .unwrap()
+            .expect("the call is unresolved");
+        ctx.store
+            .insert_text_block(conv, crate::block::Role::User, "absorbed".into())
+            .await
+            .unwrap();
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(summons),
+            "the resumed continuation anchors the original summons, never the absorbed line"
+        );
+        assert_eq!(actor.open_turn, Some(summons));
+    }
+
+    /// The verified seventh break's shape B (2026-08-23), the pre-existing
+    /// half: the restart shape. A fresh actor over the same ledger holds
+    /// nothing — every identity it resolves is ledger-derived — so a round
+    /// whose result was recorded while no actor was live, with a message absorbed
+    /// behind it, resumed anchored on the absorbed line. The ledger-first
+    /// resolution derives the same turn a live actor would have been
+    /// holding: the held identity is a consistency cache, and the ledger is
+    /// the fact.
+    #[tokio::test]
+    async fn a_fresh_actor_derives_the_open_turn_from_the_ledger_alone() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        let call = ctx
+            .store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call-restart".into(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        ctx.store
+            .complete_tool_call_block(conv, "call-restart".into(), "ok".into(), call)
+            .await
+            .unwrap()
+            .expect("the call is unresolved");
+        ctx.store
+            .insert_text_block(conv, crate::block::Role::User, "absorbed".into())
+            .await
+            .unwrap();
+
+        // The restart: a brand-new actor, no held state at all.
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(summons),
+            "the recovered continuation anchors the original summons, never the absorbed line"
+        );
+        assert_eq!(actor.open_turn, Some(summons));
+    }
+
+    /// The inheritance's bound, pinned beside the seventh fix (2026-08-23):
+    /// a COMPLETED turn's outcome captures nothing. The continuation's text
+    /// block carries the turn's anchor behind the outcome, the outcome
+    /// reads answered, and the next summons starts an identity of its own.
+    #[tokio::test]
+    async fn an_answered_outcome_never_captures_the_next_summons() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        let call = ctx
+            .store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call-done".into(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        ctx.store
+            .complete_tool_call_block(conv, "call-done".into(), "ok".into(), call)
+            .await
+            .unwrap()
+            .expect("the call is unresolved");
+        ctx.store
+            .insert_final_text_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                "done".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let fresh = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "fresh".into())
+            .await
+            .unwrap();
+
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(fresh),
+            "a completed turn's outcome never captures the next summons"
+        );
+        assert_eq!(actor.open_turn, Some(fresh));
+    }
+
+    /// The inheritance's other bound (2026-08-23): a status-marked turn's
+    /// outcome does not capture. The interrupt's status block carries the
+    /// turn's anchor, which closes the turn as answered for the walk — the
+    /// next summons is its own turn.
+    #[tokio::test]
+    async fn an_interrupted_turns_outcome_never_captures_the_next_summons() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        let call = ctx
+            .store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call-cut".into(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        ctx.store
+            .complete_tool_call_block(conv, "call-cut".into(), "ok".into(), call)
+            .await
+            .unwrap()
+            .expect("the call is unresolved");
+        ctx.store
+            .insert_status_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                "interrupted".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let fresh = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "fresh".into())
+            .await
+            .unwrap();
+
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(fresh),
+            "a status-marked turn's outcome never captures the next summons"
+        );
+        assert_eq!(actor.open_turn, Some(fresh));
+    }
+
+    // ─── The stored turn closure (2026-08-23, the eighth break) ─────────
+
+    /// One whole recorded tool round — the summons, its call, the call's
+    /// result — the floor every eighth-break shape stands on: the result is
+    /// the turn's last outcome, and whether anything ever answers it is
+    /// exactly what the shapes vary.
+    async fn one_recorded_round(
+        script: Script,
+    ) -> (RuntimeContext<BlockKind, CoreEvent>, i64, i64) {
+        let (ctx, conv, _probe) = scripted_context(script).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        let call = ctx
+            .store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call-r1".into(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        ctx.store
+            .complete_tool_call_block(conv, "call-r1".into(), "ok".into(), call)
+            .await
+            .unwrap()
+            .expect("the call is unresolved");
+        (ctx, conv, summons)
+    }
+
+    /// Every status block in the ledger, as `(machine key, anchor)` — what
+    /// the close-marker pins read.
+    async fn status_markers(
+        ctx: &RuntimeContext<BlockKind, CoreEvent>,
+        conv: i64,
+    ) -> Vec<(String, Option<i64>)> {
+        ctx.store
+            .list_blocks(conv)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|block| block.block_type == "status")
+            .map(|block| {
+                (
+                    block.fields["status"].as_str().unwrap().to_owned(),
+                    block.dispatch_anchor,
+                )
+            })
+            .collect()
+    }
+
+    /// The eighth break's first shape (2026-08-23): the parked interactive
+    /// call in round TWO. Round one recorded a result; round two emitted
+    /// only an interactive call, so nothing anchored on the turn follows
+    /// that result except a `tool_call` block — an end with no side effect,
+    /// which stranded the result as unanswered forever and captured the
+    /// next unrelated summons. The close now writes the turn's end down: a
+    /// status block anchored on the turn, keyed with the closing edge, and
+    /// the fresh summons anchors on itself.
+    #[tokio::test]
+    async fn a_round_two_interactive_park_writes_the_turns_end() {
+        let (ctx, conv, summons) = one_recorded_round(Script::CountOnly).await;
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert_eq!(actor.open_turn, Some(summons), "round two is the same turn");
+        assert_eq!(
+            actor.answered_outcomes, 1,
+            "the round-one outcome is answered by this dispatch"
+        );
+
+        ctx.store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call-r2".into(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: true,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            actor.open_turn, None,
+            "the parked interactive close releases the identity"
+        );
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("turn_ended:closed".to_owned(), Some(summons))],
+            "the close wrote the turn's end down, anchored on the turn"
+        );
+
+        let fresh = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "fresh".into())
+            .await
+            .unwrap();
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(fresh),
+            "the fresh summons anchors on itself, never on the parked turn"
+        );
+        assert_eq!(actor.open_turn, Some(fresh));
+    }
+
+    /// The eighth break's second shape (2026-08-23): the LOST round two.
+    /// Round one recorded a result; round two's stream said tool use but
+    /// the truncated lifecycle recorded nothing at all, so the close
+    /// releases the identity with the result still unanswered. The close
+    /// writes the turn's end down, and the fresh summons anchors on itself.
+    #[tokio::test]
+    async fn a_lost_round_two_writes_the_turns_end() {
+        let (ctx, conv, summons) = one_recorded_round(Script::CountOnly).await;
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert_eq!(actor.open_turn, Some(summons));
+
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            actor.open_turn, None,
+            "the lost round's close ends the turn"
+        );
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("turn_ended:closed".to_owned(), Some(summons))]
+        );
+
+        let fresh = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "fresh".into())
+            .await
+            .unwrap();
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(fresh),
+            "the fresh summons anchors on itself, never on the lost turn"
+        );
+    }
+
+    /// The eighth break's third shape (2026-08-23): the ABANDONED close
+    /// after a round-one result — the reader hit its drain deadline, the
+    /// binding is retired, and the turn ends with its result unanswered.
+    /// The abandoned close rides the closed edge, so that is the edge the
+    /// marker names.
+    #[tokio::test]
+    async fn an_abandoned_close_after_a_result_writes_the_turns_end() {
+        let (ctx, conv, summons) = one_recorded_round(Script::CountOnly).await;
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert_eq!(actor.open_turn, Some(summons));
+
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.turn_anchor.mark_abandoned(actor.turn_anchor.epoch());
+        actor.handle_stream_closed().await;
+        assert_eq!(actor.open_turn, None, "the abandoned close ends the turn");
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("turn_ended:closed".to_owned(), Some(summons))]
+        );
+
+        let fresh = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "fresh".into())
+            .await
+            .unwrap();
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(fresh),
+            "the fresh summons anchors on itself, never on the abandoned turn"
+        );
+    }
+
+    /// The eighth break's fourth shape (2026-08-23): the ERROR edge after a
+    /// round-one result. The actor's own store-failure paths ride this
+    /// same edge unstamped, so this is also the recoverable half of that
+    /// residual: whenever the store can still serve the close, the turn's
+    /// end is recorded, and only a store too broken to write stays
+    /// unmarked.
+    #[tokio::test]
+    async fn an_error_close_after_a_result_writes_the_turns_end() {
+        let (ctx, conv, summons) = one_recorded_round(Script::CountOnly).await;
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert_eq!(actor.open_turn, Some(summons));
+
+        actor.handle_stream_error().await;
+        assert_eq!(actor.open_turn, None, "the error edge ends the turn");
+        assert!(actor.read_latched.get(), "the error edge still latches");
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("turn_ended:errored".to_owned(), Some(summons))]
+        );
+
+        actor.write_latched.set(false);
+        let fresh = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "fresh".into())
+            .await
+            .unwrap();
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(fresh),
+            "the fresh summons anchors on itself, never on the errored turn"
+        );
+    }
+
+    /// The two-turns-merged follow-on, resolved (2026-08-23): before the
+    /// marker, the parked turn's stranded result captured the next summons
+    /// and the ledger read as ONE turn wearing two summonses — and when the
+    /// approval finally resolved, its outcome resumed a turn whose identity
+    /// the capture had already spent. With the close's marker the shapes
+    /// separate: the captured summons gets an identity of its own, answers
+    /// as its own turn, and the approval's outcome — which lands AFTER the
+    /// marker — still resumes the original turn through the unchanged
+    /// inheritance walk. The approval-resume pin, re-proven with the marker
+    /// in the ledger.
+    #[tokio::test]
+    async fn the_captured_summons_shape_resolves_to_two_turns() {
+        let (ctx, conv, summons) = one_recorded_round(Script::CountOnly).await;
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        let call2 = ctx
+            .store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call-r2".into(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: true,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+
+        // The summons the break used to capture: its own turn now.
+        let fresh = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "fresh".into())
+            .await
+            .unwrap();
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(fresh),
+            "the once-captured summons has an identity of its own"
+        );
+
+        // That turn answers and ends — anchored on ITS summons.
+        ctx.store
+            .insert_final_text_block(
+                crate::store::BlockDestination::anchored(conv, Some(fresh)),
+                crate::block::Role::Assistant,
+                "answered".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        actor.handle_stream_done(Some(StopReason::EndTurn));
+        actor.handle_stream_closed().await;
+        assert_eq!(actor.open_turn, None);
+
+        // The approval resolves at last: its outcome lands after the
+        // marker, so the walk reads it unanswered and the resuming dispatch
+        // inherits the ORIGINAL summons — the marker answers only the
+        // outcomes before it.
+        ctx.store
+            .complete_tool_call_block(conv, "call-r2".into(), "approved".into(), call2)
+            .await
+            .unwrap()
+            .expect("the approval call is unresolved");
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(summons),
+            "the approval's outcome still resumes the original turn"
+        );
+        assert_eq!(actor.open_turn, Some(summons));
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("turn_ended:closed".to_owned(), Some(summons))],
+            "one end, one marker — the answered fresh turn wrote none"
+        );
+    }
+
+    /// The ordering the close states (2026-08-23): the marker append
+    /// completes before the close consumes the deferred owed-turn nudge,
+    /// so a summons the close's re-check sets in motion resolves over a
+    /// snapshot that already carries the marker — it cannot outrun it. The
+    /// ordering is observable through the anchor: the marker is transparent
+    /// to the frontier (the verified burial defect — an opaque marker
+    /// buried the absorbed line forever, since the non-latching closed
+    /// edge re-checks exactly once), so the re-check dispatches the
+    /// absorbed line's turn, and only a snapshot already carrying the
+    /// marker anchors that turn on the absorbed line itself — without the
+    /// marker, the walk would hand it the dead turn's unanswered outcome.
+    #[tokio::test]
+    async fn the_turn_end_marker_precedes_the_closes_re_check() {
+        let (ctx, conv, summons) = one_recorded_round(Script::CountOnly).await;
+        let (mut actor, recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert_eq!(actor.open_turn, Some(summons));
+
+        // A message absorbed while round two is open: the delivery defers
+        // to the close.
+        let absorbed = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "absorbed".into())
+            .await
+            .unwrap();
+        actor.handle_blocks_ready().await;
+        assert!(actor.owed_turn_deferred, "the mid-turn delivery deferred");
+
+        // Round two records nothing and closes: the turn ends, the marker
+        // is committed, and only then is the nudge consumed.
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(actor.open_turn, None);
+        assert_eq!(recheck.get(), 1, "the close nudged the scheduler once");
+        let blocks = ctx.store.list_blocks(conv).await.unwrap();
+        let marker = blocks.last().unwrap();
+        assert_eq!(
+            (marker.block_type.as_str(), marker.dispatch_anchor),
+            ("status", Some(summons)),
+            "the marker is durably committed when the nudge fires"
+        );
+        assert!(
+            marker.id > absorbed,
+            "the marker follows the absorbed line in ledger order"
+        );
+
+        // The re-check's delivery: the frontier reads through the marker,
+        // and the absorbed line summons its own turn — anchored on itself,
+        // because the committed marker answers the dead turn's outcome for
+        // the inheritance walk. The dead turn itself stays dead.
+        actor.handle_blocks_ready().await;
+        assert!(
+            actor.streaming,
+            "the close's re-check dispatches the absorbed line's turn"
+        );
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(absorbed),
+            "the absorbed line anchors on itself — the marker preceded the re-check"
+        );
+        assert_eq!(actor.open_turn, Some(absorbed));
+
+        // Exactly once: the turn answers and closes, and the frontier
+        // rests — no re-dispatch off the marker, and the answered turn
+        // writes no second marker.
+        ctx.store
+            .insert_final_text_block(
+                crate::store::BlockDestination::anchored(conv, Some(absorbed)),
+                crate::block::Role::Assistant,
+                "answered".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        actor.handle_stream_done(Some(StopReason::EndTurn));
+        actor.handle_stream_closed().await;
+        assert_eq!(actor.open_turn, None);
+        actor.handle_blocks_ready().await;
+        assert!(
+            !actor.streaming,
+            "the absorbed line's turn fires exactly once"
+        );
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("turn_ended:closed".to_owned(), Some(summons))],
+            "one end, one marker"
+        );
+    }
+
+    /// The transparency's bound (2026-08-23), pinned beside the burial fix:
+    /// when nothing owed sits behind the marker — the block there is the
+    /// dead turn's own outcome, which the marker answers — the re-check
+    /// rests. The frontier reads through the marker to what it buried,
+    /// never past it onto the closed turn's products: reaching the outcome
+    /// would redispatch the very turn the marker recorded as ended.
+    #[tokio::test]
+    async fn the_stand_down_rests_when_nothing_owed_sits_behind_the_marker() {
+        let (ctx, conv, summons) = one_recorded_round(Script::CountOnly).await;
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert_eq!(actor.open_turn, Some(summons));
+
+        // Round two records nothing and closes: the turn ends over its
+        // unanswered result, and the ledger's tail is that result, then
+        // the marker.
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("turn_ended:closed".to_owned(), Some(summons))]
+        );
+
+        actor.handle_blocks_ready().await;
+        assert!(
+            !actor.streaming,
+            "the dead turn's outcome never summons through its own marker"
+        );
+        assert_eq!(actor.open_turn, None);
+    }
+
+    /// The tool-execution window, end to end on the error edge (2026-08-23,
+    /// the verified regression on the transparency's first cut): a message
+    /// absorbed between the turn's call and its RESULT sits under the
+    /// outcome-plus-marker pair, and a frontier read that skips only the
+    /// trailing markers stopped on the outcome, read it as answered by the
+    /// marker, and rested — the absorbed line was buried exactly as the
+    /// opaque marker buried it, and unlike the closed edge the burial here
+    /// survives the latch's release too, because every later delivery reads
+    /// the same shape. The dead turn's whole trailing run is transparent,
+    /// so the delivery after the unlatch dispatches the absorbed line's
+    /// turn — anchored on itself, since the marker answers the dead turn's
+    /// outcome for the inheritance walk.
+    #[tokio::test]
+    async fn an_error_close_dispatches_the_line_absorbed_in_the_tool_window() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        let (mut actor, recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert_eq!(actor.open_turn, Some(summons));
+
+        // The round records its call; the line is absorbed while the tool
+        // is still executing — BEFORE the result — and the mid-turn
+        // delivery defers to the close.
+        let call = ctx
+            .store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "call-r1".into(),
+                    name: "echo".into(),
+                    input: "{}".into(),
+                    interactive: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let absorbed = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "absorbed".into())
+            .await
+            .unwrap();
+        actor.handle_blocks_ready().await;
+        assert!(actor.owed_turn_deferred, "the mid-turn delivery deferred");
+        ctx.store
+            .complete_tool_call_block(conv, "call-r1".into(), "ok".into(), call)
+            .await
+            .unwrap()
+            .expect("the call is unresolved");
+
+        // The error edge: the turn ends over its unanswered result, the
+        // marker is written, and the close consumes the deferral.
+        actor.handle_stream_error().await;
+        assert_eq!(actor.open_turn, None, "the error edge ends the turn");
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("turn_ended:errored".to_owned(), Some(summons))]
+        );
+        assert_eq!(recheck.get(), 1, "the close nudged the scheduler once");
+
+        // The repair unlatches; the next delivery reads through the dead
+        // turn's whole trailing run and the absorbed line summons its own
+        // turn.
+        actor.write_latched.set(false);
+        actor.handle_blocks_ready().await;
+        assert!(
+            actor.streaming,
+            "the absorbed line's turn dispatches past the outcome-plus-marker pair"
+        );
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(absorbed),
+            "the absorbed line anchors on itself"
+        );
+        assert_eq!(actor.open_turn, Some(absorbed));
+    }
+
+    /// The restart half of the marker's do-no-harm proof (2026-08-23): a
+    /// fresh actor over a marked ledger — the restart shape — derives the
+    /// same answers a live actor holds. The marked turn stays ended (its
+    /// outcome captures nothing), and the next summons starts fresh; the
+    /// mid-round restart's inheritance is untouched because a kept close
+    /// writes no marker, which
+    /// [`a_fresh_actor_derives_the_open_turn_from_the_ledger_alone`] pins.
+    #[tokio::test]
+    async fn a_restart_over_a_marked_end_starts_the_next_summons_fresh() {
+        let (ctx, conv, summons) = one_recorded_round(Script::CountOnly).await;
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert_eq!(actor.open_turn, Some(summons));
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("turn_ended:closed".to_owned(), Some(summons))]
+        );
+        drop(actor);
+
+        // The restart: a brand-new actor over the marked ledger.
+        let fresh = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "fresh".into())
+            .await
+            .unwrap();
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert_eq!(
+            actor.turn_anchor.get(),
+            Some(fresh),
+            "the restarted actor reads the marked turn as ended"
+        );
+        assert_eq!(actor.open_turn, Some(fresh));
     }
 
     /// The cursor-confirm feedback edge, pinned as ruled at [`run_scheduler`]:
@@ -1631,6 +3164,39 @@ mod tests {
         /// frontier is the first round's RESULT, a turn product, so its call
         /// must inherit the original summoning message's identity.
         TwoToolRounds,
+        /// [`Script::TwoToolRounds`] with round ONE's trailing done HELD:
+        /// the message end and the whole tool lifecycle go out at once — so
+        /// the call records and its result lands while the stream is still
+        /// open — and the done waits for the probe's release. What that
+        /// stages deterministically is the consumer-proven escalation shape
+        /// (amended 2026-08-22): a message appended after round one's result
+        /// and released into the close becomes the continuation's
+        /// dispatching tail, and the continuation must still anchor on the
+        /// original summons.
+        HoldFirstRoundsDone,
+        /// [`Script::HoldFirstRoundsDone`]'s sibling: round one goes out
+        /// WHOLE — message end, tool lifecycle, trailing done — but the tool
+        /// itself (`held_echo`) waits for the probe's `finish`, so the
+        /// stream CLOSES while the call is still owed its result. The
+        /// close's snapshot then holds an unresolved call bearing the
+        /// turn's anchor and a tail (the call) that owes nobody a model
+        /// turn — the identity-release rule's unresolved-call arm,
+        /// isolated. Later rounds answer with the closing prose.
+        HoldFirstRoundsResult,
+        /// The lost tool round (2026-08-22, the verified fifth break): the
+        /// first turn stops for TOOL USE and its tool lifecycle is
+        /// truncated — a start with no end, discarded at the trailing done
+        /// as an incomplete fact. Nothing owing is recorded, so no
+        /// continuation is ever due. Later turns answer with plain prose.
+        TruncatedToolLifecycle,
+        /// [`Script::TruncatedToolLifecycle`] with the trailing done HELD
+        /// for the probe's release: the prose, the message end and the
+        /// truncated lifecycle go out at once, so a message can be absorbed
+        /// inside the still-open window before the close discards the
+        /// lifecycle. The sixth break's shape A: nothing owing is recorded,
+        /// yet the tail — the absorbed message — owes the model. Later
+        /// turns answer with plain prose.
+        TruncatedHeld,
         /// Every request answers with an empty turn — a message end and the
         /// trailing done, no content. The close-rest probe: the frontier is
         /// unchanged at the close, so the close must not keep redispatching
@@ -1876,6 +3442,57 @@ mod tests {
         ])
     }
 
+    /// A turn whose trailing done waits for the probe's release: the given
+    /// events go out at once, and only the done is held — the still-open
+    /// window the held scripts absorb a message into. Round one of
+    /// [`Script::HoldFirstRoundsDone`] rides it with a whole tool round,
+    /// [`Script::TruncatedHeld`] with the truncated lifecycle.
+    fn held_done_events(
+        events: Vec<StreamEvent>,
+        resp_tx: &tokio::sync::mpsc::UnboundedSender<ProviderResponse>,
+        release: &Arc<tokio::sync::Notify>,
+    ) -> Scripted {
+        let resp_tx = resp_tx.clone();
+        let release = Arc::clone(release);
+        tokio::spawn(async move {
+            release.notified().await;
+            let _ = resp_tx.send(ProviderResponse::Done);
+        });
+        Scripted::Events(events)
+    }
+
+    /// Round one of [`Script::HoldToolRound`]: the message end goes out now;
+    /// the tool lifecycle and the trailing done wait for the probe's
+    /// release — the held post-message-end window the duplicate-turn defect
+    /// lived in.
+    fn held_lifecycle_round(
+        turn: usize,
+        tool: &'static str,
+        resp_tx: &tokio::sync::mpsc::UnboundedSender<ProviderResponse>,
+        release: &Arc<tokio::sync::Notify>,
+    ) -> Scripted {
+        let resp_tx = resp_tx.clone();
+        let release = Arc::clone(release);
+        tokio::spawn(async move {
+            release.notified().await;
+            for event in [
+                StreamEvent::ToolUseStart {
+                    id: format!("call-{turn}"),
+                    name: tool.into(),
+                },
+                StreamEvent::ToolUseInputDelta { json: "{}".into() },
+                StreamEvent::ToolUseEnd,
+            ] {
+                let _ = resp_tx.send(ProviderResponse::Event(event));
+            }
+            let _ = resp_tx.send(ProviderResponse::Done);
+        });
+        Scripted::Events(vec![StreamEvent::MessageEnd {
+            usage: crate::providers::Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        }])
+    }
+
     /// A provider module that answers from a script instead of a wire. It
     /// stands exactly where the runtime's own infrastructure ends: requests
     /// arrive through the real bind seam and responses travel the real
@@ -1913,6 +3530,17 @@ mod tests {
                 MessageContent::Text(_) => 0,
             })
             .sum()
+    }
+
+    /// Whether any of a request's messages carries `needle` in its text —
+    /// how the tests assert WHAT a dispatched request absorbed.
+    fn request_carries(messages: &[Message], needle: &str) -> bool {
+        messages.iter().any(|m| match &m.content {
+            MessageContent::Text(text) => text.contains(needle),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::Text { text } if text.contains(needle))),
+        })
     }
 
     /// One message's compact descriptor for those diagnostics: its role, and
@@ -2110,6 +3738,42 @@ mod tests {
         ]
     }
 
+    /// The composed-runtime shape's opening turn: one tool call, with the
+    /// message end after the whole lifecycle.
+    fn call_before_end_events() -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolUseStart {
+                id: "call-1".into(),
+                name: "echo".into(),
+            },
+            StreamEvent::ToolUseInputDelta { json: "{}".into() },
+            StreamEvent::ToolUseEnd,
+            StreamEvent::MessageEnd {
+                usage: crate::providers::Usage::default(),
+                stop_reason: StopReason::ToolUse,
+            },
+        ]
+    }
+
+    /// The lost round's events: prose, the message end with the tool-use
+    /// stop, then a tool lifecycle cut off before its end — which the
+    /// reader discards at the trailing done as an incomplete fact.
+    fn truncated_lifecycle_events() -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::TextBlockStart,
+            StreamEvent::TextDelta { text: "hi".into() },
+            StreamEvent::MessageEnd {
+                usage: crate::providers::Usage::default(),
+                stop_reason: StopReason::ToolUse,
+            },
+            StreamEvent::ToolUseStart {
+                id: "call-truncated".into(),
+                name: "echo".into(),
+            },
+            StreamEvent::ToolUseInputDelta { json: "{}".into() },
+        ]
+    }
+
     /// One turn emitting TWO tool calls, in the real wire order: the message
     /// end with the tool-use stop, then BOTH drained tool lifecycles.
     fn two_call_round_events() -> Vec<StreamEvent> {
@@ -2216,22 +3880,29 @@ mod tests {
                 Scripted::Turn(prose_turn_events("recovered"))
             }
             (Script::Prose, _) => Scripted::Turn(prose_turn_events("answered")),
-            (Script::ToolCallThenText, 0) => Scripted::Turn(vec![
-                StreamEvent::ToolUseStart {
-                    id: "call-1".into(),
-                    name: "echo".into(),
-                },
-                StreamEvent::ToolUseInputDelta { json: "{}".into() },
-                StreamEvent::ToolUseEnd,
-                StreamEvent::MessageEnd {
-                    usage: crate::providers::Usage::default(),
-                    stop_reason: StopReason::ToolUse,
-                },
-            ]),
+            (Script::ToolCallThenText, 0) => Scripted::Turn(call_before_end_events()),
             (Script::ToolRound { tool, narration }, 0) => {
                 Scripted::Turn(tool_round_events(turn, tool, narration))
             }
-            (Script::TwoToolRounds, 0 | 1) => Scripted::Turn(tool_round_events(turn, "echo", None)),
+            (Script::TwoToolRounds, 0 | 1) | (Script::HoldFirstRoundsDone, 1) => {
+                Scripted::Turn(tool_round_events(turn, "echo", None))
+            }
+            (Script::HoldFirstRoundsDone, 0) => {
+                held_done_events(tool_round_events(turn, "echo", None), resp_tx, release)
+            }
+            (Script::HoldFirstRoundsResult, 0) => {
+                Scripted::Turn(tool_round_events(turn, "held_echo", None))
+            }
+            (Script::TruncatedToolLifecycle, _) if turn == 1 => {
+                Scripted::Turn(truncated_lifecycle_events())
+            }
+            (Script::TruncatedHeld, _) if turn == 1 => {
+                held_done_events(truncated_lifecycle_events(), resp_tx, release)
+            }
+            (Script::HoldFirstRoundsResult, 1..)
+            | (Script::TruncatedToolLifecycle | Script::TruncatedHeld, _) => {
+                Scripted::Turn(prose_turn_events("done"))
+            }
             (Script::EmptyTurn, _) => Scripted::Turn(vec![message_end]),
             (Script::TwoCallsInOneTurn, 0) => Scripted::Turn(two_call_round_events()),
             (
@@ -2239,6 +3910,7 @@ mod tests {
                 | Script::ToolRound { .. }
                 | Script::HoldToolRound { .. }
                 | Script::TwoToolRounds
+                | Script::HoldFirstRoundsDone
                 | Script::TwoCallsInOneTurn,
                 2..,
             )
@@ -2247,29 +3919,7 @@ mod tests {
                 1,
             ) => Scripted::Turn(prose_turn_events("done")),
             (Script::HoldToolRound { tool }, 0) => {
-                // The message end goes out now; the tool lifecycle and the
-                // trailing done wait for the probe's release — the held
-                // post-message-end window the duplicate-turn defect lived in.
-                let resp_tx = resp_tx.clone();
-                let release = Arc::clone(release);
-                tokio::spawn(async move {
-                    release.notified().await;
-                    for event in [
-                        StreamEvent::ToolUseStart {
-                            id: format!("call-{turn}"),
-                            name: tool.into(),
-                        },
-                        StreamEvent::ToolUseInputDelta { json: "{}".into() },
-                        StreamEvent::ToolUseEnd,
-                    ] {
-                        let _ = resp_tx.send(ProviderResponse::Event(event));
-                    }
-                    let _ = resp_tx.send(ProviderResponse::Done);
-                });
-                Scripted::Events(vec![StreamEvent::MessageEnd {
-                    usage: crate::providers::Usage::default(),
-                    stop_reason: StopReason::ToolUse,
-                }])
+                held_lifecycle_round(turn, tool, resp_tx, release)
             }
         }
     }
@@ -2291,6 +3941,33 @@ mod tests {
             _ctx: ToolContext<'a, CoreEvent>,
         ) -> BoxFuture<'a, ToolOutcome> {
             Box::pin(async { ToolOutcome::Done("echoed".into()) })
+        }
+    }
+
+    /// An ungated tool that answers only at the probe's `finish` — how the
+    /// held-result script keeps a recorded call unresolved past its
+    /// stream's close.
+    struct HeldEchoTool {
+        finish: Arc<tokio::sync::Notify>,
+    }
+
+    impl ToolHandler<CoreEvent> for HeldEchoTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "held_echo".into(),
+                description: "answers with a fixed string when released".into(),
+                parameters: json!({ "type": "object" }),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _input: &'a str,
+            _ctx: ToolContext<'a, CoreEvent>,
+        ) -> BoxFuture<'a, ToolOutcome> {
+            Box::pin(async {
+                self.finish.notified().await;
+                ToolOutcome::Done("echoed".into())
+            })
         }
     }
 
@@ -2370,6 +4047,12 @@ mod tests {
         let mut tools = ToolRegistry::new();
         tools.register("echo", EchoTool);
         tools.register("boom", FailingTool);
+        tools.register(
+            "held_echo",
+            HeldEchoTool {
+                finish: Arc::clone(&finish),
+            },
+        );
 
         let ctx: RuntimeContext<BlockKind, CoreEvent> = RuntimeContext::new(
             store,
@@ -2619,6 +4302,9 @@ mod tests {
             owed_turn_deferred: false,
             stream_generation: 0,
             turn_anchor: TurnAnchor::new(),
+            open_turn: None,
+            answered_outcomes: 0,
+            stream_stop: None,
             drain_deadline: crate::ingestion::MESSAGE_END_DRAIN_DEADLINE,
         };
         (actor, read_recheck)
@@ -3452,6 +5138,519 @@ mod tests {
         }
     }
 
+    /// The consumer-proven escalation shape (amended 2026-08-22): a member's
+    /// message summons a two-round tool turn, a message is absorbed after
+    /// round one's RESULT — it becomes the continuation's dispatching tail —
+    /// and the continuation's call still anchors on the ORIGINAL summons.
+    /// Under the retired tail-derived inheritance the continuation
+    /// re-anchored on the absorbed message and the original summoner fell
+    /// out of the turn's identity, which is the escalation the consumer's
+    /// admission check proved: a turn summoned by one member re-anchored
+    /// onto another's message. The turn's identity is actor state — held
+    /// from the first dispatch, kept across the tool-use close — and the
+    /// end-turn close then really ends it: a fresh summons after the turn
+    /// anchors a turn of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_message_absorbed_after_a_rounds_result_never_reanchors_the_turn() {
+        let (ctx, conv, probe) = composed_runtime(Script::HoldFirstRoundsDone).await;
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "summons".into(),
+            }],
+        });
+
+        // Round one runs to its RESULT with the stream still open: the done
+        // is held, so the continuation cannot dispatch yet.
+        await_ledger(&ctx, conv, "round one's result", |blocks| {
+            blocks.iter().any(|b| b.block_type == "tool_result")
+        })
+        .await;
+
+        // The absorbed message: appended after round one's result and before
+        // the continuation dispatch — the continuation's dispatching tail.
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "absorbed".into(),
+            }],
+        });
+        await_ledger(&ctx, conv, "the absorbed message", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.fields.get("content") == Some(&json!("absorbed")))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            1,
+            "no dispatch while round one's stream is open — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+
+        // Release the held done: the tool-use close keeps the turn open, and
+        // its re-check dispatches the continuation off the absorbed tail.
+        probe.release.notify_one();
+        let blocks = await_ledger(&ctx, conv, "the turn's closing prose", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.block_type == "text" && b.fields["content"] == json!("done"))
+        })
+        .await;
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            3,
+            "two call rounds and the close — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+        assert!(
+            request_carries(&probe.seen.lock().unwrap()[1], "absorbed"),
+            "the continuation's request absorbed the message"
+        );
+
+        // The absorbed message really sits between round one's result and
+        // the continuation's call in ledger order.
+        let summoner = user_block(&blocks).id;
+        let absorbed = blocks
+            .iter()
+            .find(|b| b.fields.get("content") == Some(&json!("absorbed")))
+            .unwrap();
+        let calls: Vec<&Block> = blocks
+            .iter()
+            .filter(|b| b.block_type == "tool_call")
+            .collect();
+        let results: Vec<&Block> = blocks
+            .iter()
+            .filter(|b| b.block_type == "tool_result")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[0].id < absorbed.id && absorbed.id < calls[1].id,
+            "the absorbed message is the continuation's dispatching tail"
+        );
+
+        // The pin itself: every product of the turn — the continuation's
+        // call included — anchors on the ORIGINAL summons; the absorbed
+        // message, a message and not a turn product, anchors nothing.
+        assert_eq!(absorbed.dispatch_anchor, None);
+        for block in calls.iter().chain(&results) {
+            assert_eq!(
+                block.dispatch_anchor,
+                Some(summoner),
+                "block {} ({}) anchors on the original summons",
+                block.id,
+                block.block_type
+            );
+        }
+        let closing = blocks
+            .iter()
+            .find(|b| b.block_type == "text" && b.fields["content"] == json!("done"))
+            .unwrap();
+        assert_eq!(closing.dispatch_anchor, Some(summoner));
+
+        // The end-turn close ended the identity: a fresh summons now
+        // anchors a turn of its own, not the finished turn's.
+        assert_fresh_summons_starts_its_own_turn(&ctx, conv).await;
+    }
+
+    /// The escalation pin's closing claim, run against a conversation whose
+    /// tool turn just closed on its end-turn stop: the close really ENDED
+    /// the held identity, so a fresh summons resolves from the tail and its
+    /// answer anchors on itself — never on the finished turn's summons.
+    async fn assert_fresh_summons_starts_its_own_turn(
+        ctx: &RuntimeContext<BlockKind, CoreEvent>,
+        conv: i64,
+    ) {
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "again".into(),
+            }],
+        });
+        let blocks = await_ledger(ctx, conv, "the second summons' answer", |blocks| {
+            assistant_answers(blocks) == vec!["done".to_string(), "done".to_string()]
+        })
+        .await;
+        let again = blocks
+            .iter()
+            .find(|b| b.fields.get("content") == Some(&json!("again")))
+            .unwrap();
+        let last_answer = blocks
+            .iter()
+            .rfind(|b| b.block_type == "text" && b.fields["content"] == json!("done"))
+            .unwrap();
+        assert_eq!(
+            last_answer.dispatch_anchor,
+            Some(again.id),
+            "a fresh turn resolves from the tail — the held identity is gone"
+        );
+    }
+
+    /// The verified fifth break, pinned (2026-08-22): a turn stops for TOOL
+    /// USE but its lifecycle is truncated and discarded, so nothing owing is
+    /// recorded and no continuation ever dispatches — the turn is over in
+    /// every observable way, and the close must END its identity. Before the
+    /// release rule the close kept it forever: the idle interrupt stamped
+    /// the dead turn's summoner, and the next, unrelated summons inherited
+    /// it — its answer anchored on the previous summoner instead of on
+    /// itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lost_tool_round_ends_the_turn_instead_of_leaking_its_identity() {
+        let (ctx, conv, probe) = composed_runtime(Script::TruncatedToolLifecycle).await;
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "first".into(),
+            }],
+        });
+        await_ledger(&ctx, conv, "the truncated turn's prose", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.block_type == "text" && b.fields.get("content") == Some(&json!("hi")))
+        })
+        .await;
+
+        // The round really is lost: the unterminated lifecycle is discarded,
+        // nothing owing is recorded, and nothing dispatches again.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let blocks = ctx.store.list_blocks(conv).await.unwrap();
+        assert!(
+            !blocks.iter().any(|b| b.block_type == "tool_call"),
+            "the truncated lifecycle is discarded — ledger {:?}",
+            blocks
+                .iter()
+                .map(|b| b.block_type.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            1,
+            "no continuation dispatches — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+
+        // An IDLE interrupt, after that turn ended: with no turn in flight
+        // the status is nobody's product and records NULL — never the dead
+        // turn's summoner.
+        ctx.bus.emit(CoreEvent::InterruptRequested {
+            conversation_id: conv,
+        });
+        let blocks = await_ledger(&ctx, conv, "the idle interrupt's status", |blocks| {
+            blocks.last().is_some_and(|b| b.block_type == "status")
+        })
+        .await;
+        assert_eq!(
+            blocks.last().unwrap().dispatch_anchor,
+            None,
+            "an idle interrupt's status anchors nothing"
+        );
+
+        // A FRESH summons — which also unlatches — anchors a turn of its
+        // own: the answer names ITS summoner, never the lost round's.
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "again".into(),
+            }],
+        });
+        let blocks = await_ledger(&ctx, conv, "the second summons' answer", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.block_type == "text" && b.fields.get("content") == Some(&json!("done")))
+        })
+        .await;
+        let first = blocks
+            .iter()
+            .find(|b| b.fields.get("content") == Some(&json!("first")))
+            .unwrap();
+        let again = blocks
+            .iter()
+            .find(|b| b.fields.get("content") == Some(&json!("again")))
+            .unwrap();
+        let answer = blocks
+            .iter()
+            .find(|b| b.fields.get("content") == Some(&json!("done")))
+            .unwrap();
+        assert!(
+            answer.id > again.id,
+            "the answer follows the second summons"
+        );
+        assert_ne!(
+            answer.dispatch_anchor,
+            Some(first.id),
+            "LEAK: the second summons' answer anchors on the FIRST summons"
+        );
+        assert_eq!(
+            answer.dispatch_anchor,
+            Some(again.id),
+            "a fresh turn resolves from the tail"
+        );
+    }
+
+    /// The verified sixth break's shape A, end to end (2026-08-23): the
+    /// lost tool round with a message absorbed in its held window. The
+    /// truncated lifecycle records nothing owing, so no continuation is
+    /// ever due — but the absorbed message is the close's tail and owes
+    /// the model, and the deleted frontier arm kept the dead turn's
+    /// identity on exactly that: the absorbed message's own turn — someone
+    /// ELSE'S fresh summons — inherited it, and its answer anchored on the
+    /// dead summons. The close must end the turn, and the turn its
+    /// re-check dispatches must anchor on the absorbed message itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_absorbed_message_after_a_lost_round_anchors_its_own_turn() {
+        let (ctx, conv, probe) = composed_runtime(Script::TruncatedHeld).await;
+        let mut done_rx = ctx.bus.subscribe();
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "first".into(),
+            }],
+        });
+
+        // The window is provably open: the message end arrived and the
+        // trailing done is still held.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match done_rx.try_recv() {
+                Ok(CoreEvent::StreamDone {
+                    conversation_id, ..
+                }) if conversation_id == conv => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the held turn's message end never arrived"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(e) => panic!("subscription failed: {e}"),
+            }
+        }
+
+        // The absorbed message: appended inside the held window, before the
+        // close discards the truncated lifecycle.
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "absorbed".into(),
+            }],
+        });
+        await_ledger(&ctx, conv, "the absorbed message", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.fields.get("content") == Some(&json!("absorbed")))
+        })
+        .await;
+
+        // Release the done: the close discards the lifecycle, ends the dead
+        // turn, and its re-check dispatches the absorbed message's own turn.
+        probe.release.notify_one();
+        let blocks = await_ledger(&ctx, conv, "the absorbed message's answer", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.block_type == "text" && b.fields["content"] == json!("done"))
+        })
+        .await;
+        assert!(
+            !blocks.iter().any(|b| b.block_type == "tool_call"),
+            "the truncated lifecycle is discarded"
+        );
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            2,
+            "the lost round and the absorbed message's turn — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+        assert!(
+            request_carries(&probe.seen.lock().unwrap()[1], "absorbed"),
+            "the second request carries the absorbed message"
+        );
+
+        let first = blocks
+            .iter()
+            .find(|b| b.fields.get("content") == Some(&json!("first")))
+            .unwrap();
+        let absorbed = blocks
+            .iter()
+            .find(|b| b.fields.get("content") == Some(&json!("absorbed")))
+            .unwrap();
+        let answer = blocks
+            .iter()
+            .find(|b| b.fields.get("content") == Some(&json!("done")))
+            .unwrap();
+        assert_ne!(
+            answer.dispatch_anchor,
+            Some(first.id),
+            "LEAK: the absorbed message's answer anchors on the dead turn's summons"
+        );
+        assert_eq!(
+            answer.dispatch_anchor,
+            Some(absorbed.id),
+            "the absorbed message's answer anchors on the absorbed message"
+        );
+    }
+
+    /// The release rule's kept case, end to end (the
+    /// [`Script::HoldFirstRoundsDone`] pin family): round one's stream closes with its call still owed a result
+    /// — the unresolved-call arm keeps the identity — so a message absorbed
+    /// before the result cannot re-anchor the turn: nothing dispatches
+    /// while the call is owed, the continuation the result unlocks absorbs
+    /// the message and still anchors on the original summons, and the
+    /// end-turn close then really ends the identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_close_before_the_result_keeps_the_turn_for_its_continuation() {
+        let (ctx, conv, probe) = composed_runtime(Script::HoldFirstRoundsResult).await;
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "summons".into(),
+            }],
+        });
+
+        // Round one goes out whole and its stream closes; the held tool
+        // keeps the call unresolved past the close.
+        await_ledger(&ctx, conv, "round one's call", |blocks| {
+            blocks.iter().any(|b| b.block_type == "tool_call")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The absorbed message: appended after the close, while the call is
+        // still owed its result. The drive parks on the unresolved call, so
+        // nothing dispatches — deterministically, not by luck.
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "absorbed".into(),
+            }],
+        });
+        await_ledger(&ctx, conv, "the absorbed message", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.fields.get("content") == Some(&json!("absorbed")))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            1,
+            "no dispatch while the call is owed its result — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+        assert!(
+            !ctx.store
+                .list_blocks(conv)
+                .await
+                .unwrap()
+                .iter()
+                .any(|b| b.block_type == "tool_result"),
+            "the result is still held"
+        );
+
+        // Release the tool: the result unlocks the continuation, which
+        // absorbs the message and closes the turn with its prose.
+        probe.finish.notify_one();
+        let blocks = await_ledger(&ctx, conv, "the turn's closing prose", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.block_type == "text" && b.fields["content"] == json!("done"))
+        })
+        .await;
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            2,
+            "one round and its continuation — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+        assert!(
+            request_carries(&probe.seen.lock().unwrap()[1], "absorbed"),
+            "the continuation's request absorbed the message"
+        );
+
+        // The absorbed message sits between the call and its result in
+        // ledger order — absorbed before the result, exactly the window the
+        // kept identity covers.
+        let call = blocks.iter().find(|b| b.block_type == "tool_call").unwrap();
+        let result = blocks
+            .iter()
+            .find(|b| b.block_type == "tool_result")
+            .unwrap();
+        let absorbed = blocks
+            .iter()
+            .find(|b| b.fields.get("content") == Some(&json!("absorbed")))
+            .unwrap();
+        assert!(
+            call.id < absorbed.id && absorbed.id < result.id,
+            "the message is absorbed before the result"
+        );
+
+        // Every product of the turn anchors on the original summons; the
+        // absorbed message, not a turn product, anchors nothing.
+        let summoner = user_block(&blocks).id;
+        assert_eq!(absorbed.dispatch_anchor, None);
+        let closing = blocks
+            .iter()
+            .find(|b| b.block_type == "text" && b.fields["content"] == json!("done"))
+            .unwrap();
+        for block in [call, result, closing] {
+            assert_eq!(
+                block.dispatch_anchor,
+                Some(summoner),
+                "block {} ({}) anchors on the original summons",
+                block.id,
+                block.block_type
+            );
+        }
+
+        // The end-turn close ended the identity: a fresh summons now
+        // anchors a turn of its own.
+        assert_fresh_summons_starts_its_own_turn(&ctx, conv).await;
+    }
+
+    /// The kept identity's consumer-visible proof, and the pin that the
+    /// release rule did not over-rotate: an interrupt arriving AFTER round
+    /// one's close but while its result is still owed tears down a turn
+    /// that is genuinely open, so its status stamps the held summoner —
+    /// a close that wrongly ended the identity here would stamp NULL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_interrupt_while_the_result_is_owed_stamps_the_held_turns_summoner() {
+        let (ctx, conv, probe) = composed_runtime(Script::HoldFirstRoundsResult).await;
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "summons".into(),
+            }],
+        });
+        await_ledger(&ctx, conv, "round one's call", |blocks| {
+            blocks.iter().any(|b| b.block_type == "tool_call")
+        })
+        .await;
+        // The wait puts round one's close before the interrupt: the
+        // identity crossing it is the kept state under probe.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        ctx.bus.emit(CoreEvent::InterruptRequested {
+            conversation_id: conv,
+        });
+        let blocks = await_ledger(&ctx, conv, "the interrupt's status", |blocks| {
+            blocks.last().is_some_and(|b| b.block_type == "status")
+        })
+        .await;
+        let summoner = user_block(&blocks).id;
+        assert_eq!(
+            blocks.last().unwrap().dispatch_anchor,
+            Some(summoner),
+            "the interrupted turn's status names the held summoner"
+        );
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            1,
+            "the interrupted round never continued — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+    }
+
     /// AC8-3, the failed round: the tool errors, the error block copies the
     /// call's anchor, and the turn dispatched off the ERROR inherits it too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3627,14 +5826,7 @@ mod tests {
             probe.shapes.lock().unwrap()
         );
         assert!(
-            probe.seen.lock().unwrap()[1].iter().any(|m| {
-                match &m.content {
-                    MessageContent::Text(text) => text.contains("absorbed"),
-                    MessageContent::Parts(parts) => parts.iter().any(
-                        |p| matches!(p, ContentPart::Text { text } if text.contains("absorbed")),
-                    ),
-                }
-            }),
+            request_carries(&probe.seen.lock().unwrap()[1], "absorbed"),
             "the following turn's request contains the absorbed message"
         );
         assert_eq!(

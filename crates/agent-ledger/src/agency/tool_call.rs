@@ -91,6 +91,129 @@ impl ToolCall {
                 _ => false,
             })
     }
+
+    /// Does the ledger hold a call anchored on `anchor` whose outcome the
+    /// SYSTEM itself still owes?
+    ///
+    /// One arm of the actor's identity-release rule (2026-08-22; narrowed
+    /// 2026-08-23, the verified sixth break): a call the runner will answer
+    /// is the proof that the turn's continuation is genuinely due — its
+    /// outcome resumes the turn no matter what else the ledger absorbs.
+    /// Keyed on the anchor, never on recency — another turn's dangling call
+    /// must not keep this turn's identity alive. Two calls are NOT that
+    /// proof and are excluded by the narrowing, because each pinned an
+    /// identity indefinitely:
+    ///
+    /// - An INTERACTIVE call parks on the user, who may never answer. Its
+    ///   close ends the turn; a later approval writes the outcome with the
+    ///   call's own anchor, and the tail inheritance re-attaches the
+    ///   identity at that dispatch.
+    /// - An EMPTY-ID call can never be resolved at all —
+    ///   [`Self::resolved_in`] matches outcomes on the id, and an absent id
+    ///   matches nothing — so counting it as owed reads as owed forever.
+    ///
+    /// Resolution is answered through [`Self::resolved_in`], THE resolution
+    /// predicate, so this cannot drift from what the runner and the
+    /// approval kinds consider answered. The call rows are read through
+    /// [`BlockKind`] for the same reason the runner reads them there: they
+    /// are the library's own kinds, and a composed consumer kind delegates
+    /// the core type strings inward to the same parse.
+    #[must_use]
+    pub(crate) fn system_owed_call_anchored_in(ledger: &[Block], anchor: i64) -> bool {
+        ledger.iter().any(|block| {
+            block.dispatch_anchor == Some(anchor)
+                && matches!(
+                    BlockKind::from_block(block),
+                    BlockKind::ToolCall(call)
+                        if !call.interactive
+                            && !call.tool_call_id.is_empty()
+                            && !call.resolved_in(ledger)
+                )
+        })
+    }
+
+    /// How many tool outcomes — results and errors — the ledger holds
+    /// anchored on `anchor`.
+    ///
+    /// The other arm's measure (2026-08-23): every outcome a turn's calls
+    /// produce summons one continuation, so an outcome count above what the
+    /// turn's dispatches have already answered is a continuation still due.
+    /// The kinds are read through [`BlockKind`], like every other outcome
+    /// decision, and the anchor keying keeps another turn's outcomes out of
+    /// this turn's count.
+    #[must_use]
+    pub(crate) fn outcomes_anchored_in(ledger: &[Block], anchor: i64) -> usize {
+        ledger
+            .iter()
+            .filter(|block| {
+                block.dispatch_anchor == Some(anchor)
+                    && matches!(
+                        BlockKind::from_block(block),
+                        BlockKind::ToolResult(_) | BlockKind::ToolError(_)
+                    )
+            })
+            .count()
+    }
+
+    /// The newest tool outcome in the ledger — a result or an error — whose
+    /// turn is still UNANSWERED, answered as that turn's anchor.
+    ///
+    /// The fresh-dispatch inheritance's measure (2026-08-23, the verified
+    /// seventh break — the resolution is ledger-first): a released turn
+    /// resumes off its outcome — a parked interactive call's approval
+    /// resolving, a restart recovering a round — and only the ledger knows
+    /// it. The tail alone does not: a message absorbed behind the outcome
+    /// becomes the tail, and a tail-only fresh resolution anchored the
+    /// resumed continuation on the absorbed line — the consumer's original
+    /// escalation, re-opened for released turns. So the fresh dispatch asks
+    /// the snapshot: walk backward to the newest outcome, and if no
+    /// assistant text block and no status block carrying that outcome's
+    /// anchor follow it, the outcome's continuation has not happened — the
+    /// turn is unanswered, and the dispatch inherits its anchor. A text
+    /// block with the anchor is the continuation itself; a status block
+    /// with the anchor is the turn's close marker — the interrupt's cap,
+    /// the reader's abnormal-stop record, or the close's own turn-end
+    /// marker (2026-08-23, turn closure is a stored fact: a close that ends
+    /// a held identity over an unanswered outcome writes the end down,
+    /// because the eighth break proved every side-effect-free end strands
+    /// its outcome here forever); any one means the turn closed and its
+    /// outcome captures nothing.
+    ///
+    /// A newest outcome with a NULL anchor — the out-of-band tool path —
+    /// carries no identity to inherit and answers `None`: the consumer's
+    /// documented fold for a null anchor is its floor, and reaching past it
+    /// to an older outcome would stamp one turn's summoner on another
+    /// turn's products.
+    ///
+    /// The accepted residual, documented with the rule and NARROWED by the
+    /// stored closure (2026-08-23): the error-edge close now writes the
+    /// turn-end marker whenever the store can still serve it, so only a
+    /// turn ended while the store itself cannot write — the unstamped
+    /// store-failure shape — leaves no status marker, and its outcome can
+    /// over-attach one later summons. The direction is over-decline in the
+    /// consumer's authority fold, and it self-heals at that turn's close —
+    /// the attached turn's own text or status carries the anchor, and the
+    /// outcome reads answered from then on.
+    #[must_use]
+    pub(crate) fn unanswered_outcome_anchor(ledger: &[Block]) -> Option<i64> {
+        let (position, outcome) = ledger.iter().enumerate().rev().find(|(_, block)| {
+            matches!(
+                BlockKind::from_block(block),
+                BlockKind::ToolResult(_) | BlockKind::ToolError(_)
+            )
+        })?;
+        let anchor = outcome.dispatch_anchor?;
+        ledger[position + 1..]
+            .iter()
+            .all(|block| {
+                block.dispatch_anchor != Some(anchor)
+                    || !matches!(
+                        BlockKind::from_block(block),
+                        BlockKind::Text(_) | BlockKind::Status(_)
+                    )
+            })
+            .then_some(anchor)
+    }
 }
 
 impl Agency for ToolCall {

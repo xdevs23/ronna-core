@@ -148,6 +148,24 @@ pub trait Agency {
         true
     }
 
+    /// Whether the owed-turn frontier decision reads THROUGH this block
+    /// (2026-08-23, the verified burial defect): a transparent tail is
+    /// skipped when the frontier's tail is read, and the block behind it
+    /// answers instead. Default: opaque — the tail speaks for itself.
+    ///
+    /// Exactly one shape answers `true`: the status record carrying a
+    /// stored turn-closure key ([`Status`]). That marker is
+    /// appended by a close that ends a turn over an unanswered outcome, and
+    /// an addressed message absorbed into the dead turn's window sits
+    /// BEHIND it in ledger order — an opaque marker buried that message
+    /// forever, because the non-latching closed edge has no re-engagement
+    /// beyond the close's one re-check. The interrupt's status stays opaque
+    /// on purpose: its capping under the latch is that path's recorded
+    /// semantics, and the latch's own release re-checks there.
+    fn frontier_transparent(&self) -> bool {
+        false
+    }
+
     /// Vet this block before [`run`](Self::run).
     ///
     /// [`Refuse`](GateDecision::Refuse) records an error block, skips `run()`
@@ -495,7 +513,8 @@ pub enum BlockKind {
     ToolResult(ToolResult),
     /// A tool's failure.
     ToolError(ToolError),
-    /// A frontier cap, such as an interrupt.
+    /// A frontier cap, such as an interrupt — except the stored turn-closure
+    /// markers, which the frontier reads through instead.
     Status(Status),
     /// The conversation's system prompt.
     SystemPrompt(SystemPrompt),
@@ -638,6 +657,10 @@ impl Agency for BlockKind {
 
     fn durable(&self) -> bool {
         dispatch!(self, kind => kind.durable())
+    }
+
+    fn frontier_transparent(&self) -> bool {
+        dispatch!(self, kind => kind.frontier_transparent())
     }
 
     async fn gate<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> GateDecision {
