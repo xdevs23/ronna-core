@@ -15,8 +15,10 @@
 //! [decoder](super::sse) its responses take, which is why the two live side by
 //! side rather than one inside the other.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use reqwest::header::HeaderMap;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::providers::bind::OpenedTurn;
@@ -39,9 +41,12 @@ use super::wire::{
 /// silently dropped by a vendor written before it existed.
 pub(crate) type EffortTranslation = fn(ReasoningLevel) -> Option<String>;
 
-/// One ordered text-bearing part of an assistant group, handed to a vendor's
-/// content encoder: plain text, or reasoning that was not already replayed
-/// through a sibling wire field.
+/// One ordered text-bearing part of a group, handed to a vendor's content
+/// encoder: plain text, or reasoning that was not already replayed through a
+/// sibling wire field. Named for the assistant because the encoder seam exists
+/// for assistant groups — reasoning replay is the one thing a vendor encodes
+/// differently — but a media-free user group folds through the same seam's
+/// default, under its own role.
 ///
 /// The payload rides along because a vendor's encoder decides for itself
 /// whether it can replay one. Which vendors are compiled decides whether any
@@ -62,6 +67,18 @@ impl AssistantTextPart<'_> {
             Self::Text(text) | Self::Reasoning { text, .. } => text,
         }
     }
+}
+
+/// One ordered part of a converted group, as [`ChatProvider::convert_parts`]
+/// collects it: a text-bearing part bound for a vendor's content encoder, or a
+/// media part bound for the structured chunks carrier.
+///
+/// The split is the point. The text-only carrier above is a vendor seam and
+/// stays one; media never reaches an encoder written for text, it switches the
+/// whole group's content to typed chunks instead.
+enum GroupPart<'a> {
+    Text(AssistantTextPart<'a>),
+    Image { mime: &'a str, data: &'a [u8] },
 }
 
 /// Vendor seam: assemble an assistant group's ordered parts into the wire
@@ -217,13 +234,9 @@ impl ChatProvider {
         let mut carried_payloads = false;
 
         for msg in messages {
+            let role = wire_role(msg.role);
             match &msg.content {
                 MessageContent::Text(text) => {
-                    let role = match msg.role {
-                        MessageRole::System => "system",
-                        MessageRole::User => "user",
-                        MessageRole::Assistant => "assistant",
-                    };
                     wire_messages.push(WireMessage {
                         role: role.to_string(),
                         content: Some(WireMessageContent::Text(text.clone())),
@@ -233,7 +246,7 @@ impl ChatProvider {
                     });
                 }
                 MessageContent::Parts(parts) => {
-                    self.convert_parts(parts, include_reasoning_payloads)
+                    self.convert_parts(parts, role, include_reasoning_payloads)
                         .append_to(&mut wire_messages, &mut carried_payloads);
                 }
             }
@@ -245,9 +258,10 @@ impl ChatProvider {
     fn convert_parts(
         &self,
         parts: &[ContentPart],
+        role: &'static str,
         include_reasoning_payloads: bool,
     ) -> ConvertedParts {
-        let mut content_parts: Vec<AssistantTextPart> = Vec::new();
+        let mut group_parts: Vec<GroupPart> = Vec::new();
         let mut details: Vec<WireReasoningDetail> = Vec::new();
         let mut tool_calls = Vec::new();
         let mut tool_results = Vec::new();
@@ -255,7 +269,9 @@ impl ChatProvider {
 
         for part in parts {
             match part {
-                ContentPart::Text { text } => content_parts.push(AssistantTextPart::Text(text)),
+                ContentPart::Text { text } => {
+                    group_parts.push(GroupPart::Text(AssistantTextPart::Text(text)));
+                }
                 ContentPart::Reasoning { text, opaque } => {
                     // The variant gate: only THIS surface's payload replays
                     // here, only on an endpoint that accepts the echo, and only
@@ -273,10 +289,10 @@ impl ChatProvider {
                             continue;
                         }
                     }
-                    content_parts.push(AssistantTextPart::Reasoning {
+                    group_parts.push(GroupPart::Text(AssistantTextPart::Reasoning {
                         text,
                         opaque: opaque.as_ref(),
-                    });
+                    }));
                 }
                 ContentPart::ToolUse { id, name, input } => {
                     tool_calls.push(WireToolCall {
@@ -292,13 +308,33 @@ impl ChatProvider {
                     tool_use_id,
                     content,
                 } => tool_results.push((tool_use_id.clone(), content.clone())),
+                ContentPart::Image { mime, data } => {
+                    group_parts.push(GroupPart::Image { mime, data });
+                }
             }
         }
 
-        let (content, chunk_payloads) =
-            (self.assistant_content)(&content_parts, include_reasoning_payloads);
+        // A group carrying media switches to the typed-chunk content; a group
+        // without any goes through the vendor's content encoder exactly as it
+        // always did, so the media path cannot disturb a text-only wire.
+        let has_media = group_parts
+            .iter()
+            .any(|part| matches!(part, GroupPart::Image { .. }));
+        let (content, chunk_payloads) = if has_media {
+            (Some(media_chunks(&group_parts)), false)
+        } else {
+            let text_parts: Vec<AssistantTextPart> = group_parts
+                .into_iter()
+                .filter_map(|part| match part {
+                    GroupPart::Text(text) => Some(text),
+                    GroupPart::Image { .. } => None,
+                })
+                .collect();
+            (self.assistant_content)(&text_parts, include_reasoning_payloads)
+        };
 
         ConvertedParts {
+            role,
             content,
             details,
             tool_calls,
@@ -432,8 +468,49 @@ impl ChatProvider {
     }
 }
 
-/// One assistant group, converted but not yet appended.
+/// The wire spelling of a message's role. Content never decides it: a user and
+/// an assistant can both carry text, or parts, and the misattribution this
+/// mapping replaced sent a user's parts to the model in the assistant's voice.
+fn wire_role(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::System => "system",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+    }
+}
+
+/// The typed-chunk content for a media-bearing group: every part in the
+/// group's own order — text (a media group's caption included) as a text
+/// chunk, an image as an `image_url` data URI carrying the bytes
+/// base64-encoded.
+///
+/// The bytes travel encoded rather than by reference on purpose: a platform's
+/// file URL is short-lived, authenticated, and names the platform to the
+/// model's provider.
+fn media_chunks(parts: &[GroupPart<'_>]) -> WireMessageContent {
+    let chunks = parts
+        .iter()
+        .filter_map(|part| match part {
+            // An empty caption contributes no chunk: a caption-less image is
+            // the common case, and an empty text part (`{"type":"text",
+            // "text":""}`) is rejected by some OpenAI-compatible gateways.
+            GroupPart::Text(text) if text.text().is_empty() => None,
+            GroupPart::Text(text) => Some(json!({ "type": "text", "text": text.text() })),
+            GroupPart::Image { mime, data } => Some(json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{mime};base64,{}", BASE64.encode(data)) },
+            })),
+        })
+        .collect();
+    WireMessageContent::Chunks(chunks)
+}
+
+/// One group, converted but not yet appended.
 struct ConvertedParts {
+    /// The wire role the group's own message is emitted under. Tool results
+    /// are not under it: they leave under the wire's tool role, keyed on the
+    /// call they answer.
+    role: &'static str,
     content: Option<WireMessageContent>,
     details: Vec<WireReasoningDetail>,
     tool_calls: Vec<WireToolCall>,
@@ -442,9 +519,10 @@ struct ConvertedParts {
 }
 
 impl ConvertedParts {
-    /// Append the assistant message and its tool results, in that order.
+    /// Append the group's message — under the group's real role — and its tool
+    /// results, in that order.
     ///
-    /// The assistant message is emitted only when it carries something: a
+    /// The group's message is emitted only when it carries something: a
     /// message with neither content nor calls is rejected outright by these
     /// endpoints, with an error that names a position in the array rather than
     /// the block that produced it.
@@ -453,7 +531,7 @@ impl ConvertedParts {
 
         if self.content.is_some() || !self.tool_calls.is_empty() || !self.details.is_empty() {
             out.push(WireMessage {
-                role: "assistant".to_string(),
+                role: self.role.to_string(),
                 content: self.content,
                 tool_calls: if self.tool_calls.is_empty() {
                     None

@@ -453,6 +453,181 @@ mod reasoning_ingest {
     }
 }
 
+/// The parts branch of the request wire: the role a converted group leaves
+/// under, and the typed-chunks form a media-bearing group takes.
+mod parts_wire {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    use super::*;
+    use crate::providers::types::{ContentPart, Message, MessageContent, MessageRole};
+
+    fn convert(messages: &[Message]) -> Value {
+        let (wire, _) = plain_provider().convert_messages(messages, true);
+        serde_json::to_value(&wire).expect("the wire serializes")
+    }
+
+    fn parts(role: MessageRole, parts: Vec<ContentPart>) -> Message {
+        Message {
+            role,
+            content: MessageContent::Parts(parts),
+        }
+    }
+
+    /// The misattribution bug, pinned on the real path: a parts message leaves
+    /// under its MESSAGE's role, never under a hardcoded assistant. A user
+    /// group is `user`, an assistant group stays `assistant`, and a tool
+    /// result keeps its `tool` routing — three roles varying in one request,
+    /// so no single hardcoded role can pass.
+    #[test]
+    fn parts_messages_leave_under_their_own_role() {
+        let actual = convert(&[
+            parts(
+                MessageRole::User,
+                vec![ContentPart::Text {
+                    text: "look at this".into(),
+                }],
+            ),
+            parts(
+                MessageRole::Assistant,
+                vec![
+                    ContentPart::Text {
+                        text: "noted".into(),
+                    },
+                    ContentPart::ToolUse {
+                        id: "c1".into(),
+                        name: "search".into(),
+                        input: json!({ "q": "x" }),
+                    },
+                ],
+            ),
+            parts(
+                MessageRole::User,
+                vec![ContentPart::ToolResult {
+                    tool_use_id: "c1".into(),
+                    content: "found".into(),
+                }],
+            ),
+        ]);
+
+        let expected = json!([
+            { "role": "user", "content": "look at this" },
+            {
+                "role": "assistant",
+                "content": "noted",
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": { "name": "search", "arguments": "{\"q\":\"x\"}" }
+                }]
+            },
+            { "role": "tool", "content": "found", "tool_call_id": "c1" },
+        ]);
+        assert_eq!(actual, expected);
+    }
+
+    /// A user message carrying a caption and an image serializes to a `user`
+    /// message whose content is the typed chunks — the caption text part and
+    /// the `image_url` data URI, in the group's own order — and the URI's MIME
+    /// and base64 round-trip the exact bytes.
+    #[test]
+    fn user_image_rides_the_chunks_content_as_a_data_uri() {
+        let bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF];
+        let actual = convert(&[parts(
+            MessageRole::User,
+            vec![
+                ContentPart::Text {
+                    text: "what is this?".into(),
+                },
+                ContentPart::Image {
+                    mime: "image/png".into(),
+                    data: bytes.clone(),
+                },
+            ],
+        )]);
+
+        let encoded = BASE64.encode(&bytes);
+        let expected = json!([{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is this?" },
+                {
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:image/png;base64,{encoded}") }
+                },
+            ],
+        }]);
+        assert_eq!(actual, expected);
+
+        // The data URI round-trips the bytes, not merely a shape.
+        let url = actual[0]["content"][1]["image_url"]["url"]
+            .as_str()
+            .expect("the URI is a string");
+        let (head, b64) = url.split_once(";base64,").expect("a base64 data URI");
+        assert_eq!(head, "data:image/png");
+        assert_eq!(BASE64.decode(b64).expect("the payload decodes"), bytes);
+    }
+
+    /// A caption-less image emits no empty text chunk. A photo sent with no
+    /// caption is the common case, and an empty `{"type":"text","text":""}`
+    /// part is rejected by some OpenAI-compatible gateways — so the content is
+    /// the image chunk alone, not a text chunk carrying the empty string.
+    #[test]
+    fn a_caption_less_image_emits_only_the_image_chunk() {
+        let bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x00, 0xFF];
+        let actual = convert(&[parts(
+            MessageRole::User,
+            vec![
+                ContentPart::Text {
+                    text: String::new(),
+                },
+                ContentPart::Image {
+                    mime: "image/png".into(),
+                    data: bytes.clone(),
+                },
+            ],
+        )]);
+
+        let encoded = BASE64.encode(&bytes);
+        let expected = json!([{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:image/png;base64,{encoded}") }
+                },
+            ],
+        }]);
+        assert_eq!(
+            actual, expected,
+            "the empty caption contributes no chunk; only the image rides"
+        );
+    }
+
+    /// The shipped media variant set is `Image` alone. Inline audio was
+    /// verified silently dropped by the gateway for the model this wire
+    /// serves, so no `Audio` variant exists — the match here is exhaustive on
+    /// purpose, so a later media variant arrives as a compile error in a pin
+    /// that names the decision, a deliberate change rather than an accident.
+    #[test]
+    fn the_media_variant_set_is_image_only() {
+        let tag = |part: &ContentPart| match part {
+            ContentPart::Text { .. } => "text",
+            ContentPart::Reasoning { .. } => "reasoning",
+            ContentPart::ToolUse { .. } => "tool_use",
+            ContentPart::ToolResult { .. } => "tool_result",
+            ContentPart::Image { .. } => "image",
+        };
+        assert_eq!(
+            tag(&ContentPart::Image {
+                mime: "image/png".into(),
+                data: vec![],
+            }),
+            "image"
+        );
+    }
+}
+
 /// The usage opt-in, and the end of turn it defers.
 mod usage_tests {
     use super::*;

@@ -81,6 +81,21 @@ pub(super) enum WireContentBlock {
         tool_use_id: String,
         content: String,
     },
+    /// A user-authored image, carried inline as this vendor's base64 source
+    /// block.
+    Image {
+        source: WireImageSource,
+    },
+}
+
+/// The inline image source: the bytes base64-encoded beside their MIME type.
+#[derive(Serialize, Deserialize)]
+pub(super) struct WireImageSource {
+    /// Always `base64` — the bytes travel with the request rather than by
+    /// reference.
+    pub(super) r#type: String,
+    pub(super) media_type: String,
+    pub(super) data: String,
 }
 
 #[derive(Serialize)]

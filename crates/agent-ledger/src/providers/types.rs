@@ -122,6 +122,13 @@ enum WireContentPart<'a> {
         tool_use_id: &'a str,
         content: &'a str,
     },
+    /// The byte count stands in for the payload. This form feeds a diagnostic
+    /// log line, and a member's photo spelled out in a log is a leak, not a
+    /// log; each vendor wire encodes the actual bytes in its own shape.
+    Image {
+        mime: &'a str,
+        bytes: usize,
+    },
 }
 
 impl Serialize for ContentPart {
@@ -136,6 +143,10 @@ impl Serialize for ContentPart {
             } => WireContentPart::ToolResult {
                 tool_use_id,
                 content,
+            },
+            Self::Image { mime, data } => WireContentPart::Image {
+                mime,
+                bytes: data.len(),
             },
         };
         wire.serialize(serializer)

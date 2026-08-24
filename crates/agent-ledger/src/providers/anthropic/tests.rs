@@ -507,6 +507,52 @@ mod wire_golden {
         assert_eq!(actual, expected);
     }
 
+    /// A user group carrying a caption and an image serializes to a `user`
+    /// message with the vendor's inline base64 image block beside the caption,
+    /// order preserved — and the block's MIME and base64 round-trip the bytes.
+    #[test]
+    fn user_image_rides_the_inline_base64_source_block() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF];
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "what is this?".into(),
+                },
+                ContentPart::Image {
+                    mime: "image/png".into(),
+                    data: bytes.clone(),
+                },
+            ]),
+        }];
+
+        let (system, wire, carried) = convert_messages(&messages, true);
+        assert!(system.is_none());
+        assert!(!carried, "an image is not a reasoning payload");
+
+        let actual = serde_json::to_value(&wire).expect("the wire serializes");
+        let encoded = BASE64.encode(&bytes);
+        let expected = json!([{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is this?" },
+                {
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": "image/png", "data": encoded }
+                },
+            ]
+        }]);
+        assert_eq!(actual, expected);
+
+        let payload = actual[0]["content"][1]["source"]["data"]
+            .as_str()
+            .expect("the payload is a string");
+        assert_eq!(BASE64.decode(payload).expect("the payload decodes"), bytes);
+    }
+
     /// Every system group folds into the one system parameter, JOINED. A
     /// mid-conversation date marker is its own system message, and overwriting
     /// would erase the system prompt the conversation opened with — silently,

@@ -59,17 +59,15 @@ pub(crate) struct WireMessage {
 /// A message's content, which is legitimately a string or an array on this
 /// surface.
 ///
-/// The base only ever constructs the string form. The array is an opaque
-/// pass-through a vendor module injects through its own content encoder, so a
-/// vendor with a structured content shape does not have to fork the base to get
-/// it — and the base does not have to learn what that shape means.
+/// The base constructs the string form for text, and the array for a
+/// media-bearing group — the one structured shape this surface itself defines.
+/// A vendor module may also inject the array through its own content encoder,
+/// so a vendor with a structured shape of its own does not have to fork the
+/// base to get it.
 #[derive(Serialize)]
 #[serde(untagged)]
 pub(crate) enum WireMessageContent {
     Text(String),
-    /// Constructed only by a vendor's own encoder, so whether anything builds
-    /// one depends on which vendors are compiled.
-    #[allow(dead_code)]
     Chunks(Vec<Value>),
 }
 

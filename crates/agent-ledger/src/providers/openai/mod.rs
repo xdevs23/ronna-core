@@ -330,6 +330,14 @@ fn convert_parts(
                     output: content.clone(),
                 });
             }
+            // This wire's own image carrier (the `input_image` item) is not
+            // implemented: no consumer routes media to this vendor yet, and a
+            // text stand-in would fake what the model never saw. The drop is
+            // loud rather than silent so a future consumer cannot mistake it
+            // for understanding.
+            ContentPart::Image { mime, .. } => {
+                warn!(mime = %mime, "this wire has no image carrier yet; the image part is dropped");
+            }
         }
     }
 
