@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 use crate::store::{StoreError, StoreTx};
 
 use super::bind::{self, OpenedTurn};
+use super::empty;
 use super::http;
 use super::http_store::{HttpProviderConfig, HttpProviderStore};
 use super::types::{
@@ -172,9 +173,12 @@ impl AnthropicProvider {
     ///
     /// # Errors
     ///
-    /// Never at this point — a transport or API failure arrives as the stream's
-    /// first item, so the bind loop's retry machinery sees it in the one place
-    /// that knows what to do about it.
+    /// Only when the converted request carries no message at all — the one
+    /// refusal made before anything is sent, since a request with an empty
+    /// message array is rejected for a reason that names an array position
+    /// rather than the content that went missing. A transport or API failure
+    /// arrives instead as the stream's first item, so the bind loop's retry
+    /// machinery sees it in the one place that knows what to do about it.
     ///
     /// Asynchronous although it awaits nothing: this is the shape the bind
     /// loop's opener has, and a vendor that must await before opening — a
@@ -194,6 +198,7 @@ impl AnthropicProvider {
 
         let (body, carried_payloads) =
             Self::build_request_body(&request, true, include_reasoning_payloads);
+        empty::refuse_if_no_message(body.messages.len())?;
 
         Ok(OpenedTurn {
             events: wire::open_stream(
@@ -268,27 +273,59 @@ fn convert_messages(
             MessageRole::Assistant => "assistant",
         };
 
-        let content = match &msg.content {
+        let blocks = match &msg.content {
             MessageContent::Text(text) => {
-                WireContent::Array(vec![WireContentBlock::Text { text: text.clone() }])
+                if !empty::keeps_message(msg.role, text) {
+                    continue;
+                }
+                vec![WireContentBlock::Text { text: text.clone() }]
             }
-            MessageContent::Parts(parts) => WireContent::Array(
+            MessageContent::Parts(parts) => {
+                if !empty::keeps_parts(msg.role, parts) {
+                    continue;
+                }
                 parts
                     .iter()
                     .map(|p| {
                         wire_content_block(p, include_reasoning_payloads, &mut carried_payloads)
                     })
-                    .collect(),
-            ),
+                    .filter(|block| keeps_block(msg.role, block))
+                    .collect()
+            }
         };
+
+        // Nothing left to say: an assistant message whose content array is
+        // empty is exactly what this API refuses, and what went is already in
+        // the log — each text block as it was dropped above, and a group that
+        // arrived with no part at all as it was turned away.
+        if blocks.is_empty() && empty::applies_to(msg.role) {
+            continue;
+        }
 
         wire_messages.push(WireMessage {
             role: role.to_string(),
-            content,
+            content: WireContent::Array(blocks),
         });
     }
 
     (system, wire_messages, carried_payloads)
+}
+
+/// The empty-content drop, read on this wire's own shape.
+///
+/// A text block is the one block a drop can apply to, and by the time a block
+/// exists the degraded reasoning is one too — which is what makes this the
+/// single site rather than one guard per part variant. The native thinking
+/// echo is not text: it replays even with no visible reasoning, because for a
+/// summary-only vendor the payload is what carries the continuity.
+fn keeps_block(role: MessageRole, block: &WireContentBlock) -> bool {
+    match block {
+        WireContentBlock::Text { text } => empty::keeps_text_part(role, text),
+        WireContentBlock::Thinking { .. }
+        | WireContentBlock::ToolUse { .. }
+        | WireContentBlock::ToolResult { .. }
+        | WireContentBlock::Image { .. } => true,
+    }
 }
 
 /// Route one neutral part into its wire block.

@@ -96,6 +96,19 @@ operator would be debugging.
 - **The scope is the assistant role, 2026-08-24.** An empty user or system group is a
   different question with a different cause, and kimi's existing guards for those stay as
   they are. The contract below is worded to that scope rather than universally.
+- **A trailing replayed reasoning item leaves with its group — added by the orchestrator
+  after implementation, 2026-08-24.** The Responses API refuses a reasoning item that the
+  item it produced does not follow, so one left at the end of a group would fail the whole
+  request. The drop can strand one (a turn that thought and then said nothing), which is why
+  the implementation needed the rule — but the rule is about the item being TRAILING, not
+  about the drop: a group whose real text flushes into its message before the replay is
+  pushed also ends with a stranded reasoning item, and that shape would have been rejected
+  before this unit too. So the removal is unconditional and the group keeps its text. Two
+  verdict seats read this as a regression against "every non-empty message converts exactly
+  as it does today"; on the code it is a pre-existing rejection being avoided rather than a
+  conversion changing, so it stands, pinned deliberately rather than left to be narrowed by
+  a later reader. `carried_payloads` is reported from what survived, so the one-shot payload
+  retry is not spent on a payload the request never carried.
 
 ## The unit's contract
 

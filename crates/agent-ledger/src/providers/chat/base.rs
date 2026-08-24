@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::providers::bind::OpenedTurn;
+use crate::providers::empty;
 use crate::providers::http;
 use crate::providers::types::{
     CompletionRequest, ContentPart, LlmError, Message, MessageContent, MessageRole, ModelInfo,
@@ -234,11 +235,13 @@ impl ChatProvider {
         let mut carried_payloads = false;
 
         for msg in messages {
-            let role = wire_role(msg.role);
             match &msg.content {
                 MessageContent::Text(text) => {
+                    if !empty::keeps_message(msg.role, text) {
+                        continue;
+                    }
                     wire_messages.push(WireMessage {
-                        role: role.to_string(),
+                        role: wire_role(msg.role).to_string(),
                         content: Some(WireMessageContent::Text(text.clone())),
                         tool_calls: None,
                         tool_call_id: None,
@@ -246,7 +249,10 @@ impl ChatProvider {
                     });
                 }
                 MessageContent::Parts(parts) => {
-                    self.convert_parts(parts, role, include_reasoning_payloads)
+                    if !empty::keeps_parts(msg.role, parts) {
+                        continue;
+                    }
+                    self.convert_parts(parts, msg.role, include_reasoning_payloads)
                         .append_to(&mut wire_messages, &mut carried_payloads);
                 }
             }
@@ -258,7 +264,7 @@ impl ChatProvider {
     fn convert_parts(
         &self,
         parts: &[ContentPart],
-        role: &'static str,
+        role: MessageRole,
         include_reasoning_payloads: bool,
     ) -> ConvertedParts {
         let mut group_parts: Vec<GroupPart> = Vec::new();
@@ -270,7 +276,7 @@ impl ChatProvider {
         for part in parts {
             match part {
                 ContentPart::Text { text } => {
-                    group_parts.push(GroupPart::Text(AssistantTextPart::Text(text)));
+                    collect_text(role, AssistantTextPart::Text(text), &mut group_parts);
                 }
                 ContentPart::Reasoning { text, opaque } => {
                     // The variant gate: only THIS surface's payload replays
@@ -289,10 +295,18 @@ impl ChatProvider {
                             continue;
                         }
                     }
-                    group_parts.push(GroupPart::Text(AssistantTextPart::Reasoning {
-                        text,
-                        opaque: opaque.as_ref(),
-                    }));
+                    // Reasoning that reaches here degrades into the content, so
+                    // it is collected as the text it has become — and an empty
+                    // one is dropped like any other. The replay above is
+                    // untouched.
+                    collect_text(
+                        role,
+                        AssistantTextPart::Reasoning {
+                            text,
+                            opaque: opaque.as_ref(),
+                        },
+                        &mut group_parts,
+                    );
                 }
                 ContentPart::ToolUse { id, name, input } => {
                     tool_calls.push(WireToolCall {
@@ -432,8 +446,12 @@ impl ChatProvider {
     ///
     /// # Errors
     ///
-    /// Never at this point — a transport or API failure arrives as the stream's
-    /// first item, where the bind loop's retry machinery can classify it.
+    /// Only when the converted request carries no message at all — the one
+    /// refusal made before anything is sent, since a request with an empty
+    /// message array is rejected for a reason that names an array position
+    /// rather than the content that went missing. A transport or API failure
+    /// arrives instead as the stream's first item, where the bind loop's retry
+    /// machinery can classify it.
     ///
     /// Asynchronous although it awaits nothing: this is the shape the bind
     /// loop's opener has, and a vendor that must await before opening — a
@@ -453,6 +471,7 @@ impl ChatProvider {
 
         let (body, carried_payloads) =
             self.build_request_body(&request, true, include_reasoning_payloads);
+        empty::refuse_if_no_message(body.messages.len())?;
 
         Ok(OpenedTurn {
             events: wire::open_stream(
@@ -479,6 +498,20 @@ fn wire_role(role: MessageRole) -> &'static str {
     }
 }
 
+/// Collect one text-bearing part into a group, or drop it when its text is
+/// empty.
+///
+/// The one door into the group's buffer for anything text-shaped: the plain
+/// text part comes through here, and so does a reasoning part that degraded
+/// into text. A later arm that produces text inherits the drop by using this
+/// door rather than by remembering the rule — a guard each arm writes for
+/// itself is exactly the shape that left one vendor's parts branch unguarded.
+fn collect_text<'a>(role: MessageRole, part: AssistantTextPart<'a>, out: &mut Vec<GroupPart<'a>>) {
+    if empty::keeps_text_part(role, part.text()) {
+        out.push(GroupPart::Text(part));
+    }
+}
+
 /// The typed-chunk content for a media-bearing group: every part in the
 /// group's own order — text (a media group's caption included) as a text
 /// chunk, an image as an `image_url` data URI carrying the bytes
@@ -494,6 +527,13 @@ fn media_chunks(parts: &[GroupPart<'_>]) -> WireMessageContent {
             // An empty caption contributes no chunk: a caption-less image is
             // the common case, and an empty text part (`{"type":"text",
             // "text":""}`) is rejected by some OpenAI-compatible gateways.
+            //
+            // Only a USER caption can still be one by the time it arrives: an
+            // assistant's empty text is gone already, dropped at collection by
+            // the shared decision (`collect_text` above). This test stays
+            // exact-empty and answers for the voices that decision does not
+            // cover — widening it to a trim would change what a user's caption
+            // sends, which is a different question with a different cause.
             GroupPart::Text(text) if text.text().is_empty() => None,
             GroupPart::Text(text) => Some(json!({ "type": "text", "text": text.text() })),
             GroupPart::Image { mime, data } => Some(json!({
@@ -507,10 +547,10 @@ fn media_chunks(parts: &[GroupPart<'_>]) -> WireMessageContent {
 
 /// One group, converted but not yet appended.
 struct ConvertedParts {
-    /// The wire role the group's own message is emitted under. Tool results
-    /// are not under it: they leave under the wire's tool role, keyed on the
-    /// call they answer.
-    role: &'static str,
+    /// The voice the group's own message is emitted under, spelled for the wire
+    /// at the moment it is pushed. Tool results are not under it: they leave
+    /// under the wire's tool role, keyed on the call they answer.
+    role: MessageRole,
     content: Option<WireMessageContent>,
     details: Vec<WireReasoningDetail>,
     tool_calls: Vec<WireToolCall>,
@@ -525,13 +565,15 @@ impl ConvertedParts {
     /// The group's message is emitted only when it carries something: a
     /// message with neither content nor calls is rejected outright by these
     /// endpoints, with an error that names a position in the array rather than
-    /// the block that produced it.
+    /// the block that produced it. A group whose only text was empty arrives
+    /// here carrying nothing, so this is also where the drop stops being
+    /// visible — the log already says what went.
     fn append_to(self, out: &mut Vec<WireMessage>, carried_payloads: &mut bool) {
         *carried_payloads |= self.carried_payloads;
 
         if self.content.is_some() || !self.tool_calls.is_empty() || !self.details.is_empty() {
             out.push(WireMessage {
-                role: self.role.to_string(),
+                role: wire_role(self.role).to_string(),
                 content: self.content,
                 tool_calls: if self.tool_calls.is_empty() {
                     None

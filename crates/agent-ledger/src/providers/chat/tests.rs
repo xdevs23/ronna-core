@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 use super::base::*;
 use super::sse::{SseState, finish_stream, parse_sse_chunk};
 use crate::providers::types::{
-    CompletionRequest, OpaquePayload, ReasoningDetailEntry, ReasoningLevel, StopReason, StreamEvent,
+    CompletionRequest, ContentPart, Message, MessageContent, MessageRole, OpaquePayload,
+    ReasoningDetailEntry, ReasoningLevel, StopReason, StreamEvent,
 };
 
 // The fixtures read better built inline at each call site, so these helpers
@@ -28,6 +29,22 @@ fn plain_provider() -> ChatProvider {
         "https://a-chat-endpoint.example/v1",
         HeaderMap::new(),
     )
+}
+
+/// One history, converted through this base's real request path and read as
+/// the JSON it would be sent as. Every request-shape module in this file asks
+/// the same question of the same path, so it asks it through one helper.
+fn convert(messages: &[Message]) -> Value {
+    let (wire, _) = plain_provider().convert_messages(messages, true);
+    serde_json::to_value(&wire).expect("the wire serializes")
+}
+
+/// A parts-carrying message in one voice.
+fn parts(role: MessageRole, parts: Vec<ContentPart>) -> Message {
+    Message {
+        role,
+        content: MessageContent::Parts(parts),
+    }
 }
 
 mod reasoning_ingest {
@@ -460,19 +477,6 @@ mod parts_wire {
     use base64::engine::general_purpose::STANDARD as BASE64;
 
     use super::*;
-    use crate::providers::types::{ContentPart, Message, MessageContent, MessageRole};
-
-    fn convert(messages: &[Message]) -> Value {
-        let (wire, _) = plain_provider().convert_messages(messages, true);
-        serde_json::to_value(&wire).expect("the wire serializes")
-    }
-
-    fn parts(role: MessageRole, parts: Vec<ContentPart>) -> Message {
-        Message {
-            role,
-            content: MessageContent::Parts(parts),
-        }
-    }
 
     /// The misattribution bug, pinned on the real path: a parts message leaves
     /// under its MESSAGE's role, never under a hardcoded assistant. A user
@@ -1042,6 +1046,250 @@ mod usage_tests {
         assert!(
             drain(&mut state).is_empty(),
             "no second end at the end-of-stream line"
+        );
+    }
+}
+
+/// The empty-content drop, on this base: assistant content that is empty once
+/// whitespace is trimmed never leaves, in any of the shapes the render pass can
+/// produce it in. Every vendor composing with this base inherits it.
+mod empty_assistant_content {
+    use super::*;
+
+    fn text(role: MessageRole, text: &str) -> Message {
+        Message {
+            role,
+            content: MessageContent::Text(text.into()),
+        }
+    }
+
+    fn tool_use() -> ContentPart {
+        ContentPart::ToolUse {
+            id: "c1".into(),
+            name: "search".into(),
+            input: json!({}),
+        }
+    }
+
+    fn user_hi() -> Message {
+        text(MessageRole::User, "hi")
+    }
+
+    fn user_hi_wire() -> Value {
+        json!({ "role": "user", "content": "hi" })
+    }
+
+    fn call_only() -> Value {
+        json!([{
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": { "name": "search", "arguments": "{}" }
+            }]
+        }])
+    }
+
+    /// Message level: a silent turn's empty assistant message is not sent, and
+    /// no `"content": ""` reaches the endpoint in its place.
+    #[test]
+    fn an_empty_assistant_message_is_not_sent() {
+        assert_eq!(
+            convert(&[user_hi(), text(MessageRole::Assistant, "")]),
+            json!([user_hi_wire()])
+        );
+    }
+
+    /// Whitespace counts as empty.
+    #[test]
+    fn a_whitespace_only_assistant_message_is_not_sent() {
+        assert_eq!(
+            convert(&[user_hi(), text(MessageRole::Assistant, "   \n ")]),
+            json!([user_hi_wire()])
+        );
+    }
+
+    /// Part level: the message keeps its call and loses the empty text, so the
+    /// content field is absent rather than the empty string a one-element vec
+    /// of `""` used to fold into.
+    #[test]
+    fn an_empty_text_part_beside_a_tool_call_loses_only_the_text() {
+        assert_eq!(
+            convert(&[parts(
+                MessageRole::Assistant,
+                vec![
+                    ContentPart::Text {
+                        text: String::new()
+                    },
+                    tool_use()
+                ]
+            )]),
+            call_only()
+        );
+    }
+
+    /// The other empty part shape: a reasoning part with no replayable payload
+    /// folds into the content on this base, and an empty one folds into empty
+    /// content. It is dropped like any other empty text.
+    #[test]
+    fn a_degraded_empty_reasoning_beside_a_tool_call_is_not_sent() {
+        assert_eq!(
+            convert(&[parts(
+                MessageRole::Assistant,
+                vec![
+                    ContentPart::Reasoning {
+                        text: String::new(),
+                        opaque: None,
+                    },
+                    tool_use(),
+                ],
+            )]),
+            call_only()
+        );
+    }
+
+    /// A parts message left with nothing at all is not sent: the base's own
+    /// "carries something" guard sees no content, no call and no echo.
+    #[test]
+    fn a_parts_message_of_nothing_but_empty_text_is_not_sent() {
+        assert_eq!(
+            convert(&[
+                user_hi(),
+                parts(
+                    MessageRole::Assistant,
+                    vec![ContentPart::Text { text: "  ".into() }]
+                )
+            ]),
+            json!([user_hi_wire()])
+        );
+    }
+
+    /// Nothing else moves: surviving content converts exactly as it did,
+    /// whitespace inside it included.
+    #[test]
+    fn non_empty_content_converts_exactly_as_before() {
+        assert_eq!(
+            convert(&[
+                text(MessageRole::Assistant, " hi "),
+                parts(
+                    MessageRole::Assistant,
+                    vec![
+                        ContentPart::Text {
+                            text: "on it".into()
+                        },
+                        tool_use()
+                    ]
+                ),
+            ]),
+            json!([
+                { "role": "assistant", "content": " hi " },
+                {
+                    "role": "assistant",
+                    "content": "on it",
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": { "name": "search", "arguments": "{}" }
+                    }]
+                },
+            ])
+        );
+    }
+
+    /// The reasoning echo is not text and is never dropped: a payload replays
+    /// even when the visible reasoning is empty, which is exactly the
+    /// summary-only case where the stored entries carry the continuity.
+    #[test]
+    fn an_empty_reasoning_carrying_a_replayable_payload_still_echoes() {
+        let messages = [parts(
+            MessageRole::Assistant,
+            vec![
+                ContentPart::Reasoning {
+                    text: String::new(),
+                    opaque: Some(OpaquePayload::OpenRouter {
+                        entries: vec![ReasoningDetailEntry {
+                            position: 0,
+                            entry_type: "reasoning.text".into(),
+                            entry_id: None,
+                            upstream_format: "a-format-v1".into(),
+                            index: None,
+                            content: "step one".into(),
+                            signature: None,
+                        }],
+                    }),
+                },
+                tool_use(),
+            ],
+        )];
+
+        let (wire, carried) = plain_provider()
+            .with_details_echo()
+            .convert_messages(&messages, true);
+        let actual = serde_json::to_value(&wire).expect("the wire serializes");
+
+        assert!(carried, "the build reports the replayed payload");
+        assert_eq!(actual[0]["reasoning_details"][0]["text"], "step one");
+        assert!(
+            actual[0].get("content").is_none(),
+            "no empty content rides beside the echo"
+        );
+        assert_eq!(actual[0]["tool_calls"][0]["id"], "c1");
+    }
+
+    /// The degenerate case: dropping never empties a request. A history whose
+    /// only message is an empty assistant one is refused by name, before
+    /// anything is sent, instead of going out as a request with an empty
+    /// message array for the endpoint to refuse in its own words.
+    #[tokio::test]
+    async fn a_request_the_drop_emptied_is_refused_before_it_is_sent() {
+        let request = CompletionRequest {
+            model: "test-model".into(),
+            messages: vec![text(MessageRole::Assistant, "   ")],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: true,
+            reasoning: None,
+        };
+
+        let err = plain_provider()
+            .open_turn(request, true)
+            .await
+            .err()
+            .expect("a request with nothing to send is refused");
+        assert!(matches!(err, crate::providers::types::LlmError::NoMessage));
+    }
+
+    /// Adjacency is untouched, and nothing merges: the tool message still
+    /// follows the message carrying its `tool_calls` — merging the adjacent
+    /// user voices would move it away from the call it answers — and two
+    /// adjacent user messages stay two.
+    #[test]
+    fn adjacent_messages_are_neither_merged_nor_reordered() {
+        assert_eq!(
+            convert(&[
+                parts(MessageRole::Assistant, vec![tool_use()]),
+                parts(
+                    MessageRole::User,
+                    vec![ContentPart::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: "found".into(),
+                    }],
+                ),
+                user_hi(),
+            ]),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": { "name": "search", "arguments": "{}" }
+                    }]
+                },
+                { "role": "tool", "content": "found", "tool_call_id": "c1" },
+                user_hi_wire(),
+            ])
         );
     }
 }
