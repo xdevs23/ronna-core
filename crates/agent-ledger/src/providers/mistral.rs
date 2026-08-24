@@ -39,8 +39,9 @@ const MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
 const LIGHTWEIGHT_MODEL: &str = "mistral-small-latest";
 
 /// The chat base configured for this vendor: its endpoint, its binary effort,
-/// its typed-chunk decoder, its unit continuity tag, its replay encoder, and a
-/// fixed vendor label — this vendor's model ids carry no vendor prefix.
+/// its typed-chunk decoder, its unit continuity tag, its replay encoder, a fixed
+/// vendor label — this vendor's model ids carry no vendor prefix — and its
+/// refusal of an empty assistant message.
 fn mistral_provider(api_key: String, base_url: Option<String>) -> ChatProvider {
     ChatProvider::with_headers(api_key, base_url, MISTRAL_BASE_URL, HeaderMap::new())
         .effort_translation(mistral_reasoning_effort)
@@ -48,6 +49,10 @@ fn mistral_provider(api_key: String, base_url: Option<String>) -> ChatProvider {
         .thinking_end_payload(mistral_thinking_end_payload)
         .assistant_content_encoder(mistral_assistant_content)
         .vendor_label("Mistral")
+        // This endpoint refuses an empty assistant message — it wants content or
+        // tool calls — so the echo every other chat endpoint keeps is converted
+        // away here, on the vendor's own side.
+        .refuses_empty_assistant()
 }
 
 /// This vendor has no extra continuity blob: the stored reasoning text itself

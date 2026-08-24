@@ -31,6 +31,16 @@ fn plain_provider() -> ChatProvider {
     )
 }
 
+/// The same base built by a vendor whose endpoint refuses an empty assistant
+/// message — Mistral's shape, and the only difference from the plain one.
+///
+/// It stands beside the plain provider rather than inside the module that uses
+/// it because it is the same construction question: what a build of this base
+/// looks like. The credential is never sent anywhere either.
+fn refusing_provider() -> ChatProvider {
+    plain_provider().refuses_empty_assistant()
+}
+
 /// One history, converted through this base's real request path and read as
 /// the JSON it would be sent as. Every request-shape module in this file asks
 /// the same question of the same path, so it asks it through one helper.
@@ -1050,11 +1060,20 @@ mod usage_tests {
     }
 }
 
-/// The empty-content drop, on this base: assistant content that is empty once
-/// whitespace is trimmed never leaves, in any of the shapes the render pass can
-/// produce it in. Every vendor composing with this base inherits it.
+/// Empty assistant content, on this base: it is ECHOED, in every shape the
+/// render pass can produce it in — a turn that said nothing is a real event on
+/// the ledger and the model reads its own silence back. A vendor whose endpoint
+/// refuses it declares that on its own build, and only that build converts it
+/// away; the pins below run each shape through both.
 mod empty_assistant_content {
     use super::*;
+
+    /// The same history through a build that refuses the echo, read as the JSON
+    /// it would be sent as — the other half of every pin in this module.
+    fn convert_refusing(messages: &[Message]) -> Value {
+        let (wire, _) = refusing_provider().convert_messages(messages, true);
+        serde_json::to_value(&wire).expect("the wire serializes")
+    }
 
     fn text(role: MessageRole, text: &str) -> Message {
         Message {
@@ -1090,32 +1109,84 @@ mod empty_assistant_content {
         }])
     }
 
-    /// Message level: a silent turn's empty assistant message is not sent, and
-    /// no `"content": ""` reaches the endpoint in its place.
+    /// The same call with content beside it, for the echoing side: the content
+    /// field is present and holds exactly what the parts folded into.
+    fn call_with_content(content: &str) -> Value {
+        json!([{
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": { "name": "search", "arguments": "{}" }
+            }]
+        }])
+    }
+
+    /// Message level: a silent turn rides out as the empty message it was, so
+    /// the model reads its own silence rather than a gap in the history.
     #[test]
-    fn an_empty_assistant_message_is_not_sent() {
+    fn an_empty_assistant_message_is_echoed() {
         assert_eq!(
             convert(&[user_hi(), text(MessageRole::Assistant, "")]),
+            json!([user_hi_wire(), { "role": "assistant", "content": "" }])
+        );
+    }
+
+    /// Message level on a build that refuses it: the empty message is converted
+    /// away here, and no `"content": ""` reaches that endpoint in its place.
+    #[test]
+    fn an_empty_assistant_message_is_not_sent_to_a_refusing_endpoint() {
+        assert_eq!(
+            convert_refusing(&[user_hi(), text(MessageRole::Assistant, "")]),
             json!([user_hi_wire()])
         );
     }
 
-    /// Whitespace counts as empty.
+    /// Whitespace is content like any other: it goes out verbatim, untrimmed.
     #[test]
-    fn a_whitespace_only_assistant_message_is_not_sent() {
+    fn a_whitespace_only_assistant_message_is_echoed_verbatim() {
         assert_eq!(
             convert(&[user_hi(), text(MessageRole::Assistant, "   \n ")]),
+            json!([user_hi_wire(), { "role": "assistant", "content": "   \n " }])
+        );
+    }
+
+    /// A refusing endpoint counts whitespace as empty: the trim decides, not an
+    /// exact match, so a whitespace-only message goes the way the empty one did.
+    #[test]
+    fn a_whitespace_only_assistant_message_is_not_sent_to_a_refusing_endpoint() {
+        assert_eq!(
+            convert_refusing(&[user_hi(), text(MessageRole::Assistant, "   \n ")]),
             json!([user_hi_wire()])
         );
     }
 
-    /// Part level: the message keeps its call and loses the empty text, so the
-    /// content field is absent rather than the empty string a one-element vec
-    /// of `""` used to fold into.
+    /// Part level: the message keeps its call AND its empty text, which folds
+    /// into the empty content string beside the call.
     #[test]
-    fn an_empty_text_part_beside_a_tool_call_loses_only_the_text() {
+    fn an_empty_text_part_beside_a_tool_call_keeps_both() {
         assert_eq!(
             convert(&[parts(
+                MessageRole::Assistant,
+                vec![
+                    ContentPart::Text {
+                        text: String::new()
+                    },
+                    tool_use()
+                ]
+            )]),
+            call_with_content("")
+        );
+    }
+
+    /// Part level on a build that refuses it: the message keeps its call and
+    /// loses the empty text, so the content field is absent rather than the
+    /// empty string a one-element vec of `""` folds into.
+    #[test]
+    fn an_empty_text_part_beside_a_tool_call_loses_only_the_text_on_a_refusing_endpoint() {
+        assert_eq!(
+            convert_refusing(&[parts(
                 MessageRole::Assistant,
                 vec![
                     ContentPart::Text {
@@ -1130,11 +1201,30 @@ mod empty_assistant_content {
 
     /// The other empty part shape: a reasoning part with no replayable payload
     /// folds into the content on this base, and an empty one folds into empty
-    /// content. It is dropped like any other empty text.
+    /// content — which is echoed like any other empty text.
     #[test]
-    fn a_degraded_empty_reasoning_beside_a_tool_call_is_not_sent() {
+    fn a_degraded_empty_reasoning_beside_a_tool_call_is_echoed() {
         assert_eq!(
             convert(&[parts(
+                MessageRole::Assistant,
+                vec![
+                    ContentPart::Reasoning {
+                        text: String::new(),
+                        opaque: None,
+                    },
+                    tool_use(),
+                ],
+            )]),
+            call_with_content("")
+        );
+    }
+
+    /// The degraded reasoning goes the way of any other empty text on a
+    /// refusing endpoint too: it folded into text, so it inherits text's answer.
+    #[test]
+    fn a_degraded_empty_reasoning_beside_a_tool_call_is_not_sent_to_a_refusing_endpoint() {
+        assert_eq!(
+            convert_refusing(&[parts(
                 MessageRole::Assistant,
                 vec![
                     ContentPart::Reasoning {
@@ -1148,12 +1238,29 @@ mod empty_assistant_content {
         );
     }
 
-    /// A parts message left with nothing at all is not sent: the base's own
-    /// "carries something" guard sees no content, no call and no echo.
+    /// A parts message whose only text is whitespace still carries that text,
+    /// so it is a message, sent as it stands.
     #[test]
-    fn a_parts_message_of_nothing_but_empty_text_is_not_sent() {
+    fn a_parts_message_of_nothing_but_empty_text_is_echoed() {
         assert_eq!(
             convert(&[
+                user_hi(),
+                parts(
+                    MessageRole::Assistant,
+                    vec![ContentPart::Text { text: "  ".into() }]
+                )
+            ]),
+            json!([user_hi_wire(), { "role": "assistant", "content": "  " }])
+        );
+    }
+
+    /// The same message on a refusing endpoint is not sent at all: the base's
+    /// own "carries something" guard is left with no content, no call and no
+    /// echo.
+    #[test]
+    fn a_parts_message_of_nothing_but_empty_text_is_not_sent_to_a_refusing_endpoint() {
+        assert_eq!(
+            convert_refusing(&[
                 user_hi(),
                 parts(
                     MessageRole::Assistant,
@@ -1236,10 +1343,11 @@ mod empty_assistant_content {
         assert_eq!(actual[0]["tool_calls"][0]["id"], "c1");
     }
 
-    /// The degenerate case: dropping never empties a request. A history whose
-    /// only message is an empty assistant one is refused by name, before
-    /// anything is sent, instead of going out as a request with an empty
-    /// message array for the endpoint to refuse in its own words.
+    /// The degenerate case on a refusing build: dropping never empties a
+    /// request. A history whose only message is an empty assistant one is
+    /// refused by name, before anything is sent, instead of going out as a
+    /// request with an empty message array for the endpoint to refuse in its
+    /// own words.
     #[tokio::test]
     async fn a_request_the_drop_emptied_is_refused_before_it_is_sent() {
         let request = CompletionRequest {
@@ -1252,7 +1360,7 @@ mod empty_assistant_content {
             reasoning: None,
         };
 
-        let err = plain_provider()
+        let err = refusing_provider()
             .open_turn(request, true)
             .await
             .err()
