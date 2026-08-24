@@ -129,6 +129,14 @@ pub struct StreamUsage {
     pub input_tokens: u32,
     /// Tokens the response produced.
     pub output_tokens: u32,
+    /// Reasoning tokens the turn spent, when the provider reports them. This is
+    /// the spend a no-text turn is justified by — the model reasoned and then
+    /// recorded no assistant move — so it rides the completion signal like the
+    /// other counts rather than being dropped.
+    ///
+    /// `None` when the provider did not say — never a fabricated zero, which
+    /// would read as a measurement that the model did not reason.
+    pub reasoning_tokens: Option<u32>,
 }
 
 #[cfg(test)]

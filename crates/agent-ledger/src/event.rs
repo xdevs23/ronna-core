@@ -31,6 +31,24 @@ use serde::Serialize;
 
 use crate::types::{ApprovalChoice, Awaiting, InputBlock, StopReason, StreamUsage};
 
+/// The stable machine keys the streaming status plane speaks, documented on
+/// [`CoreEvent::StreamStatus`]. The producer, the tests, and any downstream
+/// consumer reference these constants rather than the bare strings, so the
+/// vocabulary the docs define cannot drift on a typo or a rename at one site
+/// while the others keep the old spelling. The label field itself stays a
+/// `String` — this is not a typed enum, only the single source of the spellings.
+pub mod stream_status {
+    /// A request is on its way to the provider.
+    pub const SENDING: &str = "sending";
+    /// The stream is open, no content yet.
+    pub const WAITING_FOR_RESPONSE: &str = "waiting_for_response";
+    /// The turn stopped for tool use and the calls are executing.
+    pub const RUNNING_TOOLS: &str = "running_tools";
+    /// User-visible text is flowing: raised once per turn at the first
+    /// non-empty text delta.
+    pub const RESPONDING: &str = "responding";
+}
+
 /// Every event the runtime broadcasts on the single ordered push bus.
 ///
 /// What a dropped event costs is a property of the variant, not of this type.
@@ -89,6 +107,11 @@ pub enum CoreEvent {
     /// - `waiting_for_response` — the stream is open, no content yet.
     /// - `running_tools` — the turn stopped for tool use and the calls are
     ///   executing.
+    /// - `responding` — user-visible text is flowing: raised once per turn at
+    ///   the first non-empty text delta, and never by thinking or by a text
+    ///   block that opens and then finalizes empty. The key a consumer's
+    ///   compose cue listens for — `""` cannot serve, because it also fires
+    ///   for thinking and for a block open that may stay contentless.
     /// - `""` (empty) — content is flowing: clear the label.
     StreamStatus {
         /// The conversation.
