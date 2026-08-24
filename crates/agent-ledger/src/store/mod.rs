@@ -1088,6 +1088,76 @@ mod tests {
         assert_eq!(blocks[3].block_type, "text");
     }
 
+    /// A fork that must differ from its source in one recorded fact says so
+    /// by detaching the inherited one — and the source keeps it, because a
+    /// fork is not an edit of what it came from.
+    #[tokio::test]
+    async fn a_detached_block_leaves_the_fork_and_stays_in_the_source() {
+        let store = Store::in_memory().expect("an in-memory store opens");
+        let source = store
+            .create_conversation(
+                "instance".into(),
+                "model".into(),
+                "Model".into(),
+                "vendor".into(),
+            )
+            .await
+            .expect("the conversation is created");
+        let prompt = store
+            .insert_system_prompt(source, "the original instructions".into())
+            .await
+            .expect("the prompt is recorded");
+        let said = store
+            .insert_text_block(source, Role::User, "something said".into())
+            .await
+            .expect("the message is recorded");
+
+        let fork = store
+            .fork_conversation(source, said, ModelOverride::default())
+            .await
+            .expect("the fork inherits the history");
+        assert_eq!(
+            store.list_blocks(fork).await.expect("the fork reads").len(),
+            2,
+            "the fork inherits both blocks through the junction"
+        );
+
+        store
+            .detach_block(fork, prompt)
+            .await
+            .expect("the inherited prompt detaches");
+
+        let forked: Vec<i64> = store
+            .list_blocks(fork)
+            .await
+            .expect("the fork reads")
+            .into_iter()
+            .map(|block| block.id)
+            .collect();
+        assert_eq!(
+            forked,
+            vec![said],
+            "the fork keeps what was said and no longer holds the prompt"
+        );
+        let sourced: Vec<i64> = store
+            .list_blocks(source)
+            .await
+            .expect("the source reads")
+            .into_iter()
+            .map(|block| block.id)
+            .collect();
+        assert_eq!(
+            sourced,
+            vec![prompt, said],
+            "the source is untouched: a fork cannot edit what it came from"
+        );
+
+        store
+            .detach_block(fork, prompt)
+            .await
+            .expect("detaching what is not held changes nothing");
+    }
+
     #[tokio::test]
     async fn fork_conversation_shares_blocks() {
         let s = store();
