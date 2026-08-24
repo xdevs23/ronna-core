@@ -335,6 +335,42 @@ impl Store {
         .await
     }
 
+    /// Detach one block from one conversation, leaving the block itself and
+    /// every other conversation holding it untouched.
+    ///
+    /// The junction is what makes a block part of a conversation, and a fork
+    /// inherits its source's junction rows — so a fork that must differ from
+    /// its source in one recorded fact has no way to say so through the
+    /// append-only path alone. Appending the replacement leaves the inherited
+    /// one in front of it, still read, still instructing.
+    ///
+    /// Detaching is that one way, and it is deliberately narrow: it removes a
+    /// membership, never a block. The block keeps its content, its header and
+    /// its place in the conversation it was written in, so the record of what
+    /// was said stays whole and a source conversation cannot be edited through
+    /// its fork.
+    ///
+    /// Detaching a block a conversation does not hold changes nothing, so the
+    /// operation is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// If the delete fails or the store's actor has stopped.
+    pub async fn detach_block(
+        &self,
+        conversation_id: i64,
+        block_id: i64,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            conn.execute(
+                "DELETE FROM conversation_blocks WHERE conversation_id = ?1 AND block_id = ?2",
+                params![conversation_id, block_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Fork a conversation carrying a user-message group forward via the given
     /// [`Continuation`]. Runs entirely in one transaction, so the scheduler sees
     /// a single atomic change through the row change hook.
