@@ -26,12 +26,12 @@ workspace = true
 # with. Naming any of them directly buys a consumer nothing.
 [features]
 default = []
-anthropic = ["_sse"]
+anthropic = ["_sse", "dep:base64"]
 kimi = ["_chat_stream", "dep:uuid"]
 mistral = ["_chat"]
 openai = ["_sse"]
 openrouter = ["_chat"]
-_chat = ["_chat_stream"]
+_chat = ["_chat_stream", "dep:base64"]
 _chat_stream = ["_sse"]
 _sse = ["dep:eventsource-stream"]
 
@@ -46,6 +46,13 @@ _sse = ["dep:eventsource-stream"]
 # brings the trait and its derive together. A build-host dependency in effect:
 # a procedural macro is never linked into a consumer's binary.
 agent-ledger-derive = { path = "../agent-ledger-derive", version = "0.1.0" }
+# The image bytes' wire encoding. Only the wires that carry an image part read
+# it, so it rides in with those features. Default features are off: they add a
+# SIMD path built on unsafe code, and this crate forbids unsafe — the scalar
+# engine encodes a chat image's worth of bytes without measurable cost.
+base64 = { version = "0.23.1", default-features = false, features = [
+    "std",
+], optional = true }
 chrono = "0.4"
 # The wire an event stream arrives on. Only a vendor module reads one, so it
 # rides in with the first vendor a consumer enables.
@@ -80,5 +87,18 @@ uuid = { version = "1", features = ["v4"], optional = true }
 # dependent whether it wanted them or not. `test-util` is the paused clock the
 # bind loop's backoff tests run on — without it a retry test would sleep for
 # the real five minutes.
+#
+# The self dev-dependency turns a base-composing vendor on for test builds
+# only. The request base and its wire pins live behind the internal `_chat`
+# feature, off in every production build because no default vendor composes
+# with it — but a bare `cargo test --workspace` would then never compile the
+# base, and a change to its request builder would report green untested.
+# `openrouter` is the vendor picked to carry it here: it fills the base's
+# seams, so the compiled base has a constructor for every wire type and no
+# dead code, which `_chat` alone would leave. A dev-dependency's features unify
+# onto the crate under test and nowhere else (resolver 3 keeps them out of
+# normal builds and out of `cargo check`), so this exercises the base under the
+# default gate without adding a vendor to any consumer's tree.
 [dev-dependencies]
+agent-ledger = { path = ".", features = ["openrouter"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }

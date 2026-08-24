@@ -242,6 +242,13 @@ fn text_content(message: &Message) -> String {
             .iter()
             .filter_map(|part| match part {
                 ContentPart::Text { text } => Some(text.as_str()),
+                // A plain-string content field cannot carry an image, and a
+                // text stand-in would fake what the model never saw. The drop
+                // is loud rather than silent.
+                ContentPart::Image { mime, .. } => {
+                    warn!(mime = %mime, "this wire has no image carrier; the image part is dropped");
+                    None
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -334,7 +341,10 @@ fn push_assistant(message: &Message, thinking_enabled: bool, out: &mut Vec<WireM
                             arguments: serde_json::to_string(input).unwrap_or_default(),
                         },
                     }),
-                    ContentPart::ToolResult { .. } => {}
+                    // The result rides its own tool-role message; the image
+                    // is user-authored, so an assistant group never carries
+                    // one inbound — and this wire could not carry it anyway.
+                    ContentPart::ToolResult { .. } | ContentPart::Image { .. } => {}
                 }
             }
         }

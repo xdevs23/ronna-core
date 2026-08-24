@@ -59,6 +59,22 @@ pub enum ContentPart {
         /// What the tool said — its output, or the reason it failed.
         content: String,
     },
+    /// A user-authored image the model should see — never stringified into
+    /// [`Text`](Self::Text): the model must read the real media, not an
+    /// invented description of it.
+    ///
+    /// The bytes ride raw here; encoding them is the wire's business, and each
+    /// provider that carries an image encodes it in its own shape. This is the
+    /// only media variant on purpose: inline audio was verified to be silently
+    /// dropped by the gateway path this layer serves, and a variant no wire can
+    /// carry would be a silent no-op dressed as a feature (decision of
+    /// 2026-08-24, `docs/slices/09-user-authored-media-wire.md`).
+    Image {
+        /// The image's MIME type, `image/png` and kin.
+        mime: String,
+        /// The raw image bytes.
+        data: Vec<u8>,
+    },
 }
 
 /// The four facts a block kind states about how it reaches the model.

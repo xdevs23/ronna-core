@@ -5,6 +5,7 @@
 //! projected into neutral messages by the one central pass, and this module
 //! owns exactly the step after that: neutral to wire, and wire back to neutral.
 
+use base64::Engine as _;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -23,8 +24,8 @@ use super::{BoxFuture, ProviderModule};
 mod wire;
 
 use wire::{
-    WireCapabilities, WireContent, WireContentBlock, WireMessage, WireModel, WireModelsResponse,
-    WireRequest, WireThinkingRequest, WireTool,
+    WireCapabilities, WireContent, WireContentBlock, WireImageSource, WireMessage, WireModel,
+    WireModelsResponse, WireRequest, WireThinkingRequest, WireTool,
 };
 
 /// The API version header this module speaks. Pinned rather than tracked: a
@@ -329,6 +330,16 @@ fn wire_content_block(
         } => WireContentBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: content.clone(),
+        },
+        // The bytes travel base64-encoded in the vendor's own inline source
+        // block, for the same reason every wire encodes them: a platform file
+        // URL is short-lived, authenticated, and names the platform.
+        ContentPart::Image { mime, data } => WireContentBlock::Image {
+            source: WireImageSource {
+                r#type: "base64".to_string(),
+                media_type: mime.clone(),
+                data: base64::engine::general_purpose::STANDARD.encode(data),
+            },
         },
     }
 }

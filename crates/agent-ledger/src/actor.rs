@@ -3583,6 +3583,7 @@ mod tests {
                         ContentPart::Reasoning { .. } => "reasoning",
                         ContentPart::ToolUse { .. } => "tool_use",
                         ContentPart::ToolResult { .. } => "tool_result",
+                        ContentPart::Image { .. } => "image",
                     })
                     .collect();
                 format!("{:?}:[{}]", message.role, tags.join(","))
