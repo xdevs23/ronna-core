@@ -65,6 +65,16 @@ use serde_json::Value;
 use crate::store::StoreError;
 
 pub mod bind;
+// The empty-content drop every wire applies. It is compiled with the wires
+// rather than always: with no vendor enabled there is no wire to apply it, and
+// the decision is not a capability the rest of the layer depends on.
+#[cfg(any(
+    feature = "anthropic",
+    feature = "kimi",
+    feature = "openai",
+    feature = "_chat"
+))]
+pub(crate) mod empty;
 pub mod http;
 pub mod http_store;
 pub mod registry;

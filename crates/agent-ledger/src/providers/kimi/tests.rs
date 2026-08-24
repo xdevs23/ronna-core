@@ -543,3 +543,258 @@ mod token_rotation {
         assert_eq!(stored.expires_at, Some(2_000_000));
     }
 }
+
+/// The empty-content drop, on this vendor's wire. Its `Text` branch already
+/// refused the empty string; the drop generalizes that to whitespace and to the
+/// parts branch, which pushed its text unfiltered.
+mod empty_assistant_content {
+    use super::*;
+    use crate::providers::empty::capture::recorded;
+
+    fn convert(messages: &[Message]) -> Value {
+        let wire = messages_to_wire_messages(messages, false);
+        serde_json::to_value(&wire).expect("the wire serializes")
+    }
+
+    fn text(role: MessageRole, text: &str) -> Message {
+        Message {
+            role,
+            content: MessageContent::Text(text.into()),
+        }
+    }
+
+    fn parts(role: MessageRole, parts: Vec<ContentPart>) -> Message {
+        Message {
+            role,
+            content: MessageContent::Parts(parts),
+        }
+    }
+
+    fn tool_use() -> ContentPart {
+        ContentPart::ToolUse {
+            id: "c1".into(),
+            name: "search".into(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    fn user_hi() -> Message {
+        text(MessageRole::User, "hi")
+    }
+
+    fn user_hi_wire() -> Value {
+        serde_json::json!({ "role": "user", "content": "hi" })
+    }
+
+    fn call_only() -> Value {
+        serde_json::json!([{
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": { "name": "search", "arguments": "{}" }
+            }]
+        }])
+    }
+
+    /// Message level: a silent turn's empty assistant message is not sent.
+    #[test]
+    fn an_empty_assistant_message_is_not_sent() {
+        assert_eq!(
+            convert(&[user_hi(), text(MessageRole::Assistant, "")]),
+            serde_json::json!([user_hi_wire()])
+        );
+    }
+
+    /// Whitespace counts as empty — the guard this wire already had tested for
+    /// the empty string alone, and let `"   \n "` through.
+    #[test]
+    fn a_whitespace_only_assistant_message_is_not_sent() {
+        assert_eq!(
+            convert(&[user_hi(), text(MessageRole::Assistant, "   \n ")]),
+            serde_json::json!([user_hi_wire()])
+        );
+    }
+
+    /// Part level — the hole beside the guarded branch: the call survives and
+    /// the content field is absent rather than the empty string.
+    #[test]
+    fn an_empty_text_part_beside_a_tool_call_loses_only_the_text() {
+        assert_eq!(
+            convert(&[parts(
+                MessageRole::Assistant,
+                vec![
+                    ContentPart::Text {
+                        text: String::new()
+                    },
+                    tool_use()
+                ]
+            )]),
+            call_only()
+        );
+    }
+
+    /// Reasoning never enters the content on this wire — it rides the sibling
+    /// field this endpoint requires on every assistant message once reasoning
+    /// is on — so an empty reasoning part beside a call leaves the content
+    /// absent and the call intact. The sibling field is not content and the
+    /// drop does not touch it: it rides as the empty string the endpoint asks
+    /// for, exactly as it does for a turn that reasoned about nothing.
+    #[test]
+    fn a_degraded_empty_reasoning_beside_a_tool_call_is_not_sent() {
+        let wire = messages_to_wire_messages(
+            &[parts(
+                MessageRole::Assistant,
+                vec![
+                    ContentPart::Reasoning {
+                        text: String::new(),
+                        opaque: None,
+                    },
+                    tool_use(),
+                ],
+            )],
+            true,
+        );
+
+        assert_eq!(wire.len(), 1);
+        assert!(wire[0].content.is_none(), "no empty content goes out");
+        assert_eq!(wire[0].reasoning_content.as_deref(), Some(""));
+        assert!(wire[0].tool_calls.as_ref().is_some_and(|c| c.len() == 1));
+    }
+
+    /// A turn that thought and then said nothing: the reasoning cannot travel
+    /// alone on this wire — the sibling field rides an assistant message and
+    /// there is no message left to ride — so it goes with the dropped message,
+    /// and the log says so. Without that line the only record would be the
+    /// dropped text part, and a reader reconciling the pre-conversion dump
+    /// against the sent request would find a turn's thinking gone unexplained.
+    #[test]
+    fn a_dropped_message_says_its_reasoning_went_with_it() {
+        let mut wire = Vec::new();
+        let lines = recorded(|| {
+            wire = messages_to_wire_messages(
+                &[parts(
+                    MessageRole::Assistant,
+                    vec![
+                        ContentPart::Reasoning {
+                            text: "thought".into(),
+                            opaque: None,
+                        },
+                        ContentPart::Text {
+                            text: String::new(),
+                        },
+                    ],
+                )],
+                true,
+            );
+        });
+
+        assert!(wire.is_empty(), "no empty content goes out to carry it");
+        assert_eq!(lines.len(), 2, "the text that went, then the rider");
+        assert!(
+            lines[0].contains("assistant text part is empty"),
+            "the dropped text is recorded: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("WARN") && lines[1].contains("its reasoning goes with it"),
+            "the reasoning is not lost in silence: {:?}",
+            lines[1]
+        );
+    }
+
+    /// A parts message left with nothing at all is not sent.
+    #[test]
+    fn a_parts_message_of_nothing_but_empty_text_is_not_sent() {
+        assert_eq!(
+            convert(&[
+                user_hi(),
+                parts(
+                    MessageRole::Assistant,
+                    vec![ContentPart::Text { text: "  ".into() }]
+                )
+            ]),
+            serde_json::json!([user_hi_wire()])
+        );
+    }
+
+    /// Nothing else moves: surviving content converts exactly as it did.
+    #[test]
+    fn non_empty_content_converts_exactly_as_before() {
+        assert_eq!(
+            convert(&[
+                text(MessageRole::Assistant, " hi "),
+                parts(
+                    MessageRole::Assistant,
+                    vec![
+                        ContentPart::Text {
+                            text: "on it".into()
+                        },
+                        tool_use()
+                    ]
+                ),
+            ]),
+            serde_json::json!([
+                { "role": "assistant", "content": " hi " },
+                {
+                    "role": "assistant",
+                    "content": "on it",
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": { "name": "search", "arguments": "{}" }
+                    }]
+                },
+            ])
+        );
+    }
+
+    /// The degenerate case: dropping never empties a request. A history whose
+    /// only message is an empty assistant one is refused by name, before
+    /// anything is sent, instead of going out as a request with an empty
+    /// message array for the endpoint to refuse in its own words.
+    #[test]
+    fn a_request_the_drop_emptied_is_refused_before_it_is_sent() {
+        let err = KimiProvider::new("test-token".into(), None)
+            .stream_turn(
+                &[text(MessageRole::Assistant, "   ")],
+                LIGHTWEIGHT_MODEL.into(),
+                &[],
+            )
+            .err()
+            .expect("a request with nothing to send is refused");
+        assert!(matches!(err, LlmError::NoMessage));
+    }
+
+    /// Adjacency is untouched, and nothing merges: the tool message still
+    /// follows the message carrying its call, and two adjacent user voices stay
+    /// two messages.
+    #[test]
+    fn adjacent_messages_are_neither_merged_nor_reordered() {
+        assert_eq!(
+            convert(&[
+                parts(MessageRole::Assistant, vec![tool_use()]),
+                parts(
+                    MessageRole::User,
+                    vec![ContentPart::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: "found".into(),
+                    }],
+                ),
+                user_hi(),
+            ]),
+            serde_json::json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": { "name": "search", "arguments": "{}" }
+                    }]
+                },
+                { "role": "tool", "content": "found", "tool_call_id": "c1" },
+                user_hi_wire(),
+            ])
+        );
+    }
+}

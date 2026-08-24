@@ -553,6 +553,32 @@ mod wire_golden {
         assert_eq!(BASE64.decode(payload).expect("the payload decodes"), bytes);
     }
 
+    /// A user group carrying an empty caption keeps it: the drop is the
+    /// assistant's alone, and a user or system group empty for its own reasons
+    /// is a different question with a different cause.
+    #[test]
+    fn a_user_group_is_left_exactly_as_it_was() {
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: String::new(),
+                },
+                ContentPart::Image {
+                    mime: "image/png".into(),
+                    data: vec![0x00],
+                },
+            ]),
+        }];
+        let (_, wire, _) = convert_messages(&messages, true);
+        let actual = serde_json::to_value(&wire).expect("the wire serializes");
+        assert_eq!(
+            actual[0]["content"][0],
+            json!({ "type": "text", "text": "" }),
+            "the user's empty caption is untouched"
+        );
+    }
+
     /// Every system group folds into the one system parameter, JOINED. A
     /// mid-conversation date marker is its own system message, and overwriting
     /// would erase the system prompt the conversation opened with — silently,
@@ -588,6 +614,262 @@ mod wire_golden {
             wire.len(),
             3,
             "user, assistant, user — no system leakage into the messages"
+        );
+    }
+}
+
+/// The empty-content drop, on this vendor's wire: assistant content that is
+/// empty once whitespace is trimmed never leaves, in any of the shapes the
+/// render pass can produce it in.
+mod empty_assistant_content {
+    use super::*;
+    use crate::providers::empty::capture::recorded;
+
+    fn convert(messages: &[Message]) -> Value {
+        let (_, wire, _) = convert_messages(messages, true);
+        serde_json::to_value(&wire).expect("the wire serializes")
+    }
+
+    fn text(role: MessageRole, text: &str) -> Message {
+        Message {
+            role,
+            content: MessageContent::Text(text.into()),
+        }
+    }
+
+    fn parts(role: MessageRole, parts: Vec<ContentPart>) -> Message {
+        Message {
+            role,
+            content: MessageContent::Parts(parts),
+        }
+    }
+
+    fn tool_use() -> ContentPart {
+        ContentPart::ToolUse {
+            id: "c1".into(),
+            name: "search".into(),
+            input: json!({}),
+        }
+    }
+
+    fn user_hi() -> Message {
+        text(MessageRole::User, "hi")
+    }
+
+    fn user_hi_wire() -> Value {
+        json!({ "role": "user", "content": [{ "type": "text", "text": "hi" }] })
+    }
+
+    /// Message level: a silent turn's empty assistant message carries nothing,
+    /// so nothing is sent for it — not a message, and not an empty text block.
+    #[test]
+    fn an_empty_assistant_message_is_not_sent() {
+        let actual = convert(&[user_hi(), text(MessageRole::Assistant, "")]);
+        assert_eq!(actual, json!([user_hi_wire()]));
+    }
+
+    /// Whitespace counts as empty: this endpoint refuses whitespace-only
+    /// assistant content exactly as it refuses the empty string.
+    #[test]
+    fn a_whitespace_only_assistant_message_is_not_sent() {
+        let actual = convert(&[user_hi(), text(MessageRole::Assistant, "   \n ")]);
+        assert_eq!(actual, json!([user_hi_wire()]));
+    }
+
+    /// Part level: an empty text part beside a tool call loses the text and
+    /// keeps the call. The message still carries something, so it still goes.
+    #[test]
+    fn an_empty_text_part_beside_a_tool_call_loses_only_the_text() {
+        let actual = convert(&[parts(
+            MessageRole::Assistant,
+            vec![
+                ContentPart::Text {
+                    text: String::new(),
+                },
+                tool_use(),
+            ],
+        )]);
+        assert_eq!(
+            actual,
+            json!([{
+                "role": "assistant",
+                "content": [{ "type": "tool_use", "id": "c1", "name": "search", "input": {} }]
+            }])
+        );
+    }
+
+    /// The same at the other empty part shape: a reasoning part with no
+    /// replayable payload degrades to a text block on this wire, and an empty
+    /// one degrades to an EMPTY text block. It is dropped like any other.
+    #[test]
+    fn a_degraded_empty_reasoning_beside_a_tool_call_is_not_sent() {
+        let actual = convert(&[parts(
+            MessageRole::Assistant,
+            vec![
+                ContentPart::Reasoning {
+                    text: String::new(),
+                    opaque: None,
+                },
+                tool_use(),
+            ],
+        )]);
+        assert_eq!(
+            actual,
+            json!([{
+                "role": "assistant",
+                "content": [{ "type": "tool_use", "id": "c1", "name": "search", "input": {} }]
+            }])
+        );
+    }
+
+    /// A parts message left with nothing at all is not sent either.
+    #[test]
+    fn a_parts_message_of_nothing_but_empty_text_is_not_sent() {
+        let actual = convert(&[
+            user_hi(),
+            parts(
+                MessageRole::Assistant,
+                vec![ContentPart::Text { text: "  ".into() }],
+            ),
+        ]);
+        assert_eq!(actual, json!([user_hi_wire()]));
+    }
+
+    /// The native reasoning echo is not text and is never dropped: this
+    /// vendor's own payload replays even when the visible reasoning is empty,
+    /// which is exactly the summary-only case where the payload carries the
+    /// continuity.
+    #[test]
+    fn an_empty_reasoning_carrying_this_vendors_payload_still_replays() {
+        let actual = convert(&[parts(
+            MessageRole::Assistant,
+            vec![
+                ContentPart::Reasoning {
+                    text: String::new(),
+                    opaque: Some(OpaquePayload::Anthropic {
+                        signature: "sig-xyz".into(),
+                    }),
+                },
+                tool_use(),
+            ],
+        )]);
+        // The WHOLE message, not just its first block: an empty text block
+        // slipping in behind the echo is exactly what this pin exists to catch,
+        // and it would sit at an index a spot-check never reads.
+        assert_eq!(
+            actual,
+            json!([{
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "", "signature": "sig-xyz" },
+                    { "type": "tool_use", "id": "c1", "name": "search", "input": {} }
+                ]
+            }])
+        );
+    }
+
+    /// The one shape with no text contribution to speak for it: a group that
+    /// arrived carrying no part at all is dropped like any other empty
+    /// assistant message — and it says so, because otherwise the pre-conversion
+    /// dump and the sent request would differ with nothing in the log between
+    /// them.
+    #[test]
+    fn a_parts_message_carrying_no_part_at_all_is_dropped_and_recorded() {
+        let mut actual = Value::Null;
+        let lines = recorded(|| {
+            actual = convert(&[user_hi(), parts(MessageRole::Assistant, vec![])]);
+        });
+
+        assert_eq!(actual, json!([user_hi_wire()]));
+        assert_eq!(lines.len(), 1, "one line for the one thing that went");
+        assert!(
+            lines[0].starts_with("WARN") && lines[0].contains("carries no part at all"),
+            "the drop is recorded: {:?}",
+            lines[0]
+        );
+    }
+
+    /// Nothing else moves: content that survives the trim converts byte for
+    /// byte as it always did, whitespace and all.
+    #[test]
+    fn non_empty_content_converts_exactly_as_before() {
+        let actual = convert(&[
+            text(MessageRole::Assistant, " hi "),
+            parts(
+                MessageRole::Assistant,
+                vec![
+                    ContentPart::Text {
+                        text: "on it".into(),
+                    },
+                    tool_use(),
+                ],
+            ),
+        ]);
+        assert_eq!(
+            actual,
+            json!([
+                { "role": "assistant", "content": [{ "type": "text", "text": " hi " }] },
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "on it" },
+                        { "type": "tool_use", "id": "c1", "name": "search", "input": {} }
+                    ]
+                }
+            ])
+        );
+    }
+
+    /// The degenerate case: dropping never empties a request. A history whose
+    /// only message is an empty assistant one is refused by name, before
+    /// anything is sent, instead of going out as a request with an empty
+    /// message array for the endpoint to refuse in its own words.
+    #[tokio::test]
+    async fn a_request_the_drop_emptied_is_refused_before_it_is_sent() {
+        let request = turn_request(
+            ModelSelector::Specific("claude-test".into()),
+            vec![text(MessageRole::Assistant, "   ")],
+            vec![],
+            None,
+        );
+
+        let err = AnthropicProvider::new("test-key".into(), None)
+            .open_turn(request, true)
+            .await
+            .err()
+            .expect("a request with nothing to send is refused");
+        assert!(matches!(err, LlmError::NoMessage));
+    }
+
+    /// Adjacency is untouched, and nothing merges. The tool result still
+    /// follows the message carrying its call, and two adjacent user messages
+    /// stay two — merging them is what would move a result away from its call.
+    #[test]
+    fn adjacent_messages_are_neither_merged_nor_reordered() {
+        let actual = convert(&[
+            parts(MessageRole::Assistant, vec![tool_use()]),
+            parts(
+                MessageRole::User,
+                vec![ContentPart::ToolResult {
+                    tool_use_id: "c1".into(),
+                    content: "found".into(),
+                }],
+            ),
+            user_hi(),
+        ]);
+        assert_eq!(
+            actual,
+            json!([
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "tool_use", "id": "c1", "name": "search", "input": {} }]
+                },
+                {
+                    "role": "user",
+                    "content": [{ "type": "tool_result", "tool_use_id": "c1", "content": "found" }]
+                },
+                user_hi_wire(),
+            ])
         );
     }
 }

@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 use crate::store::{StoreError, StoreTx};
 
 use super::bind::{self, OpenedTurn};
+use super::empty;
 use super::http;
 use super::http_store::{HttpProviderConfig, HttpProviderStore};
 use super::types::{
@@ -106,7 +107,10 @@ impl OpenAiResponsesProvider {
     ///
     /// # Errors
     ///
-    /// Never at this point — a transport or API failure arrives as the stream's
+    /// Only when the converted request carries no input item at all — the one
+    /// refusal made before anything is sent, since an empty input is rejected
+    /// for a reason that names the field rather than the content that went
+    /// missing. A transport or API failure arrives instead as the stream's
     /// first item, where the bind loop can classify it.
     ///
     /// Asynchronous although it awaits nothing: this is the shape the bind
@@ -127,6 +131,7 @@ impl OpenAiResponsesProvider {
 
         let (body, carried_payloads) =
             Self::build_request_body(&request, true, include_reasoning_payloads);
+        empty::refuse_if_no_message(body.input.len())?;
 
         Ok(OpenedTurn {
             events: wire::open_stream(
@@ -217,39 +222,41 @@ fn convert_input(
     let mut carried_payloads = false;
 
     for msg in messages {
-        let role = match msg.role {
-            MessageRole::System => {
-                match &msg.content {
-                    MessageContent::Text(text) => instructions.push(text.clone()),
-                    MessageContent::Parts(parts) => {
-                        for part in parts {
-                            if let ContentPart::Text { text }
-                            | ContentPart::Reasoning { text, .. } = part
-                            {
-                                instructions.push(text.clone());
-                            }
+        if msg.role == MessageRole::System {
+            match &msg.content {
+                MessageContent::Text(text) => instructions.push(text.clone()),
+                MessageContent::Parts(parts) => {
+                    for part in parts {
+                        if let ContentPart::Text { text } | ContentPart::Reasoning { text, .. } =
+                            part
+                        {
+                            instructions.push(text.clone());
                         }
                     }
                 }
-                continue;
             }
-            MessageRole::User => "user",
-            MessageRole::Assistant => "assistant",
-        };
+            continue;
+        }
 
         match &msg.content {
-            MessageContent::Text(text) => items.push(InputItem::Message {
-                role,
-                content: text.clone(),
-            }),
+            MessageContent::Text(text) => {
+                if empty::keeps_message(msg.role, text) {
+                    items.push(InputItem::Message {
+                        role: item_role(msg.role),
+                        content: text.clone(),
+                    });
+                }
+            }
             MessageContent::Parts(parts) => {
-                convert_parts(
-                    parts,
-                    role,
-                    include_reasoning_payloads,
-                    &mut items,
-                    &mut carried_payloads,
-                );
+                if empty::keeps_parts(msg.role, parts) {
+                    convert_parts(
+                        parts,
+                        msg.role,
+                        include_reasoning_payloads,
+                        &mut items,
+                        &mut carried_payloads,
+                    );
+                }
             }
         }
     }
@@ -262,12 +269,40 @@ fn convert_input(
     (instructions, items, carried_payloads)
 }
 
+/// The wire spelling of a voice on this API's input items.
+///
+/// A system group never reaches one — it becomes the top-level instructions —
+/// but the mapping is total rather than defensive, so it states nothing untrue
+/// if one ever does.
+fn item_role(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::System => "system",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+    }
+}
+
+/// Buffer one text contribution, or drop it when it is empty.
+///
+/// The one door into the buffer for anything text-shaped: the plain text part
+/// comes through here, and so does a reasoning part that folded into the
+/// message text. A later arm that produces text inherits the drop by using
+/// this door rather than by remembering the rule.
+fn buffer_text(role: MessageRole, text: &str, pending_text: &mut Vec<String>) {
+    if empty::keeps_text_part(role, text) {
+        pending_text.push(text.to_string());
+    }
+}
+
 /// Flush buffered assistant text as one message, at the position it occupies, so
 /// a following item keeps its place in the sequence.
-fn flush(role: &'static str, pending_text: &mut Vec<String>, items: &mut Vec<InputItem>) {
+///
+/// Empty text never reaches the buffer, so a flush with nothing buffered is a
+/// message that was never worth sending rather than one being suppressed here.
+fn flush(role: MessageRole, pending_text: &mut Vec<String>, items: &mut Vec<InputItem>) {
     if !pending_text.is_empty() {
         items.push(InputItem::Message {
-            role,
+            role: item_role(role),
             content: pending_text.join("\n"),
         });
         pending_text.clear();
@@ -275,25 +310,31 @@ fn flush(role: &'static str, pending_text: &mut Vec<String>, items: &mut Vec<Inp
 }
 
 /// Emit one group's parts at their ORIGINAL positions.
+///
+/// A replayed reasoning item is the one item that cannot stand alone: this API
+/// requires the item it produced to follow it, so a group ending in one leaves
+/// without it.
 fn convert_parts(
     parts: &[ContentPart],
-    role: &'static str,
+    role: MessageRole,
     include_reasoning_payloads: bool,
     items: &mut Vec<InputItem>,
     carried_payloads: &mut bool,
 ) {
     let mut pending_text: Vec<String> = Vec::new();
+    // Where this group's own items start, so the stranding check below reads
+    // only what this group produced and never an earlier group's items.
+    let group_start = items.len();
 
     for part in parts {
         match part {
-            ContentPart::Text { text } => pending_text.push(text.clone()),
+            ContentPart::Text { text } => buffer_text(role, text, &mut pending_text),
             ContentPart::Reasoning { text, opaque } => match opaque {
                 Some(OpaquePayload::OpenAiResponses {
                     item_id,
                     encrypted_content,
                 }) if include_reasoning_payloads => {
                     flush(role, &mut pending_text, items);
-                    *carried_payloads = true;
                     items.push(InputItem::Reasoning {
                         id: item_id.clone(),
                         summary: vec![ReasoningSummaryText {
@@ -307,7 +348,9 @@ fn convert_parts(
                     });
                 }
                 // Absent, foreign, or suppressed: fold the text, omit the blob.
-                _ => pending_text.push(text.clone()),
+                // Folded text is text, so an empty one is dropped like any
+                // other; the replay above is untouched.
+                _ => buffer_text(role, text, &mut pending_text),
             },
             ContentPart::ToolUse { id, name, input } => {
                 flush(role, &mut pending_text, items);
@@ -342,6 +385,28 @@ fn convert_parts(
     }
 
     flush(role, &mut pending_text, items);
+
+    // A replayed reasoning item is accepted only while the item it produced
+    // still follows it, and this API rejects the whole request for one left
+    // without it. The empty-text drop can take that very message away — a turn
+    // that thought and then said nothing replays as reasoning followed by
+    // nothing — so the replay leaves with the message it belonged to instead of
+    // stranding the request. Trailing, because an item pushed after a reasoning
+    // item is the item that follows it.
+    while items.len() > group_start && matches!(items.last(), Some(InputItem::Reasoning { .. })) {
+        items.pop();
+        warn!("a replayed reasoning item has no item left to follow it, so it is dropped");
+    }
+
+    // Reported from what SURVIVED: a payload popped above never went out, and
+    // claiming it would spend the one-shot retry that exists for payloads a
+    // request actually carried.
+    if items[group_start..]
+        .iter()
+        .any(|item| matches!(item, InputItem::Reasoning { .. }))
+    {
+        *carried_payloads = true;
+    }
 }
 
 /// Translate a selected level into this vendor's effort value.

@@ -26,6 +26,7 @@ use tracing::{info, warn};
 use crate::store::{StoreError, StoreTx};
 
 use super::bind;
+use super::empty;
 use super::http;
 use super::types::{
     ContentPart, EventStream, LlmError, Message, MessageContent, MessageRole, ModelInfo,
@@ -195,19 +196,28 @@ impl KimiProvider {
     }
 
     /// Open one streaming turn from neutral messages.
+    ///
+    /// # Errors
+    ///
+    /// Only when the converted request carries no message at all — the one
+    /// refusal made before anything is sent, since a request with an empty
+    /// message array is rejected for a reason that names an array position
+    /// rather than the content that went missing.
     fn stream_turn(
         &self,
         messages: &[Message],
         model: String,
         tools: &[ToolDefinition],
-    ) -> EventStream {
+    ) -> Result<EventStream, LlmError> {
         let body = self.build_request(messages, model, tools, true);
-        wire::open_stream(
+        empty::refuse_if_no_message(body.messages.len())?;
+
+        Ok(wire::open_stream(
             self.client.clone(),
             self.access_token.clone(),
             self.endpoint(),
             body,
-        )
+        ))
     }
 }
 
@@ -316,20 +326,33 @@ fn push_user(message: &Message, out: &mut Vec<WireMessage>) {
 }
 
 fn push_assistant(message: &Message, thinking_enabled: bool, out: &mut Vec<WireMessage>) {
+    if let MessageContent::Parts(parts) = &message.content
+        && !empty::keeps_parts(message.role, parts)
+    {
+        return;
+    }
+
     let mut text_parts: Vec<&str> = Vec::new();
     let mut reasoning_parts: Vec<&str> = Vec::new();
     let mut tool_calls = Vec::new();
 
     match &message.content {
         MessageContent::Text(text) => {
-            if !text.is_empty() {
+            // The guard this wire always had, now the shared one: it covers
+            // whitespace as well as the empty string, and it leaves a record.
+            if empty::keeps_message(message.role, text) {
                 text_parts.push(text);
             }
         }
         MessageContent::Parts(parts) => {
             for part in parts {
                 match part {
-                    ContentPart::Text { text } => text_parts.push(text),
+                    // The same decision on the branch that pushed unfiltered.
+                    ContentPart::Text { text } => {
+                        if empty::keeps_text_part(message.role, text) {
+                            text_parts.push(text);
+                        }
+                    }
                     // The sibling field carries the text; this wire has no
                     // continuity payload of its own to replay.
                     ContentPart::Reasoning { text, .. } => reasoning_parts.push(text),
@@ -362,23 +385,32 @@ fn push_assistant(message: &Message, thinking_enabled: bool, out: &mut Vec<WireM
     // An assistant message is valid only with content or calls. Reasoning is a
     // rider on those, never a payload of its own: a lone reasoning contribution
     // would otherwise become an empty message the endpoint rejects.
-    if !text_parts.is_empty() || !tool_calls.is_empty() {
-        out.push(WireMessage {
-            role: "assistant".to_string(),
-            content: if text_parts.is_empty() {
-                None
-            } else {
-                Some(text_parts.join("\n\n"))
-            },
-            reasoning_content,
-            tool_calls: if tool_calls.is_empty() {
-                None
-            } else {
-                Some(tool_calls)
-            },
-            tool_call_id: None,
-        });
+    if text_parts.is_empty() && tool_calls.is_empty() {
+        // What the rider costs when its mount goes: this wire's sibling field
+        // cannot travel on its own, so a turn that thought and then said
+        // nothing loses the thinking with the message. The dropped text has
+        // its own line already; this is the line for what rode along.
+        if !reasoning_parts.is_empty() {
+            warn!("an assistant message carries nothing to send, so its reasoning goes with it");
+        }
+        return;
     }
+
+    out.push(WireMessage {
+        role: "assistant".to_string(),
+        content: if text_parts.is_empty() {
+            None
+        } else {
+            Some(text_parts.join("\n\n"))
+        },
+        reasoning_content,
+        tool_calls: if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        },
+        tool_call_id: None,
+    });
 }
 
 /// Derive reasoning levels from a model's self-described support.
@@ -588,7 +620,7 @@ impl ProviderModule for KimiModule {
                             .with_thinking(thinking)
                             .with_reasoning_effort(effort);
 
-                    Ok(provider.stream_turn(&messages, model, &tools))
+                    provider.stream_turn(&messages, model, &tools)
                 }
             },
         ));

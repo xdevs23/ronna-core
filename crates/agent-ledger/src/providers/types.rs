@@ -529,6 +529,15 @@ pub enum LlmError {
     /// The provider instance is misconfigured.
     #[error("config error: {0}")]
     Config(String),
+
+    /// The request has no message to send.
+    ///
+    /// Every wire drops assistant content that is empty once whitespace is
+    /// trimmed, and a degenerate history can leave nothing behind. Such a
+    /// request is refused before it is sent, named, rather than handed to an
+    /// endpoint that rejects it with a message about a position in an array.
+    #[error("the request has no message to send")]
+    NoMessage,
 }
 
 impl LlmError {
@@ -540,7 +549,7 @@ impl LlmError {
     /// transport-level failures — a connect or read timeout, a reset, an early
     /// EOF — that carry no HTTP status. Terminal: a real server response, a
     /// verdict the provider delivered inside a stream, a parse failure, a
-    /// missing credential, a config error.
+    /// missing credential, a config error, a request with nothing to send.
     ///
     /// A rate limit is deliberately *not* recoverable here, and that is not the
     /// same as saying it is never retried. It has a path of its own in the bind
@@ -563,7 +572,8 @@ impl LlmError {
             | Self::RateLimited { .. }
             | Self::Json(_)
             | Self::MissingKey(_)
-            | Self::Config(_) => false,
+            | Self::Config(_)
+            | Self::NoMessage => false,
         }
     }
 }
