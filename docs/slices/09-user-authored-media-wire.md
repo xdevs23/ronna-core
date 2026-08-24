@@ -52,21 +52,30 @@ documents — is unit 20, built on this once it lands.
   always user-authored inbound. Rejected: inferring the role from content shape
   (the current bug — content kind does not determine authorship; a user and an
   assistant can both carry text).
-- **`ContentPart` gains an image variant, and an audio variant only if the
-  gateway accepts it, 2026-08-24.** `ContentPart` (`agency/projection.rs`) gains
-  `Image { mime, data }` (`data` the raw bytes, base64-encoded at the wire) and,
-  gated on verification, `Audio { format, data }`. The OpenAI-compatible wire
-  emits the image as an `image_url` data URI inside `WireMessageContent::Chunks`,
-  and the audio as the verified inline shape; the carrier `convert_parts` uses
-  gains a media case beside its text/reasoning cases, routed into `Chunks` for a
-  message that carries any non-text part. The image data-URI AND the audio shape
-  are BOTH verified with a real request against the gateway before their pins are
-  called done — neither is assumed from convention. If inline audio is not
-  accepted, this unit ships `Image` only and records `Audio` as a named
-  follow-up. Rejected: stringifying media into `Text` (the model must see the
-  real media, not an invented description); a URL part (the platform file URL is
-  short-lived, authenticated, and leaks the platform reference — the bytes
-  travel, encoded, not a link).
+- **`ContentPart` gains an image variant; audio is deferred, the gateway having
+  been verified to drop it, 2026-08-24.** `ContentPart` (`agency/projection.rs`)
+  gains `Image { mime, data }` (`data` the raw bytes, base64-encoded at the
+  wire). The OpenAI-compatible wire emits it as an `image_url` data URI inside
+  `WireMessageContent::Chunks`, and the carrier `convert_parts` uses gains a
+  media case beside its text/reasoning cases, routed into `Chunks` for a message
+  that carries any non-text part. The image shape is VERIFIED, not assumed: a
+  real request to Requesty's `vertex/gemini-3.7-flash@eu` with an `image_url`
+  data URI of a 16x16 blue PNG was answered "Blue", the image ingested as ~1000
+  prompt tokens — the shape works and the model reads it. Audio is NOT added:
+  the same verification found the gateway SILENTLY DROPS every inline audio shape
+  for this model — `input_audio` (0 audio tokens ingested), an `audio_url` type,
+  and an audio data URI in `image_url` all left the audio unprocessed. So audio
+  understanding cannot ride this model's inline wire; it is a named follow-up
+  needing either a speech-to-text step ahead of the model (the voice becomes
+  transcript text) or a model that accepts inline audio through the gateway — a
+  path unit 20 records for the operator, since the owner asked for voice
+  moderation. This unit ships `Image` only, and does not add an `Audio`
+  `ContentPart` variant that no wire path could carry today. Rejected:
+  stringifying media into `Text` (the model must see the real media, not an
+  invented description); a URL part (the platform file URL is short-lived,
+  authenticated, and leaks the platform reference — the bytes travel, encoded);
+  shipping an `Audio` variant serialized to a shape the gateway drops (a silent
+  no-op dressed as a feature — the exact trap the verification caught).
 - **The Anthropic path is kept compiling and out of scope, verified, 2026-08-24.**
   Adding a `ContentPart` variant forces an exhaustive-match arm in the
   Anthropic vendor (`providers/anthropic/mod.rs`), which is feature-gated off by
@@ -85,11 +94,12 @@ In agent-ledger: `convert_messages` threads `msg.role` into `convert_parts`, and
 `tool`). `ContentPart` gains `Image { mime, data }` (and `Audio { format, data }`
 if the gateway accepts inline audio); the OpenAI-compatible wire routes a
 media-bearing message into `WireMessageContent::Chunks` with the image as an
-`image_url` data URI and the audio as its verified shape; the `convert_parts`
-carrier gains a media case. The Anthropic path is handled (implemented or
-cleanly rejected) and proven under `--features anthropic`. A base64 helper, if
-not already a direct dependency, is added at its latest version after a
-supply-chain check. No consumer change here; unit 20 is the consumer.
+`image_url` data URI; the `convert_parts` carrier gains a media case. No `Audio`
+variant ships (the gateway drops inline audio for this model, verified). The
+Anthropic path is handled (implemented or cleanly rejected) and proven under
+`--features anthropic`. A base64 helper, if not already a direct dependency, is
+added at its latest version after a supply-chain check. No consumer change here;
+unit 20 is the consumer.
 
 ## Acceptance criteria
 
@@ -107,15 +117,16 @@ supply-chain check. No consumer change here; unit 20 is the consumer.
   message whose content is `Chunks` with the caption text part and an
   `image_url` data-URI part in order — pinned against the exact wire JSON, and
   the data URI's MIME and base64 verified to round-trip the bytes.
-- **AC4** Audio: if the gateway accepts inline audio, an `Audio { format, data }`
-  serializes to its verified inline shape on the wire — pinned; OR audio is
-  recorded as a named follow-up and only `Image` ships, stated and pinned as the
-  variant set.
-- **AC5** The gateway shapes are verified, not assumed: the image data-URI shape
-  (and the audio shape if it ships) are confirmed accepted by a real request to
-  Requesty's `vertex/gemini-3.7-flash@eu` before AC3/AC4 are called done; the
-  verification method and result are recorded in the unit's decision or a
-  follow-up.
+- **AC4** Audio does not ship and is not faked: no `Audio` `ContentPart` variant
+  is added, the decision records the gateway verified to drop every inline audio
+  shape for this model, and audio understanding is a named follow-up (transcript
+  step or an audio-capable model) — pinned as the shipped variant set (`Image`
+  only) so a later `Audio` addition is a deliberate change, not an accident.
+- **AC5** The image shape is verified, not assumed: the decision records that a
+  real request to Requesty's `vertex/gemini-3.7-flash@eu` with the `image_url`
+  data-URI shape was read by the model (a blue test image answered "Blue",
+  ~1000 image tokens), and that the audio shapes were verified dropped — the
+  grounding this unit rests on, recorded rather than assumed from convention.
 - **AC6** No regression on the existing wire: every current
   `convert_messages`/`convert_parts`/append_to pin passes unchanged (assistant
   text, reasoning continuity, tool use, tool results), the role rework proven
