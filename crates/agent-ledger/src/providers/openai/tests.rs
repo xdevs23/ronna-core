@@ -899,9 +899,12 @@ mod registry {
     }
 }
 
-/// The empty-content drop, on this vendor's wire: assistant content that is
-/// empty once whitespace is trimmed never leaves, in any of the shapes the
-/// render pass can produce it in.
+/// Empty assistant content, on this vendor's wire: it is ECHOED, in every shape
+/// the render pass can produce it in. This API accepts an empty message content
+/// — its documented refusal is of a NULL text, which this wire never sends — so
+/// a turn that said nothing rides out as the empty message it was, and the model
+/// reads its own silence back. The one item that still leaves is the replayed
+/// reasoning item no item follows, which the API rejects outright.
 mod empty_assistant_content {
     use super::*;
 
@@ -940,31 +943,43 @@ mod empty_assistant_content {
         json!({ "type": "message", "role": "user", "content": "hi" })
     }
 
-    fn one_call() -> Value {
-        json!([{ "type": "function_call", "call_id": "c1", "name": "search", "arguments": "{}" }])
+    /// An empty assistant message item, as it rides out, followed by the call.
+    fn empty_message_then_call() -> Value {
+        json!([
+            { "type": "message", "role": "assistant", "content": "" },
+            { "type": "function_call", "call_id": "c1", "name": "search", "arguments": "{}" }
+        ])
     }
 
-    /// Message level: a silent turn contributes no input item at all.
+    /// Message level: a silent turn contributes its own message item, empty
+    /// content and all.
     #[test]
-    fn an_empty_assistant_message_is_not_sent() {
+    fn an_empty_assistant_message_is_echoed() {
         assert_eq!(
             convert(&[user_hi(), text(MessageRole::Assistant, "")]),
-            json!([user_hi_item()])
+            json!([
+                user_hi_item(),
+                { "type": "message", "role": "assistant", "content": "" }
+            ])
         );
     }
 
-    /// Whitespace counts as empty.
+    /// Whitespace is content like any other: it goes out verbatim, untrimmed.
     #[test]
-    fn a_whitespace_only_assistant_message_is_not_sent() {
+    fn a_whitespace_only_assistant_message_is_echoed_verbatim() {
         assert_eq!(
             convert(&[user_hi(), text(MessageRole::Assistant, "   \n ")]),
-            json!([user_hi_item()])
+            json!([
+                user_hi_item(),
+                { "type": "message", "role": "assistant", "content": "   \n " }
+            ])
         );
     }
 
-    /// Part level: the call survives, the empty text buys no message item.
+    /// Part level: the empty text flushes into its own message item at the
+    /// position it held, and the call follows it — order intact.
     #[test]
-    fn an_empty_text_part_beside_a_tool_call_loses_only_the_text() {
+    fn an_empty_text_part_beside_a_tool_call_keeps_both() {
         assert_eq!(
             convert(&[parts(
                 MessageRole::Assistant,
@@ -975,15 +990,15 @@ mod empty_assistant_content {
                     tool_use()
                 ]
             )]),
-            one_call()
+            empty_message_then_call()
         );
     }
 
     /// The other empty part shape: a reasoning part with no replayable payload
     /// folds into the message text, and an empty one folds into an empty
-    /// message. It is dropped like any other empty text.
+    /// message — which is echoed like any other empty text.
     #[test]
-    fn a_degraded_empty_reasoning_beside_a_tool_call_is_not_sent() {
+    fn a_degraded_empty_reasoning_beside_a_tool_call_is_echoed() {
         assert_eq!(
             convert(&[parts(
                 MessageRole::Assistant,
@@ -995,7 +1010,7 @@ mod empty_assistant_content {
                     tool_use(),
                 ],
             )]),
-            one_call()
+            empty_message_then_call()
         );
     }
 
@@ -1029,9 +1044,10 @@ mod empty_assistant_content {
         );
     }
 
-    /// A parts message left with nothing at all contributes no item.
+    /// A parts message whose only text is whitespace still carries that text,
+    /// so it flushes into a message item and goes out as it stands.
     #[test]
-    fn a_parts_message_of_nothing_but_empty_text_is_not_sent() {
+    fn a_parts_message_of_nothing_but_empty_text_is_echoed() {
         assert_eq!(
             convert(&[
                 user_hi(),
@@ -1040,7 +1056,10 @@ mod empty_assistant_content {
                     vec![ContentPart::Text { text: "  ".into() }]
                 )
             ]),
-            json!([user_hi_item()])
+            json!([
+                user_hi_item(),
+                { "type": "message", "role": "assistant", "content": "  " }
+            ])
         );
     }
 
@@ -1080,30 +1099,27 @@ mod empty_assistant_content {
         );
     }
 
-    /// A replayed reasoning item cannot be the last thing a group sends: this
-    /// API rejects a reasoning item that no produced item follows, and the
-    /// empty-text drop is what can leave one that way — a turn that thought and
-    /// then said nothing. The replay goes with the message it belonged to, and
-    /// the build reports no carried payload for one that never went out, so the
-    /// one-shot payload retry is not spent on a request that carried none.
+    /// A replayed reasoning item cannot be the last thing a GROUP sends: this
+    /// API rejects a reasoning item that no produced item follows ("Item 'rs_…'
+    /// of type 'reasoning' was provided without its required following item"),
+    /// so a group whose replay is all it has left sends nothing at all. The
+    /// next message's item is no rescue — it belongs to another group, and the
+    /// pop has already happened by the time it is converted. The build reports
+    /// no carried payload for a replay that never went out, so the one-shot
+    /// payload retry is not spent on a request that carried none.
     #[test]
     fn a_replayed_reasoning_left_with_nothing_to_follow_it_is_not_sent() {
         let messages = [
             user_hi(),
             parts(
                 MessageRole::Assistant,
-                vec![
-                    ContentPart::Reasoning {
-                        text: "let me think".into(),
-                        opaque: Some(OpaquePayload::OpenAiResponses {
-                            item_id: "rs_1".into(),
-                            encrypted_content: "gAAAA-blob".into(),
-                        }),
-                    },
-                    ContentPart::Text {
-                        text: String::new(),
-                    },
-                ],
+                vec![ContentPart::Reasoning {
+                    text: "let me think".into(),
+                    opaque: Some(OpaquePayload::OpenAiResponses {
+                        item_id: "rs_1".into(),
+                        encrypted_content: "gAAAA-blob".into(),
+                    }),
+                }],
             ),
             text(MessageRole::User, "still there?"),
         ];
@@ -1115,6 +1131,46 @@ mod empty_assistant_content {
             json!([
                 user_hi_item(),
                 { "type": "message", "role": "user", "content": "still there?" }
+            ])
+        );
+    }
+
+    /// The echo is what keeps a replay company: a turn that thought and then
+    /// said nothing sends its reasoning item followed by the empty message the
+    /// silence became, which is the required following item this API asks for.
+    /// Before the echo this shape lost both; it is the pin on why the pop is
+    /// now the narrow case rather than the ordinary one.
+    #[test]
+    fn a_replayed_reasoning_followed_by_the_echoed_silence_rides_out() {
+        let messages = [parts(
+            MessageRole::Assistant,
+            vec![
+                ContentPart::Reasoning {
+                    text: "let me think".into(),
+                    opaque: Some(OpaquePayload::OpenAiResponses {
+                        item_id: "rs_1".into(),
+                        encrypted_content: "gAAAA-blob".into(),
+                    }),
+                },
+                ContentPart::Text {
+                    text: String::new(),
+                },
+            ],
+        )];
+
+        let (_, items, carried) = convert_input(&messages, true);
+        assert!(carried, "the replay rode out, so the payload is reported");
+        assert_eq!(
+            serde_json::to_value(&items).expect("the items serialize"),
+            json!([
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{ "type": "summary_text", "text": "let me think" }],
+                    "status": null,
+                    "encrypted_content": "gAAAA-blob"
+                },
+                { "type": "message", "role": "assistant", "content": "" }
             ])
         );
     }
@@ -1143,15 +1199,29 @@ mod empty_assistant_content {
         );
     }
 
-    /// The degenerate case: dropping never empties a request. A history whose
-    /// only message is an empty assistant one is refused by name, before
-    /// anything is sent, instead of going out with an empty input for the
-    /// endpoint to refuse in its own words.
+    /// The degenerate case: a request left with no input item is refused by
+    /// name, before anything is sent, instead of going out with an empty input
+    /// for the endpoint to refuse in its own words.
+    ///
+    /// The shape that reaches it is the trailing-replay pop, the one conversion
+    /// on this wire that still takes an item away: a history whose only message
+    /// is a turn that thought and produced nothing else has its replay popped
+    /// and nothing left behind it. An empty assistant message no longer empties
+    /// anything — it is echoed, and an echoed item is an item.
     #[tokio::test]
-    async fn a_request_the_drop_emptied_is_refused_before_it_is_sent() {
+    async fn a_request_the_reasoning_pop_emptied_is_refused_before_it_is_sent() {
         let request = CompletionRequest {
             model: "gpt-5-test".into(),
-            messages: vec![text(MessageRole::Assistant, "   ")],
+            messages: vec![parts(
+                MessageRole::Assistant,
+                vec![ContentPart::Reasoning {
+                    text: "let me think".into(),
+                    opaque: Some(OpaquePayload::OpenAiResponses {
+                        item_id: "rs_1".into(),
+                        encrypted_content: "gAAAA-blob".into(),
+                    }),
+                }],
+            )],
             tools: vec![],
             max_tokens: None,
             temperature: None,

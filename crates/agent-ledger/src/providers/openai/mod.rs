@@ -240,23 +240,23 @@ fn convert_input(
 
         match &msg.content {
             MessageContent::Text(text) => {
-                if empty::keeps_message(msg.role, text) {
-                    items.push(InputItem::Message {
-                        role: item_role(msg.role),
-                        content: text.clone(),
-                    });
-                }
+                // Echoed, empty included: a turn that said nothing is a real
+                // event on the ledger and the model reads its own silence back.
+                // Nothing here is known to refuse it — this API's documented
+                // refusal is of a NULL text, which this never sends.
+                items.push(InputItem::Message {
+                    role: item_role(msg.role),
+                    content: text.clone(),
+                });
             }
             MessageContent::Parts(parts) => {
-                if empty::keeps_parts(msg.role, parts) {
-                    convert_parts(
-                        parts,
-                        msg.role,
-                        include_reasoning_payloads,
-                        &mut items,
-                        &mut carried_payloads,
-                    );
-                }
+                convert_parts(
+                    parts,
+                    msg.role,
+                    include_reasoning_payloads,
+                    &mut items,
+                    &mut carried_payloads,
+                );
             }
         }
     }
@@ -286,12 +286,11 @@ fn item_role(role: MessageRole) -> &'static str {
 ///
 /// The one door into the buffer for anything text-shaped: the plain text part
 /// comes through here, and so does a reasoning part that folded into the
-/// message text. A later arm that produces text inherits the drop by using
-/// this door rather than by remembering the rule.
-fn buffer_text(role: MessageRole, text: &str, pending_text: &mut Vec<String>) {
-    if empty::keeps_text_part(role, text) {
-        pending_text.push(text.to_string());
-    }
+/// message text. The door stays even though nothing is filtered at it: a later
+/// arm that produces text joins the buffer the same way, and a rule this
+/// endpoint ever needs lands in one place rather than in each arm.
+fn buffer_text(_role: MessageRole, text: &str, pending_text: &mut Vec<String>) {
+    pending_text.push(text.to_string());
 }
 
 /// Flush buffered assistant text as one message, at the position it occupies, so

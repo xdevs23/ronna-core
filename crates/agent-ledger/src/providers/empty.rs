@@ -1,24 +1,25 @@
-//! The empty-content drop, decided once and applied by every wire.
+//! What "empty assistant content" means, for the endpoints that refuse it.
 //!
-//! Several endpoints reject an assistant message whose content is empty, and
-//! the ledger legitimately holds one: a turn that completed without saying
-//! anything is recorded as an empty assistant block, and the projection replays
-//! it. That record does not change. What changes is what a wire SENDS —
-//! assistant content that is empty once whitespace is trimmed never goes out:
-//! not as a message, not as a text part, and not as the whole of a parts list.
-//! A message still carrying a non-text part keeps that part and loses only the
-//! empty text.
+//! A turn that completed without saying anything is recorded as an empty
+//! assistant block, and the projection replays it. **That message is meant to
+//! go out.** The model reading its own silence back is the point of recording
+//! it, and the chat-completions schema agrees an empty string is a string. So
+//! the default everywhere is to echo it, unchanged.
 //!
-//! The decision lives here because it is the same decision four times over, and
-//! it is deliberately not keyed on the vendor. The endpoint behind a wire is
-//! operator-configurable, and one of them is a gateway fronting the very
-//! vendors that refuse empty content, so a per-vendor answer would be wrong
-//! exactly where it mattered. The risk is one-sided anyway: keeping an empty
-//! message can fail a request, dropping it cannot.
+//! Some endpoints refuse it anyway — anthropic will not take an empty text
+//! block, and one gateway's own vendor wants content or tool calls. An
+//! endpoint that refuses converts the message away **on its own side**, which
+//! is why this module answers a question rather than enforcing a policy: it
+//! says what counts as empty and records the removal, and each wire that needs
+//! the answer asks for it. A wire whose endpoint accepts the echo never calls
+//! in here at all.
 //!
-//! What a wire does with the answer stays the wire's own. Each already knows
-//! whether the message it is building still carries something, and none of them
-//! merges adjacent messages — a merge would move a tool result away from the
+//! Empty means nothing survives once whitespace is trimmed — as a message, as a
+//! text part, or as the whole of a parts list. A message still carrying a
+//! non-text part keeps that part and loses only the empty text.
+//!
+//! The removal is a wire-side conversion and nothing more. None of these wires
+//! merges adjacent messages: a merge would move a tool result away from the
 //! message carrying the call it answers, which every endpoint here rejects.
 
 use tracing::warn;

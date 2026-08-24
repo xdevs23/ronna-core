@@ -107,6 +107,16 @@ pub(crate) struct ChatProvider {
     /// A fixed vendor name for listed models. `None` derives the vendor from the
     /// model id, for endpoints whose ids carry a vendor prefix.
     vendor: Option<&'static str>,
+    /// Whether this endpoint refuses an empty assistant message and must have
+    /// it converted away here.
+    ///
+    /// Default false: the ledger records a turn that said nothing, and the
+    /// model is meant to read its own silence back, so the empty message is
+    /// echoed. The chat-completions schema agrees — assistant content is a
+    /// string, an array or null, and `""` is a string. A vendor whose endpoint
+    /// genuinely refuses it says so here, and converts on its own side rather
+    /// than every other endpoint losing the echo for its sake.
+    refuses_empty_assistant: bool,
 }
 
 impl ChatProvider {
@@ -130,6 +140,7 @@ impl ChatProvider {
             assistant_content: fold_assistant_content,
             details_echo: false,
             vendor: None,
+            refuses_empty_assistant: false,
         }
     }
 
@@ -177,6 +188,14 @@ impl ChatProvider {
     #[allow(dead_code)]
     pub(crate) fn vendor_label(mut self, label: &'static str) -> Self {
         self.vendor = Some(label);
+        self
+    }
+
+    /// Declare that this endpoint refuses an empty assistant message, so it is
+    /// converted away here instead of being echoed.
+    #[allow(dead_code)]
+    pub(crate) fn refuses_empty_assistant(mut self) -> Self {
+        self.refuses_empty_assistant = true;
         self
     }
 
@@ -237,7 +256,7 @@ impl ChatProvider {
         for msg in messages {
             match &msg.content {
                 MessageContent::Text(text) => {
-                    if !empty::keeps_message(msg.role, text) {
+                    if self.refuses_empty_assistant && !empty::keeps_message(msg.role, text) {
                         continue;
                     }
                     wire_messages.push(WireMessage {
@@ -249,7 +268,7 @@ impl ChatProvider {
                     });
                 }
                 MessageContent::Parts(parts) => {
-                    if !empty::keeps_parts(msg.role, parts) {
+                    if self.refuses_empty_assistant && !empty::keeps_parts(msg.role, parts) {
                         continue;
                     }
                     self.convert_parts(parts, msg.role, include_reasoning_payloads)
@@ -276,7 +295,12 @@ impl ChatProvider {
         for part in parts {
             match part {
                 ContentPart::Text { text } => {
-                    collect_text(role, AssistantTextPart::Text(text), &mut group_parts);
+                    collect_text(
+                        self.refuses_empty_assistant,
+                        role,
+                        AssistantTextPart::Text(text),
+                        &mut group_parts,
+                    );
                 }
                 ContentPart::Reasoning { text, opaque } => {
                     // The variant gate: only THIS surface's payload replays
@@ -300,6 +324,7 @@ impl ChatProvider {
                     // one is dropped like any other. The replay above is
                     // untouched.
                     collect_text(
+                        self.refuses_empty_assistant,
                         role,
                         AssistantTextPart::Reasoning {
                             text,
@@ -506,8 +531,13 @@ fn wire_role(role: MessageRole) -> &'static str {
 /// into text. A later arm that produces text inherits the drop by using this
 /// door rather than by remembering the rule — a guard each arm writes for
 /// itself is exactly the shape that left one vendor's parts branch unguarded.
-fn collect_text<'a>(role: MessageRole, part: AssistantTextPart<'a>, out: &mut Vec<GroupPart<'a>>) {
-    if empty::keeps_text_part(role, part.text()) {
+fn collect_text<'a>(
+    refuses_empty: bool,
+    role: MessageRole,
+    part: AssistantTextPart<'a>,
+    out: &mut Vec<GroupPart<'a>>,
+) {
+    if !refuses_empty || empty::keeps_text_part(role, part.text()) {
         out.push(GroupPart::Text(part));
     }
 }
