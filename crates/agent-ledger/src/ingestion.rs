@@ -21,6 +21,7 @@ use crate::agency::{AgencyCtx, RuntimeKind};
 use crate::bus::RuntimeEvent;
 use crate::dispatch::TurnAnchor;
 use crate::event::CoreEvent;
+use crate::event::stream_status;
 use crate::providers::types::{
     FinalContentBlock, ProviderResponse, ProviderRx, StopReason, StreamEvent,
 };
@@ -94,6 +95,8 @@ struct TurnTrackers {
     current_thinking_block: Option<i64>,
     content_final_received: bool,
     thinking_finalized: bool,
+    /// Where the turn's text channel stands — see [`TextChannel`].
+    text_channel: TextChannel,
     /// Every concurrently-open streaming tool call, in start order — the
     /// shared chat-stream translator buffers N parallel calls and emits a
     /// SINGLE terminal `ToolUseEnd`, so a Vec (not one slot) is what keeps
@@ -101,20 +104,44 @@ struct TurnTrackers {
     open_streaming_tool_calls: Vec<(i64, String, String)>,
 }
 
+/// The turn's text-channel progression (2026-08-24): one fact with three
+/// stops, not two independent flags, because the two were never independent
+/// — the `responding` signal matters only before a commit, and a commit ends
+/// the channel's story for the turn.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum TextChannel {
+    /// No user-visible text yet. A block may have OPENED — an open that
+    /// finalizes empty is the recorded empty turn — but nothing real flowed,
+    /// so no compose cue was raised.
+    #[default]
+    Silent,
+    /// Real text flowed: the `responding` status fired, once, at the first
+    /// non-empty delta.
+    Responding,
+    /// A final text block committed, through ANY of the finalize paths.
+    /// Read at `message_end`: a completed non-tool turn whose channel never
+    /// reached this stop owes the ledger its empty assistant text block —
+    /// this state is what tells "the turn's text is already in the ledger"
+    /// from "the turn ended with nothing", because a `TextFinal` commit
+    /// leaves no streaming tail behind for `message_end` to see.
+    Committed,
+}
+
 /// What became of the open streamed text tail at a finalization point.
 ///
 /// Three-valued on purpose: the guard logic in [`ChannelReader::content_final`]
-/// must tell a DELIBERATE no-persist (no tail, or an empty tail discarded by
-/// the empty-block rule) from a FAILED persist (content that may still exist
-/// and that a fallback path could still save). Collapsing both into one
-/// "nothing persisted" answer is what let an empty sibling clear the received
-/// guard and a following `TextFinal` commit the turn's text twice.
+/// must tell a DELIBERATE no-persist (no open tail at all) from a FAILED
+/// persist (content that may still exist and that a fallback path could still
+/// save). Collapsing both into one "nothing persisted" answer is what let an
+/// empty sibling clear the received guard and a following `TextFinal` commit
+/// the turn's text twice.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TailFinalization {
-    /// The tail's prose committed as a final text block.
+    /// The tail's final state committed as a final text block — empty
+    /// included (2026-08-24): an opened tail that accumulated nothing is
+    /// still the text channel's final state, and it commits like any other.
     Persisted,
-    /// There was nothing to commit — no open tail, or an empty one that was
-    /// deliberately discarded. Not a failure.
+    /// There was no open tail to commit. Not a failure.
     NothingToPersist,
     /// A commit was owed and did not happen — the fallback paths may still
     /// save the content.
@@ -154,6 +181,17 @@ struct ChannelReader<K: RuntimeKind, E> {
     /// close happens where every close happens: when the reader is done with
     /// the turn.
     pending_error: Option<String>,
+    /// The drained turn completed (`EndTurn`) with NO text block committed,
+    /// and owes the ledger its empty assistant text block (2026-08-24). Set
+    /// at `message_end`, consumed at the turn's real boundary — the trailing
+    /// done — because one real wire ends a tool-call turn with an `EndTurn`
+    /// stop and trails the lifecycles after the end: a tool call that
+    /// finalizes during the drain cancels the debt, so no empty block sits
+    /// orphaned beside the calls. Lives on the reader, not the trackers,
+    /// because `message_end` resets the trackers for the drain phase. The
+    /// error, restart and teardown ends all drop it: the commit rides only
+    /// the normal completion terminal.
+    owes_empty_commit: bool,
     /// Between a turn's `MessageEnd` and its terminal: the phase the drain
     /// deadline covers.
     draining: bool,
@@ -182,6 +220,7 @@ async fn run_channel<K: RuntimeKind, E: RuntimeEvent>(
         generation,
         anchor,
         pending_error: None,
+        owes_empty_commit: false,
         draining: false,
         drained_epoch: 0,
     };
@@ -211,8 +250,12 @@ async fn run_channel<K: RuntimeKind, E: RuntimeEvent>(
                 if reader.anchor.epoch() != reader.drained_epoch {
                     // Only the drain state resets: mid_turn belongs to
                     // whatever the successor's stream is doing right now
-                    // and is managed by its own arms.
+                    // and is managed by its own arms. An empty commit the
+                    // drained turn still owed dies with it — the turn was
+                    // ended out of band, and committing its block under the
+                    // successor's anchor would misattribute it.
                     reader.draining = false;
+                    reader.abandon_owed_empty_commit();
                     continue;
                 }
                 reader
@@ -317,6 +360,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 // both superseded.
                 self.discard_streaming_tails("restart-clean").await;
                 self.pending_error = None;
+                self.abandon_owed_empty_commit();
                 self.draining = false;
             }
             ProviderResponse::Error(error) => {
@@ -343,6 +387,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 // a recorded abnormal stop is superseded by it.
                 self.mid_turn = false;
                 self.pending_error = None;
+                self.abandon_owed_empty_commit();
                 self.draining = false;
             }
             ProviderResponse::Done => {
@@ -356,6 +401,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 // streaming tail alive past its turn.
                 self.finalize_streamed_text_tail().await;
                 self.discard_unterminated_tails("turn done").await;
+                self.commit_owed_empty_turn().await;
                 self.emit_turn_terminal();
             }
         }
@@ -488,14 +534,14 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
             StreamEvent::ProviderStatus { label } => {
                 self.ctx.bus.emit(CoreEvent::StreamStatus {
                     conversation_id: conv_id,
-                    label: "sending".into(),
+                    label: stream_status::SENDING.into(),
                     subtitle: Some(label),
                 });
             }
             StreamEvent::Connected => {
                 self.ctx.bus.emit(CoreEvent::StreamStatus {
                     conversation_id: conv_id,
-                    label: "waiting_for_response".into(),
+                    label: stream_status::WAITING_FOR_RESPONSE.into(),
                     subtitle: None,
                 });
             }
@@ -542,6 +588,21 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
 
     async fn text_delta(&mut self, text: String) {
         let conv_id = self.ctx.conversation_id;
+        // The user-visible-text signal (2026-08-24): `responding` fires once
+        // per turn, at the first NON-EMPTY text delta — the moment real
+        // user-visible content starts flowing. Deliberately not at
+        // `text_block_start`: a block can open and then finalize empty (the
+        // recorded empty turn), and a cue raised at the open would announce a
+        // reply for a turn that says nothing. Thinking raises it never — its
+        // deltas take the other channel.
+        if !text.is_empty() && self.trackers.text_channel == TextChannel::Silent {
+            self.trackers.text_channel = TextChannel::Responding;
+            self.ctx.bus.emit(CoreEvent::StreamStatus {
+                conversation_id: conv_id,
+                label: stream_status::RESPONDING.into(),
+                subtitle: None,
+            });
+        }
         let block_id = match self.trackers.current_streaming_block {
             Some(id) => id,
             None => match self
@@ -699,9 +760,12 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 FinalContentBlock::Text { text } => {
                     // The first final text replaces the turn's streaming text
                     // tail atomically (ephemeral, replaced by finals). An
-                    // empty final never commits ITSELF — but over a NON-empty
-                    // streamed tail the streamed prose is the turn's content,
-                    // so it finalizes from the tail instead of discarding it.
+                    // empty final never commits ITSELF — the streamed tail's
+                    // own final state is the turn's content, so it finalizes
+                    // from the tail, empty included (2026-08-24); with no
+                    // tail open there is nothing here to commit, and a turn
+                    // that completes with no text at all writes its empty
+                    // block at `message_end`.
                     if text.is_empty() {
                         match self.finalize_streamed_text_tail().await {
                             TailFinalization::Persisted => any_persisted = true,
@@ -721,7 +785,10 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                         )
                         .await
                     {
-                        Ok(_) => any_persisted = true,
+                        Ok(_) => {
+                            any_persisted = true;
+                            self.trackers.text_channel = TextChannel::Committed;
+                        }
                         Err(e) => {
                             any_failed = true;
                             tracing::error!(conversation_id = conv_id, error = %e, "persist final text block failed");
@@ -796,10 +863,17 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
     }
 
     /// Commit the open streamed text tail as its final block — the atomic
-    /// replace — or discard it when it is empty: an empty final can never
-    /// commit, because a committed empty text block renders as an empty
-    /// content part, which some vendors reject with an API error on EVERY
-    /// later turn, poisoning the conversation permanently.
+    /// replace — empty included (2026-08-24). An opened tail that accumulated
+    /// no content is still the text channel's final state: the completion
+    /// recorded no assistant text, and that empty result is a real fact the
+    /// ledger keeps like any assistant text. The empty tail used to be
+    /// discarded here on the belief that a committed empty text block poisons
+    /// later requests; a
+    /// real request against the deployed provider replayed empty assistant
+    /// content and it was accepted, so the discard was a design error — and
+    /// it left the owing message as the frontier tail after a no-text turn,
+    /// which wedged the conversation (nothing re-dispatches a turn that wrote
+    /// nothing).
     async fn finalize_streamed_text_tail(&mut self) -> TailFinalization {
         let conv_id = self.ctx.conversation_id;
         let Some(block_id) = self.trackers.current_streaming_block.take() else {
@@ -811,7 +885,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
             .get_block_content(block_id, "block_text")
             .await
         {
-            Ok(Some(content)) if !content.is_empty() => {
+            Ok(Some(content)) => {
                 match self
                     .ctx
                     .store
@@ -823,20 +897,19 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                     )
                     .await
                 {
-                    Ok(_) => TailFinalization::Persisted,
+                    Ok(_) => {
+                        self.trackers.text_channel = TextChannel::Committed;
+                        TailFinalization::Persisted
+                    }
                     Err(e) => {
                         tracing::error!(conversation_id = conv_id, block_id, error = %e, "persist final text block failed");
                         TailFinalization::Failed
                     }
                 }
             }
-            Ok(_) => {
-                // An empty tail is deliberately discarded — content-free, so
-                // nothing a fallback path could still save, even when the
-                // discard itself errors.
-                if let Err(e) = self.ctx.store.discard_streaming_block(block_id).await {
-                    tracing::error!(conversation_id = conv_id, block_id, error = %e, "discard empty text tail failed");
-                }
+            Ok(None) => {
+                // The tracked row is gone — an out-of-band sweep already took
+                // it. Nothing exists to commit.
                 TailFinalization::NothingToPersist
             }
             Err(e) => {
@@ -854,13 +927,13 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
             return;
         }
         if text.is_empty() {
-            // A non-empty streamed tail under an empty restatement is still
-            // the turn's content — finalize from the tail; an empty tail is
-            // discarded.
+            // The streamed tail under an empty restatement is still the
+            // turn's content — finalize from the tail, empty included
+            // (2026-08-24).
             self.finalize_streamed_text_tail().await;
             return;
         }
-        if let Err(e) = self
+        match self
             .ctx
             .store
             .insert_final_text_block(
@@ -871,7 +944,10 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
             )
             .await
         {
-            tracing::error!(conversation_id = self.ctx.conversation_id, error = %e, "persist final text block failed");
+            Ok(_) => self.trackers.text_channel = TextChannel::Committed,
+            Err(e) => {
+                tracing::error!(conversation_id = self.ctx.conversation_id, error = %e, "persist final text block failed");
+            }
         }
     }
 
@@ -879,17 +955,56 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
 
     async fn message_end(&mut self, usage: crate::providers::Usage, stop_reason: StopReason) {
         let conv_id = self.ctx.conversation_id;
-        if !self.trackers.content_final_received {
+        let tail = if self.trackers.content_final_received {
+            TailFinalization::NothingToPersist
+        } else {
             // The atomic replace: the final text commits and the streaming
-            // tail dies in one transaction — or the empty tail is discarded.
-            self.finalize_streamed_text_tail().await;
-        }
+            // tail dies in one transaction — empty included (2026-08-24).
+            self.finalize_streamed_text_tail().await
+        };
+
+        // The completed no-text turn owes its empty assistant text block
+        // (2026-08-24): a turn that ends normally without committing any
+        // assistant text — no text channel at all, a thinking-only turn, or a
+        // completion whose only move was elided (a skipped empty-input tool
+        // call) — still completed, and the ledger records that completion. The
+        // empty block is a frontier-settling record: it closes the frontier's
+        // owed turn (an assistant text awaits nobody) and carries the turn's
+        // usage, and on replay the model reads its own empty message back
+        // instead of a hole. Recorded here as OWED, committed at the turn's
+        // real boundary (`Done`): one real wire ends a tool-call turn with an `EndTurn`
+        // stop and trails the buffered lifecycles AFTER this event, and an
+        // empty block written now would sit orphaned beside those calls.
+        // A finalized tool call therefore cancels the debt, and only the
+        // trailing done — the normal completion terminal — commits it.
+        // Scoped tightly:
+        //
+        // - `EndTurn` only. A tool-use stop's turn continues into its calls,
+        //   and the abnormal stops (`max_tokens`, `content_filter`) ride the
+        //   error edge — they latch, and the retry resumes from the
+        //   still-owing tail; an empty block committed there would bury the
+        //   owed message for good. The stream-error and teardown paths never
+        //   reach here at all.
+        // - Not when the turn already committed text through ANY finalize
+        //   path — the empty block records "no assistant text was committed",
+        //   never "text committed, elsewhere".
+        // - Not over a FAILED tail commit: the tail held real content that
+        //   did not persist, and an empty block on top would forge a
+        //   no-text turn out of a store failure.
+        // - Not while a streaming text tail is still open (reachable only
+        //   when `ContentFinal` skipped the text channel): committing
+        //   "nothing" beside unfinalized prose would lie twice.
+        self.owes_empty_commit = stop_reason == StopReason::EndTurn
+            && self.trackers.text_channel != TextChannel::Committed
+            && tail != TailFinalization::Failed
+            && self.trackers.current_streaming_block.is_none();
 
         self.ctx.bus.emit(CoreEvent::StreamDone {
             conversation_id: conv_id,
             usage: Some(StreamUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
             }),
             stop_reason: Some(stop_reason),
             generation: Some(self.generation),
@@ -898,7 +1013,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
         if stop_reason == StopReason::ToolUse {
             self.ctx.bus.emit(CoreEvent::StreamStatus {
                 conversation_id: conv_id,
-                label: "running_tools".into(),
+                label: stream_status::RUNNING_TOOLS.into(),
                 subtitle: None,
             });
         }
@@ -921,6 +1036,48 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
         // Recorded now, while the drained turn is provably the seam's open
         // turn — the actor cannot dispatch again before this turn's close.
         self.drained_epoch = self.anchor.epoch();
+    }
+
+    /// Abandon an owed empty-turn commit without recording the block. Every
+    /// edge that ends or supersedes the drained turn WITHOUT it being the
+    /// normal completion — the restart-clean, the provider-error terminal, the
+    /// stale-drain reset when the seam's epoch moved on, and a finalized tool
+    /// call that turns the completion into a tool-call turn — clears the debt
+    /// through this one seam. Committing the debt happens in exactly one place
+    /// ([`Self::commit_owed_empty_turn`], on the trailing done); every other
+    /// clear is an abandonment and routes here, so the set of non-completion
+    /// clears has a single named referent a new edge is added against rather
+    /// than a fifth scattered assignment that a review has to hunt for.
+    fn abandon_owed_empty_commit(&mut self) {
+        self.owes_empty_commit = false;
+    }
+
+    /// Commit the empty assistant text block a completed no-text turn owes
+    /// (2026-08-24), at the turn's real boundary — the trailing done. By this
+    /// point every trailing lifecycle has arrived: a tool call that finalized
+    /// during the drain has already cancelled the debt, and a recorded
+    /// abnormal stop rides the error terminal, so a pending error drops the
+    /// commit too. The insert precedes the terminal on purpose: the actor's
+    /// close re-derives the owed turn from the ledger, and the block must be
+    /// in the snapshot that re-check reads — the empty block resting the
+    /// frontier is the whole point.
+    async fn commit_owed_empty_turn(&mut self) {
+        if !std::mem::take(&mut self.owes_empty_commit) || self.pending_error.is_some() {
+            return;
+        }
+        if let Err(e) = self
+            .ctx
+            .store
+            .insert_final_text_block(
+                self.turn_destination(),
+                crate::block::Role::Assistant,
+                String::new(),
+                None,
+            )
+            .await
+        {
+            tracing::error!(conversation_id = self.ctx.conversation_id, error = %e, "persist empty final text block failed");
+        }
     }
 
     /// A stop that ends the turn abnormally: record a visible error status
@@ -1052,12 +1209,21 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 )
                 .await
             {
-                Ok(block_id) => tracing::info!(
-                    conversation_id = conv_id,
-                    tool_call_id = %tool_call_id,
-                    block_id,
-                    "tool call block inserted"
-                ),
+                Ok(block_id) => {
+                    // A finalized call cancels any empty-turn commit the
+                    // message end recorded as owed: one real wire ends a
+                    // tool-call turn with an `EndTurn` stop and trails the
+                    // lifecycle after the end, and that turn continues into
+                    // its calls — it is not a no-text completion, and an
+                    // empty block would sit orphaned beside the call.
+                    self.abandon_owed_empty_commit();
+                    tracing::info!(
+                        conversation_id = conv_id,
+                        tool_call_id = %tool_call_id,
+                        block_id,
+                        "tool call block inserted"
+                    );
+                }
                 Err(e) => tracing::error!(
                     conversation_id = conv_id,
                     tool_call_id = %tool_call_id,
@@ -1113,6 +1279,7 @@ mod tests {
             generation: 1,
             anchor: TurnAnchor::new(),
             pending_error: None,
+            owes_empty_commit: false,
             draining: false,
             drained_epoch: 0,
         };
@@ -1973,6 +2140,12 @@ mod tests {
             1,
             "the call woke the runner despite the stop finish"
         );
+        assert_eq!(
+            count_type(&ctx, "text").await,
+            0,
+            "the stop-finish tool turn continues into its call — no empty \
+             text block sits beside it (2026-08-24)"
+        );
     }
 
     /// A synthetic unterminated lifecycle — a `ToolUseStart` whose `End`
@@ -2017,12 +2190,14 @@ mod tests {
         assert!(outcome.owes_turn, "the frontier stays owed after the sweep");
     }
 
-    /// Empty final text never commits — the same rule the thinking path
-    /// applies. `MessageEnd` over a started-but-empty tail discards the tail
-    /// instead of committing an empty text block (the shape one vendor rejects
-    /// with an API error on every later turn).
+    /// The inverted discard (2026-08-24): `MessageEnd` (`EndTurn`) over a
+    /// started-but-empty tail COMMITS the empty assistant text block — the
+    /// text channel's final state, empty included. The discard this test used
+    /// to pin encoded a design error: the "vendors reject empty content"
+    /// belief was disproved against the deployed provider, and the discard
+    /// left the owing message as the frontier tail, wedging the session.
     #[tokio::test]
-    async fn empty_streamed_text_is_discarded_at_message_end() {
+    async fn empty_streamed_text_commits_an_empty_final_block_at_message_end() {
         let (ctx, _rx) = fixture().await;
         drive(
             &ctx,
@@ -2037,12 +2212,20 @@ mod tests {
         )
         .await;
 
+        assert_eq!(streaming_count(&ctx).await, 0, "the tail is replaced");
+        let blocks = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+        let text = blocks
+            .iter()
+            .find(|b| b.block_type == "text")
+            .expect("the empty turn commits a real text block");
+        assert_eq!(text.fields["content"], serde_json::json!(""));
+        assert_eq!(text.role, Some(crate::block::Role::Assistant));
         assert_eq!(
-            streaming_count(&ctx).await,
-            0,
-            "the empty tail is discarded"
+            count_type(&ctx, "text").await,
+            1,
+            "exactly one block — the tail finalize and the no-text fallback \
+             never double up"
         );
-        assert_eq!(count_type(&ctx, "text").await, 0, "no empty text committed");
     }
 
     /// A reusable reader over the fixture's context, for tests that thread
@@ -2067,6 +2250,7 @@ mod tests {
                 generation: 1,
                 anchor: TurnAnchor::new(),
                 pending_error: None,
+                owes_empty_commit: false,
                 draining: false,
                 drained_epoch: 0,
             },
@@ -2179,7 +2363,10 @@ mod tests {
 
     /// The status plane speaks EXACTLY the documented machine keys — never
     /// prose. The vocabulary is the contract on [`CoreEvent::StreamStatus`]:
-    /// `sending`, `waiting_for_response`, the empty clear, `running_tools`.
+    /// `sending`, `waiting_for_response`, the empty clear, `responding`,
+    /// `running_tools`. A real text delta is driven so `responding` actually
+    /// fires — the closed set is checked against the keys as produced, not a
+    /// list that could silently omit a real member.
     #[tokio::test]
     async fn stream_status_labels_are_exactly_the_documented_machine_keys() {
         let (ctx, mut rx) = fixture().await;
@@ -2192,6 +2379,9 @@ mod tests {
                 },
                 StreamEvent::Connected,
                 StreamEvent::TextBlockStart,
+                StreamEvent::TextDelta {
+                    text: "hello".into(),
+                },
                 StreamEvent::MessageEnd {
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
@@ -2212,10 +2402,14 @@ mod tests {
         assert_eq!(
             statuses,
             vec![
-                ("sending".to_string(), Some("provider detail".to_string())),
-                ("waiting_for_response".to_string(), None),
+                (
+                    stream_status::SENDING.to_string(),
+                    Some("provider detail".to_string())
+                ),
+                (stream_status::WAITING_FOR_RESPONSE.to_string(), None),
                 (String::new(), None),
-                ("running_tools".to_string(), None),
+                (stream_status::RESPONDING.to_string(), None),
+                (stream_status::RUNNING_TOOLS.to_string(), None),
             ],
             "exactly the documented machine keys, in stream order"
         );
@@ -2752,11 +2946,15 @@ mod tests {
         }
     }
 
-    /// The two explicit final-content paths follow the same empty rule:
-    /// an empty `TextFinal` and an empty `ContentFinal` text block each
-    /// discard the streaming tail and commit nothing.
+    /// The inverted discard on the two explicit final-content paths
+    /// (2026-08-24): an empty `TextFinal` and an empty `ContentFinal` text
+    /// block each finalize the opened tail AS the empty text block — the
+    /// atomic replace, committing the text channel's final state instead of
+    /// throwing it away. Exactly one block per turn: the `ContentFinal`
+    /// commit sets the received guard and marks the text committed, so
+    /// `message_end`'s no-text fallback stays quiet.
     #[tokio::test]
-    async fn empty_final_text_variants_discard_instead_of_committing() {
+    async fn empty_final_text_variants_commit_the_empty_block() {
         let (ctx, _rx) = fixture().await;
         drive(
             &ctx,
@@ -2769,8 +2967,8 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(streaming_count(&ctx).await, 0);
-        assert_eq!(count_type(&ctx, "text").await, 0);
+        assert_eq!(streaming_count(&ctx).await, 0, "the tail is replaced");
+        assert_eq!(count_type(&ctx, "text").await, 1, "the empty block commits");
 
         let (ctx, _rx) = fixture().await;
         drive(
@@ -2790,7 +2988,454 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(streaming_count(&ctx).await, 0);
-        assert_eq!(count_type(&ctx, "text").await, 0);
+        assert_eq!(streaming_count(&ctx).await, 0, "the tail is replaced");
+        let blocks = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+        let texts: Vec<&serde_json::Value> = blocks
+            .iter()
+            .filter(|b| b.block_type == "text")
+            .map(|b| &b.fields["content"])
+            .collect();
+        assert_eq!(
+            texts,
+            vec![&serde_json::json!("")],
+            "one empty block — never a second from the message-end fallback"
+        );
+    }
+
+    // ─── The empty completed turn (2026-08-24): a real block on the ledger,
+    //     closing the debt it used to leave open ────────────────────────────
+
+    /// The pure no-text completed turn — no text channel ever opened —
+    /// commits the empty assistant text block at the turn's boundary, with
+    /// the turn's dispatch anchor, and the block closes the frontier's owed
+    /// turn: the scheduler's next derivation owes nothing and re-dispatches
+    /// nothing. On the pre-change code the turn wrote no row at all, the
+    /// owing message stayed the tail, and the session wedged — this test is
+    /// the mutation pin for that discard.
+    #[tokio::test]
+    async fn a_completed_no_text_turn_commits_the_empty_block_and_closes_the_debt() {
+        let (ctx, _rx) = fixture().await;
+        let summoner = ctx
+            .store
+            .insert_user_blocks(
+                ctx.conversation_id,
+                vec![crate::types::InputBlock::Text {
+                    content: "anything to add?".into(),
+                }],
+            )
+            .await
+            .unwrap()[0];
+
+        let (mut reader, _latch) = bare_reader(&ctx);
+        reader.anchor.set(summoner);
+        for response in [
+            ProviderResponse::Event(StreamEvent::MessageEnd {
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+            }),
+            ProviderResponse::Done,
+        ] {
+            reader.handle_response(response).await;
+        }
+
+        let blocks = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+        let empty = blocks
+            .iter()
+            .find(|b| b.block_type == "text" && b.id != summoner)
+            .expect("the empty turn commits a real text block — not discarded");
+        assert_eq!(empty.fields["content"], serde_json::json!(""));
+        assert_eq!(empty.role, Some(crate::block::Role::Assistant));
+        assert_eq!(
+            empty.dispatch_anchor,
+            Some(summoner),
+            "the empty block carries the turn's dispatch anchor like every \
+             block a turn writes"
+        );
+
+        let outcome = crate::agency::ratchet::drive::<crate::agency::BlockKind, _>(&ctx)
+            .await
+            .unwrap();
+        assert!(
+            !outcome.owes_turn,
+            "the empty block settles the frontier — the debt closes once and \
+             the scheduler dispatches no second turn for the same message"
+        );
+        assert_eq!(
+            outcome.awaiting, None,
+            "the frontier no longer awaits the model"
+        );
+    }
+
+    /// The placeholder asymmetry, both stops: a turn that ends in tool use
+    /// leaves NO orphaned empty text block — under a `tool_use` stop AND
+    /// under the aggregator's `EndTurn`-stop shape whose lifecycles trail
+    /// the message end. The finalized call cancels the owed empty commit.
+    #[tokio::test]
+    async fn a_tool_ending_turn_leaves_no_empty_text_block() {
+        // The plain tool-use stop.
+        let (ctx, _rx) = fixture().await;
+        let responses = std::iter::once(ProviderResponse::Event(StreamEvent::MessageEnd {
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        }))
+        .chain(tool_use("plain").map(ProviderResponse::Event))
+        .chain(std::iter::once(ProviderResponse::Done))
+        .collect();
+        drive_responses(&ctx, false, responses).await;
+        assert_eq!(count_type(&ctx, "tool_call").await, 1);
+        assert_eq!(count_type(&ctx, "text").await, 0, "no orphaned empty block");
+
+        // The aggregator shape: an `EndTurn` stop whose buffered lifecycle
+        // trails the end — the turn continues into its call, so the empty
+        // commit recorded at message end is cancelled at the call's insert.
+        let (ctx, _rx) = fixture().await;
+        let responses = std::iter::once(ProviderResponse::Event(StreamEvent::MessageEnd {
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+        }))
+        .chain(tool_use("trailing").map(ProviderResponse::Event))
+        .chain(std::iter::once(ProviderResponse::Done))
+        .collect();
+        drive_responses(&ctx, false, responses).await;
+        assert_eq!(count_type(&ctx, "tool_call").await, 1);
+        assert_eq!(count_type(&ctx, "text").await, 0, "no orphaned empty block");
+    }
+
+    /// A thinking-only completed turn still commits the empty text block:
+    /// the thinking block incidentally rests the frontier already, but the
+    /// empty block is the canonical assistant move and is committed
+    /// regardless.
+    #[tokio::test]
+    async fn a_thinking_only_turn_commits_the_empty_block_as_its_move() {
+        let (ctx, _rx) = fixture().await;
+        drive_responses(
+            &ctx,
+            false,
+            vec![
+                ProviderResponse::Event(StreamEvent::ThinkingStart),
+                ProviderResponse::Event(StreamEvent::ThinkingDelta {
+                    text: "nothing to add".into(),
+                }),
+                ProviderResponse::Event(StreamEvent::ThinkingEnd { opaque: None }),
+                ProviderResponse::Event(StreamEvent::MessageEnd {
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                }),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(count_type(&ctx, "thinking").await, 1);
+        let blocks = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+        let text = blocks
+            .iter()
+            .find(|b| b.block_type == "text")
+            .expect("the empty block is the turn's canonical move");
+        assert_eq!(text.fields["content"], serde_json::json!(""));
+    }
+
+    /// An empty-input call skipped at `ToolUseEnd` records nothing — under an
+    /// `EndTurn` stop the turn then completed with no recorded move, and the
+    /// owed empty block still commits: the debt closes instead of wedging on
+    /// a call that never became a fact.
+    #[tokio::test]
+    async fn a_skipped_empty_input_call_still_commits_the_empty_turn() {
+        let (ctx, _rx) = fixture().await;
+        drive_responses(
+            &ctx,
+            false,
+            vec![
+                ProviderResponse::Event(StreamEvent::MessageEnd {
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                }),
+                ProviderResponse::Event(StreamEvent::ToolUseStart {
+                    id: "no-args".into(),
+                    name: "read_file".into(),
+                }),
+                ProviderResponse::Event(StreamEvent::ToolUseEnd),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            count_type(&ctx, "tool_call").await,
+            0,
+            "the call is skipped"
+        );
+        assert_eq!(
+            count_type(&ctx, "text").await,
+            1,
+            "the empty block still closes the turn"
+        );
+    }
+
+    /// Where the empty turn's usage attaches (AC5, 2026-08-24): in this
+    /// codebase usage attaches to no block row — every turn's request-final
+    /// usage rides [`CoreEvent::StreamDone`], emitted at `message_end`. The
+    /// empty turn's spent tokens travel that same signal, so nothing is
+    /// lost with the text: this pin names the carrier and shows the counts
+    /// arriving for a turn that said nothing.
+    #[tokio::test]
+    async fn an_empty_turn_reports_its_usage_on_stream_done() {
+        let (ctx, mut rx) = fixture().await;
+        drive_responses(
+            &ctx,
+            false,
+            vec![
+                ProviderResponse::Event(StreamEvent::MessageEnd {
+                    usage: Usage {
+                        input_tokens: 11,
+                        output_tokens: 3,
+                        reasoning_tokens: Some(150),
+                    },
+                    stop_reason: StopReason::EndTurn,
+                }),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+
+        let usage = loop {
+            match rx.try_recv() {
+                Ok(CoreEvent::StreamDone { usage, .. }) => break usage,
+                Ok(_) => {}
+                Err(e) => panic!("no StreamDone for the empty turn: {e}"),
+            }
+        }
+        .expect("the empty turn's usage is reported, not lost");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(
+            usage.reasoning_tokens,
+            Some(150),
+            "the reasoning spend that justifies the empty turn rides the same \
+             signal, not dropped"
+        );
+    }
+
+    /// The empty block replays into the model-facing projection as the
+    /// assistant's empty message — present, not omitted, not transparent.
+    /// Omitting it would recreate the hole in history the block exists to
+    /// avoid.
+    #[tokio::test]
+    async fn the_empty_block_replays_as_the_assistants_empty_message() {
+        use crate::providers::render::blocks_to_messages;
+        use crate::providers::types::{MessageContent, MessageRole};
+
+        let (ctx, _rx) = fixture().await;
+        ctx.store
+            .insert_user_blocks(
+                ctx.conversation_id,
+                vec![crate::types::InputBlock::Text {
+                    content: "anything to add?".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        drive_responses(
+            &ctx,
+            false,
+            vec![
+                ProviderResponse::Event(StreamEvent::MessageEnd {
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                }),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+
+        let blocks = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+        let messages = blocks_to_messages::<crate::agency::BlockKind>(&blocks);
+        let assistant: Vec<_> = messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .collect();
+        assert_eq!(
+            assistant.len(),
+            1,
+            "the assistant's empty message is present, not omitted"
+        );
+        assert!(
+            std::ptr::eq(assistant[0], messages.last().unwrap()),
+            "it is the conversation's last message"
+        );
+        match &assistant[0].content {
+            MessageContent::Text(text) => {
+                assert_eq!(text, "", "the empty message replays empty");
+            }
+            other @ MessageContent::Parts(_) => {
+                panic!("expected text content, got {other:?}")
+            }
+        }
+    }
+
+    /// The `responding` signal (AC7): raised at the FIRST non-empty text
+    /// delta, once per turn — and never by a text block that merely opens,
+    /// never by thinking, never by an empty delta, so a turn that says
+    /// nothing raises no compose cue.
+    #[tokio::test]
+    async fn the_responding_signal_fires_on_real_text_only() {
+        fn responding_count(rx: &mut tokio::sync::broadcast::Receiver<CoreEvent>) -> usize {
+            let mut count = 0;
+            while let Ok(event) = rx.try_recv() {
+                if let CoreEvent::StreamStatus { label, .. } = event
+                    && label == stream_status::RESPONDING
+                {
+                    count += 1;
+                }
+            }
+            count
+        }
+
+        // Real text: exactly one signal, at the first delta, not per delta.
+        let (ctx, mut rx) = fixture().await;
+        drive(
+            &ctx,
+            false,
+            vec![
+                StreamEvent::TextBlockStart,
+                StreamEvent::TextDelta { text: "he".into() },
+                StreamEvent::TextDelta { text: "llo".into() },
+            ],
+        )
+        .await;
+        assert_eq!(responding_count(&mut rx), 1, "once per turn, on real text");
+
+        // Thinking only: silent.
+        let (ctx, mut rx) = fixture().await;
+        drive(
+            &ctx,
+            false,
+            vec![
+                StreamEvent::ThinkingStart,
+                StreamEvent::ThinkingDelta { text: "hmm".into() },
+                StreamEvent::ThinkingSummaryDelta {
+                    text: "weighing".into(),
+                },
+            ],
+        )
+        .await;
+        assert_eq!(responding_count(&mut rx), 0, "thinking raises no cue");
+
+        // The empty turn: a block opens, an empty delta arrives, the turn
+        // finalizes empty — no false compose cue anywhere.
+        let (ctx, mut rx) = fixture().await;
+        drive_responses(
+            &ctx,
+            false,
+            vec![
+                ProviderResponse::Event(StreamEvent::TextBlockStart),
+                ProviderResponse::Event(StreamEvent::TextDelta {
+                    text: String::new(),
+                }),
+                ProviderResponse::Event(StreamEvent::MessageEnd {
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                }),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+        assert_eq!(
+            responding_count(&mut rx),
+            0,
+            "the empty turn raises no compose cue"
+        );
+        assert_eq!(
+            count_type(&ctx, "text").await,
+            1,
+            "and still commits its empty block"
+        );
+    }
+
+    /// The error and teardown edges commit NO empty block (AC8): the turn
+    /// latches and the message keeps owing for the retry — an empty block
+    /// committed there would bury it forever.
+    #[tokio::test]
+    async fn error_and_abnormal_edges_commit_no_empty_block() {
+        // A stream error after an opened (empty) text block: nothing commits,
+        // the frontier keeps owing the turn.
+        let (ctx, _rx) = fixture().await;
+        ctx.store
+            .insert_user_blocks(
+                ctx.conversation_id,
+                vec![crate::types::InputBlock::Text {
+                    content: "still owed".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        drive_responses(
+            &ctx,
+            false,
+            vec![
+                ProviderResponse::Event(StreamEvent::TextBlockStart),
+                ProviderResponse::Error("boom".into()),
+            ],
+        )
+        .await;
+        assert_eq!(count_type(&ctx, "text").await, 1, "only the user's block");
+        let outcome = crate::agency::ratchet::drive::<crate::agency::BlockKind, _>(&ctx)
+            .await
+            .unwrap();
+        assert!(
+            outcome.owes_turn,
+            "the errored turn keeps the message owing — nothing buried it"
+        );
+
+        // An abnormal stop (`max_tokens`) with no text: the error status is
+        // the record; no empty block rides the error edge.
+        let (ctx, _rx) = fixture().await;
+        drive_responses(
+            &ctx,
+            false,
+            vec![
+                ProviderResponse::Event(StreamEvent::MessageEnd {
+                    usage: Usage::default(),
+                    stop_reason: StopReason::MaxTokens,
+                }),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+        assert_eq!(count_type(&ctx, "status").await, 1);
+        assert_eq!(count_type(&ctx, "text").await, 0, "no empty block on error");
+    }
+
+    /// The teardown edge — the channel dying mid-turn — commits no empty
+    /// block either: the reader's own close discards the tails and the
+    /// retry semantics stand.
+    #[tokio::test]
+    async fn a_mid_turn_teardown_commits_no_empty_block() {
+        let (ctx, _rx) = fixture().await;
+        let runtime: RuntimeContext<BlockKind, CoreEvent> = RuntimeContext::new(
+            ctx.store.clone(),
+            Arc::clone(&ctx.bus),
+            Arc::new(crate::providers::ProviderRegistry::new()),
+            Arc::new(ToolRegistry::new()),
+        );
+        let (latched, _write_latched) = create_signal(false);
+        let (tx, provider_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = spawn_channel(
+            ctx.conversation_id,
+            runtime,
+            provider_rx,
+            latched,
+            1,
+            TurnAnchor::new(),
+            MESSAGE_END_DRAIN_DEADLINE,
+        );
+
+        tx.send(ProviderResponse::Event(StreamEvent::TextBlockStart))
+            .unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        assert_eq!(streaming_count(&ctx).await, 0, "the dead tail is swept");
+        assert_eq!(count_type(&ctx, "text").await, 0, "no empty block");
     }
 }

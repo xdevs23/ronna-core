@@ -6254,15 +6254,18 @@ mod tests {
         );
     }
 
-    /// A turn that writes nothing closes to REST. The close re-checks only a
-    /// signal the open turn swallowed, and it re-checks through the
-    /// scheduler's drive — so the unchanged frontier is re-asked at most
-    /// once (for the mid-turn tick the dispatch itself bought) and then the
-    /// conversation rests. A close that signalled the dispatch delivery
-    /// blindly redispatched the unchanged frontier once per close, forever:
-    /// one paid provider request per iteration with no backoff and no cap.
+    /// A turn that says nothing closes its debt with ONE dispatch
+    /// (2026-08-24, the inverted discard). The completed no-text turn
+    /// commits a real empty assistant text block; that block is the frontier
+    /// tail when the coalesced second owed-turn signal re-derives, so the
+    /// re-ask finds nothing owed and the conversation rests at exactly one
+    /// paid request. This test used to pin the discard's shape — two
+    /// dispatches for one message and an assistant that "really wrote
+    /// nothing" — which was the misimplementation: the same empty turn
+    /// dispatched once per re-derivation, and with no second signal the
+    /// owing message wedged unreachable instead.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_empty_turn_closes_to_rest_instead_of_redispatching_forever() {
+    async fn an_empty_turn_commits_its_block_and_closes_with_one_dispatch() {
         let (ctx, conv, probe) = composed_runtime(Script::EmptyTurn).await;
         ctx.bus.emit(CoreEvent::BlocksAppended {
             conversation_id: conv,
@@ -6281,8 +6284,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
-        // Settle, then hold still: under the blind close the counter climbs
-        // through this whole window.
+        // Settle, then hold still: a debt the empty block failed to close
+        // would keep the counter climbing through this whole window.
         tokio::time::sleep(Duration::from_millis(500)).await;
         let settled = probe.requests.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -6291,24 +6294,24 @@ mod tests {
             settled,
             "the conversation rests after an empty turn"
         );
-        // Exactly two, derived: the append's coalesced wakes are one owing
-        // tick plus the one extra tick the cursor confirm buys, so exactly
-        // two owed-turn signals exist — the first dispatches, the second
-        // reaches the actor either after the instant empty turn closed
-        // (dispatching directly) or during it (deferred, re-checked at the
-        // close, re-signalled once, dispatched). Nothing wakes the scheduler
-        // after that, so the re-check chain ends at two instead of looping.
+        // Exactly one: the empty block settles the frontier, so the extra
+        // owed-turn tick the cursor confirm buys re-derives against a tail
+        // that owes nothing and dispatches no second turn for the message.
         assert_eq!(
-            settled, 2,
-            "one dispatch per owed-turn signal, the confirm-bought re-ask included, then rest"
+            settled, 1,
+            "the empty block closes the debt once — no re-dispatch for the same message"
         );
         let blocks = ctx.store.list_blocks(conv).await.unwrap();
-        assert!(
-            blocks
-                .iter()
-                .all(|b| b.role != Some(crate::block::Role::Assistant)),
-            "the empty turn really wrote nothing"
+        let empty = blocks
+            .iter()
+            .find(|b| b.role == Some(crate::block::Role::Assistant) && b.block_type == "text")
+            .expect("the empty turn commits a real assistant text block");
+        assert_eq!(
+            empty.fields["content"],
+            json!(""),
+            "the block records the empty answer faithfully"
         );
+        assert_anchors(&blocks, user_block(&blocks).id);
     }
 
     /// A turn that emits TWO tool calls: while the first sibling's result is
