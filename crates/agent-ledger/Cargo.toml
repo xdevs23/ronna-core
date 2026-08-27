@@ -54,6 +54,12 @@ base64 = { version = "0.23.1", default-features = false, features = [
     "std",
 ], optional = true }
 chrono = "0.4"
+# The IANA zone name a date marker records. Promoted from transitive to direct
+# rather than added: chrono already resolves this exact version for its own
+# local-time support, so the dependency tree is unchanged and only the name is
+# newly spoken here. chrono itself answers no zone name — its `%Z` prints the
+# numeric offset.
+iana-time-zone = "0.1.65"
 # The wire an event stream arrives on. Only a vendor module reads one, so it
 # rides in with the first vendor a consumer enables.
 eventsource-stream = { version = "0.2", optional = true }

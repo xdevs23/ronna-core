@@ -24,6 +24,10 @@ use super::{DomainGate, StoreError};
 /// 2026-08-22, in lockstep with the pinned literal: the header select gained
 /// `dispatch_anchor` — a header column, not a content join, so every kind's
 /// load carries it for free.
+///
+/// 2026-08-27, in the same lockstep: the date marker's join gained the three
+/// nullable zone-and-minute columns. A column written and never selected here
+/// is a column the projection can never speak.
 pub(super) const BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
@@ -38,7 +42,7 @@ pub(super) const BLOCKS_QUERY: &str = "SELECT
             bs.status AS bs_status, bs.subtitle AS bs_subtitle,
             bar.for_block_id AS bar_for_block_id,
             bad.for_block_id AS bad_for_block_id, bad.decision AS bad_decision, bad.system_reason AS bad_system_reason, bad.user_reason AS bad_user_reason,
-            bdm.date AS bdm_date
+            bdm.date AS bdm_date, bdm.tz_abbrev AS bdm_tz_abbrev, bdm.tz_name AS bdm_tz_name, bdm.written_at AS bdm_written_at
      FROM blocks b
      LEFT JOIN block_text bt ON bt.block_id = b.id AND b.block_type IN ('text', 'streaming', 'system_prompt')
      LEFT JOIN block_quote bq ON bq.block_id = b.id AND b.block_type = 'quote'
@@ -380,6 +384,19 @@ fn structural_payload(
                 "date".into(),
                 Value::String(required_str(row, "bdm_date", block_id, block_type)?),
             );
+            // The zone and the writing minute are each independently
+            // nullable: a marker written before the columns existed carries
+            // none of them, and a source that answered nothing wrote NULL.
+            // Null travels as Null so the kind's projection can drop the
+            // clause rather than print an empty one.
+            for (field, column) in [
+                ("tz_abbrev", "bdm_tz_abbrev"),
+                ("tz_name", "bdm_tz_name"),
+                ("written_at", "bdm_written_at"),
+            ] {
+                let value: Option<String> = col_opt(row, column)?;
+                fields.insert(field.into(), value.map_or(Value::Null, Value::String));
+            }
         }
         // The approval blocks are the human's — role user by nature, not by
         // column. Mechanically load-bearing: the fork's group walk reads this

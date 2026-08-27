@@ -746,23 +746,28 @@ impl Store {
         conversation_id: i64,
         blocks: Vec<InputBlock>,
     ) -> Result<Vec<i64>, StoreError> {
-        self.insert_user_blocks_dated(conversation_id, blocks, super::date_markers::today_local())
-            .await
+        self.insert_user_blocks_dated(
+            conversation_id,
+            blocks,
+            super::date_markers::DateStamp::now_local(),
+        )
+        .await
     }
 
     /// The injectable-date seam behind [`insert_user_blocks`]: one atomic
     /// transaction that runs the date marker's change detection BEFORE the user
     /// blocks land. Production always routes through [`insert_user_blocks`]
-    /// with today's local date; tests drive midnight crossings deterministically.
+    /// with the stamp built from now; tests drive midnight crossings and zone
+    /// changes deterministically.
     pub(crate) async fn insert_user_blocks_dated(
         &self,
         conversation_id: i64,
         blocks: Vec<InputBlock>,
-        today: String,
+        stamp: super::date_markers::DateStamp,
     ) -> Result<Vec<i64>, StoreError> {
         self.run(move |conn| {
             let tx = conn.transaction()?;
-            super::date_markers::ensure_date_marker(&tx, conversation_id, &today)?;
+            super::date_markers::ensure_date_marker(&tx, conversation_id, &stamp)?;
             let mut ids = Vec::with_capacity(blocks.len());
             for block in &blocks {
                 ids.push(super::conversations::insert_input_block(

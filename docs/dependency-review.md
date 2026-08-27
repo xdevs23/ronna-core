@@ -133,3 +133,31 @@ the composing seam a single public surface.
 **The one transitive dependency named.** `unicode-ident` 1.0.24 (current latest, no
 advisories) is the parser's identifier classifier — recorded because it is the one crate these
 three pull in that is not already reviewed above.
+
+## 2026-08-27 — the date marker's timezone
+
+One promotion rather than an addition: `iana-time-zone` was already in both lockfiles as
+`chrono`'s own dependency, and the date marker now names it directly to record the IANA zone
+name beside the date. The dependency tree is unchanged by this — the same version was already
+compiled — and only the manifest is. Same two questions, same sources: current version from the
+registry API, advisories from the OSV aggregate.
+
+| Crate | Resolved | Latest at check | Advisories | Why it is here |
+|---|---|---|---|---|
+| iana-time-zone | 0.1.65 | 0.1.65 | none | The IANA zone name a date marker records; `chrono` answers no zone name |
+
+The resolved version is the current latest, published 2026-01-28. The crate's history carries
+one advisory ever — RUSTSEC-2022-0049, a use-after-free in the macOS implementation, introduced
+in 0.1.43 and fixed in 0.1.45 — and three yanked versions (0.1.43, 0.1.44, 0.1.59), none of
+them a malicious release. Nothing affects 0.1.65.
+
+**Why not `chrono` alone.** `chrono`'s `%Z` prints the numeric offset (`+02:00`) rather than an
+abbreviation, and its `Local` offset type carries no name at all: the zone name has to come from
+somewhere else, and this is the crate `chrono` itself uses for it.
+
+**What is still missing, and why no dependency was added for it.** The zone ABBREVIATION
+(`CEST`) lives in `localtime_r`'s `tm_zone`, which is an unsafe FFI call; this workspace forbids
+unsafe code, and no crate in the tree wraps that call safely. Adding a timezone database to
+recompute an abbreviation the C library already holds would be a heavyweight dependency bought
+for one string, so the marker writes that column NULL and the projected line drops the clause —
+see `store::date_markers::local_tz_abbrev`.

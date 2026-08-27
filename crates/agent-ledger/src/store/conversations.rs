@@ -419,7 +419,7 @@ impl Store {
                     super::date_markers::ensure_date_marker(
                         &tx,
                         new_id,
-                        &super::date_markers::today_local(),
+                        &super::date_markers::DateStamp::now_local(),
                     )?;
                     for block in blocks {
                         insert_input_block(&tx, new_id, block)?;
@@ -443,7 +443,7 @@ impl Store {
                     super::date_markers::ensure_date_marker(
                         &tx,
                         new_id,
-                        &super::date_markers::today_local(),
+                        &super::date_markers::DateStamp::now_local(),
                     )?;
                     deep_copy_group_into(&tx, descriptors, source_id, new_id, &group)?;
                     new_id

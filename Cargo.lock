@@ -12,6 +12,7 @@ dependencies = [
  "chrono",
  "eventsource-stream",
  "futures",
+ "iana-time-zone",
  "reqwest",
  "rusqlite",
  "serde",
