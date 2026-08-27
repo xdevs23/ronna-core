@@ -334,6 +334,19 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE blocks ADD COLUMN dispatch_anchor INTEGER REFERENCES blocks(id);
     ALTER TABLE metadata ADD COLUMN dispatch_anchor INTEGER REFERENCES metadata(id);
     ",
+    // v3 (2026-08-27): what the date marker records beside the date — the
+    // platform's zone abbreviation, the IANA zone name, and the wall-clock
+    // minute the marker was written. Three nullable columns, each written by
+    // its own source and each NULL when that source answers nothing; every
+    // marker that predates them reads back all-NULL and projects exactly the
+    // line it always did. A step, not an edit to v1's CREATE TABLE: editing
+    // the shipped statement would pass every fresh-database test and strand
+    // every store that already exists.
+    "
+    ALTER TABLE block_date_marker ADD COLUMN tz_abbrev  TEXT;
+    ALTER TABLE block_date_marker ADD COLUMN tz_name    TEXT;
+    ALTER TABLE block_date_marker ADD COLUMN written_at TEXT;
+    ",
 ];
 
 /// Apply every unapplied step, advancing `user_version` as each lands.
@@ -490,8 +503,8 @@ mod tests {
         );
     }
 
-    /// A populated v1 database — the shipped shape — upgrades in place: only
-    /// step two runs, the existing rows survive, and every pre-column row
+    /// A populated v1 database — the shipped shape — upgrades in place: every
+    /// later step runs, the existing rows survive, and every pre-column row
     /// reads back a NULL anchor. The library's first real upgrade, so the
     /// version gate is exercised against data, not just a fresh file.
     #[test]
@@ -533,14 +546,68 @@ mod tests {
         assert_eq!(anchor, None);
     }
 
-    /// The date marker's content table.
+    /// The date marker's content table, with the zone and minute columns v3
+    /// added beside the date.
     #[test]
     fn the_date_marker_table_is_present() {
         let conn = migrated();
         assert_eq!(
             table_columns(&conn, "block_date_marker"),
-            vec!["block_id", "date"]
+            vec!["block_id", "date", "tz_abbrev", "tz_name", "written_at"]
         );
+    }
+
+    /// A populated store carrying date markers from before v3 gains the three
+    /// columns in place: the marker rows survive, and every one of them reads
+    /// back all-NULL — the shape whose projected line is unchanged. Same
+    /// precedent as the v1-to-v2 upgrade above, against the data the step
+    /// actually widens.
+    #[test]
+    fn a_populated_store_with_markers_gains_the_zone_columns_in_place() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for sql in &MIGRATIONS[..2] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch(
+            "INSERT INTO blocks (block_type) VALUES ('date_marker');
+             INSERT INTO block_date_marker (block_id, date) VALUES (1, '2026-08-26');",
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+        assert_eq!(version(&conn), u32::try_from(MIGRATIONS.len()).unwrap());
+
+        let row: (String, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT date, tz_abbrev, tz_name, written_at FROM block_date_marker
+                 WHERE block_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("2026-08-26".to_owned(), None, None, None),
+            "the existing marker survives, knowing nothing it was never told"
+        );
+
+        // And the widened row writes through the same table afterwards.
+        conn.execute_batch(
+            "INSERT INTO blocks (block_type) VALUES ('date_marker');
+             INSERT INTO block_date_marker (block_id, date, tz_abbrev, tz_name, written_at)
+                 VALUES (2, '2026-08-27', 'CEST', 'Europe/Berlin', '22:41');",
+        )
+        .unwrap();
+        let name: Option<String> = conn
+            .query_row(
+                "SELECT tz_name FROM block_date_marker WHERE block_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("Europe/Berlin"));
     }
 
     /// The display-only summary channel sits beside content and the opaque

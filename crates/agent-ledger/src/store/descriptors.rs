@@ -1036,11 +1036,33 @@ impl Store {
     /// for that domain answers it with [`StoreError::MigrationFailed`] exactly
     /// as [`domain_run`](super::domain_run) is answered.
     ///
-    /// The composer's date-marker discipline deliberately does NOT run here:
-    /// it belongs to the group-append seam ([`Store::insert_user_blocks`]),
-    /// which detects the day change once per submitted group. The library's
-    /// own per-block writes of user-voiced blocks — the approval chain — skip
-    /// it for the same reason.
+    /// The date-marker discipline runs here for a USER-VOICED append, and only
+    /// for one: an append whose role is [`Role::User`] carries the marker's
+    /// change detection in its own transaction, ordered before the block, so
+    /// the day a member speaks on is on the wire exactly as the library's own
+    /// group appends put it there.
+    ///
+    /// Amended 2026-08-27. The recorded reasoning this replaces — that the
+    /// discipline "deliberately does NOT run here" — was written about the
+    /// composer's finalizing inserts and the approval chain, which detect the
+    /// day change once per submitted group and keep their skip. It silently
+    /// decided for every consumer as well, and a consumer landing chat
+    /// messages through this path is the group-append seam, whatever the
+    /// argument list looks like. Non-user appends — context notes, reports,
+    /// anything role-less or assistant-voiced — still never trip it.
+    ///
+    /// One consequence of that amendment, recorded here at the seam that
+    /// causes it rather than left to be re-discovered: a marker carries NO
+    /// role, so it BREAKS a role-contiguous run. The fork's group walk
+    /// (`conversations::find_group_bounds`) therefore stops at it — a fork
+    /// anchored on the day's first user-voiced consumer append copies that
+    /// append without the user blocks that came before the marker, where
+    /// before this amendment it copied them too. Every such split is a day
+    /// boundary, since that is the only thing that trips a marker; the blocks
+    /// on the far side belong to a different day's turn. The slice that made
+    /// this change does not name the split among its residuals — it is stated
+    /// here, and pinned by
+    /// `a_marker_splits_a_user_run_at_the_days_first_append`.
     ///
     /// # Errors
     ///
@@ -1049,8 +1071,8 @@ impl Store {
     /// failed-migration state; an error if a field names an undeclared column
     /// or does not fit its declared type, if a role is given without a
     /// declared `role` column, if the transaction fails — a refused junction
-    /// insert rolls back the header with it — or if the store's actor has
-    /// stopped.
+    /// insert, or a refused marker, rolls back the header with it — or if the
+    /// store's actor has stopped.
     pub async fn append_consumer_block(
         &self,
         conversation_id: i64,
@@ -1058,6 +1080,30 @@ impl Store {
         kind: &'static str,
         fields: serde_json::Map<String, Value>,
         replaces_streaming: Option<i64>,
+    ) -> Result<i64, StoreError> {
+        self.append_consumer_block_stamped(
+            conversation_id,
+            role,
+            kind,
+            fields,
+            replaces_streaming,
+            super::date_markers::DateStamp::now_local(),
+        )
+        .await
+    }
+
+    /// The injectable-stamp seam behind [`Store::append_consumer_block`],
+    /// mirroring [`Store::insert_user_blocks_dated`] behind its own public
+    /// method: production passes the stamp built from now, tests drive
+    /// midnight, zone changes and the NULL cases deterministically.
+    pub(crate) async fn append_consumer_block_stamped(
+        &self,
+        conversation_id: i64,
+        role: Option<Role>,
+        kind: &'static str,
+        fields: serde_json::Map<String, Value>,
+        replaces_streaming: Option<i64>,
+        stamp: super::date_markers::DateStamp,
     ) -> Result<i64, StoreError> {
         let descriptors = self.descriptors;
         let Some(descriptor) = descriptor_for_kind(descriptors, kind) else {
@@ -1089,6 +1135,13 @@ impl Store {
             }
 
             transact(conn, |tx| {
+                // A user-voiced append is the day's first word as much as a
+                // composed group is, so it runs the same change detection —
+                // inside this transaction and BEFORE the block, which is what
+                // puts the marker ahead of the message in junction order.
+                if role == Some(Role::User) {
+                    super::date_markers::ensure_date_marker(tx, conversation_id, &stamp)?;
+                }
                 // The public consumer write path never sets a dispatch
                 // anchor: the anchor is written by the framework's own paths
                 // only, so a consumer block is never a turn's product by its
@@ -1226,6 +1279,7 @@ mod tests {
 
     use serde_json::{Map, json};
 
+    use super::super::date_markers::DateStamp;
     use super::super::{Continuation, ModelOverride, StoreConfig, domain_migrate, domain_run};
     use super::*;
     use crate::block::Role;
@@ -1241,6 +1295,10 @@ mod tests {
     /// `dispatch_anchor` — a header column on `blocks`, not a content join,
     /// so the join list is untouched and every kind carries the anchor for
     /// free.
+    ///
+    /// Updated 2026-08-27 with the statement: the date marker's existing join
+    /// gained three selected columns — the zone abbreviation, the IANA name
+    /// and the writing minute — with the join list itself untouched.
     const PINNED_BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
@@ -1255,7 +1313,7 @@ mod tests {
             bs.status AS bs_status, bs.subtitle AS bs_subtitle,
             bar.for_block_id AS bar_for_block_id,
             bad.for_block_id AS bad_for_block_id, bad.decision AS bad_decision, bad.system_reason AS bad_system_reason, bad.user_reason AS bad_user_reason,
-            bdm.date AS bdm_date
+            bdm.date AS bdm_date, bdm.tz_abbrev AS bdm_tz_abbrev, bdm.tz_name AS bdm_tz_name, bdm.written_at AS bdm_written_at
      FROM blocks b
      LEFT JOIN block_text bt ON bt.block_id = b.id AND b.block_type IN ('text', 'streaming', 'system_prompt')
      LEFT JOIN block_quote bq ON bq.block_id = b.id AND b.block_type = 'quote'
@@ -2000,8 +2058,7 @@ mod tests {
             .insert_text_block(conv, Role::Assistant, "quoted target".into())
             .await
             .unwrap();
-        let context = s
-            .insert_text_block(conv, Role::User, "context".into())
+        s.insert_text_block(conv, Role::User, "context".into())
             .await
             .unwrap();
         let note = s
@@ -2039,11 +2096,19 @@ mod tests {
             copied.fields["about_block_id"], target,
             "an uncloned target is kept by reference, the detached-target semantics"
         );
+        // The user-voiced append tripped a marker between the earlier user
+        // text and the note, and a marker carries no role — so the note's
+        // group starts AT the note, and the text before it belongs to the
+        // turn on the marker's far side. The neighbouring remap test covers a
+        // group with more than one block in it.
         assert!(
-            blocks
-                .iter()
-                .any(|b| b.role == Some(Role::User) && b.block_type == "text" && b.id != context),
-            "the surrounding user group came along, freshly cloned"
+            !blocks.iter().any(|b| b.block_type == "text"),
+            "nothing from before the marker was in the group"
+        );
+        assert_eq!(
+            blocks.iter().filter(|b| b.block_type == "note").count(),
+            1,
+            "the group is the note alone"
         );
     }
 
@@ -2141,8 +2206,9 @@ mod tests {
         s.delete_conversation(kept).await.unwrap();
         assert_eq!(
             s.gc_orphan_blocks().await.unwrap(),
-            2,
-            "the note, then the target its cascade released"
+            3,
+            "the note and the marker its user voice tripped, then the target \
+             the note's cascade released"
         );
         assert!(s.find_block(target).await.unwrap().is_none());
     }
@@ -2304,9 +2370,9 @@ mod tests {
         );
         assert!(s.find_block(note).await.unwrap().is_some());
         assert_eq!(
-            s.list_blocks(conv).await.unwrap().len(),
-            1,
-            "one committed block remains"
+            kinds_of(&s, conv).await,
+            vec!["date_marker", "note"],
+            "one committed block remains, behind the marker its user voice tripped"
         );
     }
 
@@ -2350,8 +2416,12 @@ mod tests {
 
         let s = Store::open_with(&db, note_config()).unwrap();
         let blocks = s.list_blocks(conv).await.unwrap();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].fields["body"], "durable fact");
+        assert_eq!(
+            blocks.len(),
+            2,
+            "the marker the append tripped, then the note"
+        );
+        assert_eq!(blocks[1].fields["body"], "durable fact");
         drop(s);
 
         let core_only = dir.join("core.sqlite3");
@@ -2470,7 +2540,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(s.list_blocks(conv).await.unwrap().len(), 1);
+        assert_eq!(
+            s.list_blocks(conv).await.unwrap().len(),
+            2,
+            "the marker and the note the first append wrote together"
+        );
         s.append_consumer_block(
             conv,
             Some(Role::User),
@@ -2959,6 +3033,350 @@ mod tests {
             .await
             .is_err(),
             "a role without a declared role column is refused"
+        );
+    }
+
+    // ─── The date-marker discipline on the consumer write path ───────────
+
+    /// The blocks of a conversation as stored type strings, in junction order.
+    async fn kinds_of(s: &Store, conv: i64) -> Vec<String> {
+        s.list_blocks(conv)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.block_type)
+            .collect()
+    }
+
+    /// A user-voiced consumer append trips the marker, and the marker lands
+    /// BEFORE the block it rides with — the ordering promise, which is only
+    /// keepable from inside the append's own transaction. A second append on
+    /// the same day adds nothing.
+    #[tokio::test]
+    async fn a_user_voiced_consumer_append_trips_the_marker_before_its_block() {
+        let s = configured_store();
+        let conv = make_conv(&s).await;
+
+        s.append_consumer_block_stamped(
+            conv,
+            Some(Role::User),
+            "note",
+            note_fields("a member speaks", None),
+            None,
+            DateStamp::date_only("2026-08-27"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(kinds_of(&s, conv).await, vec!["date_marker", "note"]);
+
+        s.append_consumer_block_stamped(
+            conv,
+            Some(Role::User),
+            "note",
+            note_fields("again, same day", None),
+            None,
+            DateStamp::date_only("2026-08-27"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            kinds_of(&s, conv).await,
+            vec!["date_marker", "note", "note"],
+            "same day, no second marker"
+        );
+
+        s.append_consumer_block_stamped(
+            conv,
+            Some(Role::User),
+            "note",
+            note_fields("next day", None),
+            None,
+            DateStamp::date_only("2026-08-28"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            kinds_of(&s, conv).await,
+            vec!["date_marker", "note", "note", "date_marker", "note"],
+            "midnight crossed — the fresh marker precedes the new block"
+        );
+
+        let dates: Vec<String> = s
+            .list_blocks(conv)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|b| b.block_type == "date_marker")
+            .map(|b| b.fields["date"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(dates, vec!["2026-08-27", "2026-08-28"]);
+    }
+
+    /// Everything that is not user-voiced still skips it: an assistant-voiced
+    /// append and a role-less one — context notes, palette rows, reports —
+    /// write no marker, on a fresh conversation where one would otherwise be
+    /// free.
+    #[tokio::test]
+    async fn a_non_user_consumer_append_never_trips_the_marker() {
+        let s = configured_store();
+
+        let conv = make_conv(&s).await;
+        s.append_consumer_block_stamped(
+            conv,
+            Some(Role::Assistant),
+            "note",
+            note_fields("the assistant's own record", None),
+            None,
+            DateStamp::date_only("2026-08-27"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(kinds_of(&s, conv).await, vec!["note"]);
+
+        let roleless = make_conv(&s).await;
+        s.append_consumer_block_stamped(
+            roleless,
+            None,
+            "note",
+            note_fields("a context note", None),
+            None,
+            DateStamp::date_only("2026-08-27"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(kinds_of(&s, roleless).await, vec!["note"]);
+    }
+
+    /// The marker the consumer path writes carries the whole stamp, and it is
+    /// the same change detection the library's own seams run — a stamped
+    /// consumer append after a library group append on the same day adds
+    /// nothing, and the zone rule holds across the two paths.
+    #[tokio::test]
+    async fn the_consumer_path_shares_the_one_change_detection() {
+        let s = configured_store();
+        let conv = make_conv(&s).await;
+
+        s.insert_user_blocks_dated(
+            conv,
+            vec![crate::types::InputBlock::Text {
+                content: "composed".into(),
+            }],
+            DateStamp::zoned("2026-08-27", Some("Europe/Berlin")),
+        )
+        .await
+        .unwrap();
+        s.append_consumer_block_stamped(
+            conv,
+            Some(Role::User),
+            "note",
+            note_fields("landed", None),
+            None,
+            DateStamp::zoned("2026-08-27", Some("Europe/Berlin")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            kinds_of(&s, conv).await,
+            vec!["date_marker", "text", "note"],
+            "one day, one marker, whichever path wrote it"
+        );
+
+        s.append_consumer_block_stamped(
+            conv,
+            Some(Role::User),
+            "note",
+            note_fields("moved", None),
+            None,
+            DateStamp::zoned("2026-08-27", Some("Europe/Lisbon")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            kinds_of(&s, conv).await,
+            vec!["date_marker", "text", "note", "date_marker", "note"],
+            "the zone changed knowably — the consumer path detects it too"
+        );
+    }
+
+    /// What the consumer path stores is what the read path serves: the full
+    /// stamp round-trips through the block query onto the marker's fields.
+    #[tokio::test]
+    async fn the_consumer_path_writes_the_whole_stamp() {
+        let s = configured_store();
+        let conv = make_conv(&s).await;
+
+        s.append_consumer_block_stamped(
+            conv,
+            Some(Role::User),
+            "note",
+            note_fields("a member speaks", None),
+            None,
+            DateStamp {
+                date: "2026-08-27".into(),
+                tz_abbrev: Some("CEST".into()),
+                tz_name: Some("Europe/Berlin".into()),
+                written_at: Some("22:41".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let blocks = s.list_blocks(conv).await.unwrap();
+        let marker = &blocks[0];
+        assert_eq!(marker.block_type, "date_marker");
+        assert_eq!(marker.fields["date"], "2026-08-27");
+        assert_eq!(marker.fields["tz_abbrev"], "CEST");
+        assert_eq!(marker.fields["tz_name"], "Europe/Berlin");
+        assert_eq!(marker.fields["written_at"], "22:41");
+    }
+
+    /// The grouping consequence of running the discipline here, pinned as its
+    /// own statement instead of as a side effect of another test's
+    /// assertions. A marker is role-less, so it BREAKS a role-contiguous run:
+    /// a fork anchored on the day's FIRST user-voiced consumer append leaves
+    /// the user blocks before the marker behind, where before this change it
+    /// carried them. Later the same day no marker stands between them and the
+    /// run is whole again — so every split is a day boundary. The slice does
+    /// not name this among its residuals; the disagreement is recorded on
+    /// `append_consumer_block` and pinned here.
+    #[tokio::test]
+    async fn a_marker_splits_a_user_run_at_the_days_first_append() {
+        let s = configured_store();
+        let conv = make_conv(&s).await;
+
+        s.insert_user_blocks_dated(
+            conv,
+            vec![crate::types::InputBlock::Text {
+                content: "yesterday's words".into(),
+            }],
+            DateStamp::date_only("2026-08-26"),
+        )
+        .await
+        .unwrap();
+        let first_of_the_day = s
+            .append_consumer_block_stamped(
+                conv,
+                Some(Role::User),
+                "note",
+                note_fields("the new day's first word", None),
+                None,
+                DateStamp::date_only("2026-08-27"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            kinds_of(&s, conv).await,
+            vec!["date_marker", "text", "date_marker", "note"],
+            "the fresh marker sits between yesterday's user text and today's append"
+        );
+
+        let split = s
+            .fork_continuation(
+                conv,
+                first_of_the_day,
+                Continuation::NewThread {
+                    system_prompt: None,
+                },
+                ModelOverride::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            kinds_of(&s, split).await,
+            vec!["date_marker", "note"],
+            "the group walk stopped at the marker: yesterday's user text stayed behind"
+        );
+
+        let later_that_day = s
+            .append_consumer_block_stamped(
+                conv,
+                Some(Role::User),
+                "note",
+                note_fields("later the same day", None),
+                None,
+                DateStamp::date_only("2026-08-27"),
+            )
+            .await
+            .unwrap();
+        let whole = s
+            .fork_continuation(
+                conv,
+                later_that_day,
+                Continuation::NewThread {
+                    system_prompt: None,
+                },
+                ModelOverride::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            kinds_of(&s, whole).await,
+            vec!["date_marker", "note", "note"],
+            "no marker between them — the user run is unbroken and both came across"
+        );
+    }
+
+    /// A marker inside a forked group is COPIED, not refused. The fork walks
+    /// role-contiguous groups, and a marker is role-less, so any role-less
+    /// block beside one shares its group — a shape this path has always been
+    /// able to produce and now produces routinely. Before the marker's own
+    /// clone arm existed this fork failed with
+    /// `UnsupportedBlockKind{block_type:"date_marker"}`, an error on ordinary
+    /// data.
+    #[tokio::test]
+    async fn a_fork_whose_group_holds_a_marker_copies_the_marker() {
+        let s = configured_store();
+        let conv = make_conv(&s).await;
+
+        let note = s
+            .append_consumer_block_stamped(
+                conv,
+                None,
+                "note",
+                note_fields("a role-less context note", None),
+                None,
+                DateStamp::date_only("2026-08-27"),
+            )
+            .await
+            .unwrap();
+        s.append_consumer_block_stamped(
+            conv,
+            Some(Role::User),
+            "note",
+            note_fields("a member speaks", None),
+            None,
+            DateStamp::date_only("2026-08-27"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            kinds_of(&s, conv).await,
+            vec!["note", "date_marker", "note"],
+            "the marker landed role-less, directly after the role-less note"
+        );
+
+        let thread = s
+            .fork_continuation(
+                conv,
+                note,
+                Continuation::NewThread {
+                    system_prompt: None,
+                },
+                ModelOverride::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            kinds_of(&s, thread).await,
+            vec!["date_marker", "note", "date_marker"],
+            "the fresh thread's own marker, then the role-less group whole — \
+             the marker inside it copied with the rest, not refused"
+        );
+        let blocks = s.list_blocks(thread).await.unwrap();
+        assert_eq!(
+            blocks[2].fields["date"], "2026-08-27",
+            "the copied marker carries the date it recorded, not today's"
         );
     }
 }

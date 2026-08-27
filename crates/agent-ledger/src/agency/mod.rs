@@ -716,6 +716,20 @@ fn string_field(block: &Block, key: &str) -> String {
         .to_string()
 }
 
+/// A string payload field that is genuinely absent when it is absent.
+///
+/// The counterpart to [`string_field`] for a field a row may legitimately not
+/// carry: a nullable column, or a column written before it existed. Its
+/// empty-string sentinel would turn "nothing was recorded" into a value that
+/// renders as nothing, which is a different claim.
+fn optional_string_field(block: &Block, key: &str) -> Option<String> {
+    block
+        .fields
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 /// An integer payload field, or 0 when the payload does not carry it.
 ///
 /// 0 is the same kind of sentinel [`string_field`]'s empty string is: no row

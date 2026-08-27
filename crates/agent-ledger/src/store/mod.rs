@@ -1283,7 +1283,11 @@ mod tests {
         let c1 = make_conv(&s, "p1", "model").await;
 
         let seeded = s
-            .insert_user_blocks_dated(c1, vec![text("original")], "2020-01-01".into())
+            .insert_user_blocks_dated(
+                c1,
+                vec![text("original")],
+                super::date_markers::DateStamp::date_only("2020-01-01"),
+            )
             .await
             .unwrap();
 
@@ -1316,7 +1320,7 @@ mod tests {
         );
         assert_eq!(
             markers[1],
-            super::date_markers::today_local(),
+            super::date_markers::DateStamp::now_local().date,
             "the edit's own day is recorded"
         );
     }
@@ -1848,26 +1852,26 @@ mod tests {
     /// A kind the cloner has no content mapping for says so, naming the kind.
     /// It used to report `InvalidQuery`, which describes broken SQL and sends
     /// the reader hunting through statements that are fine.
+    ///
+    /// The exemplar is a status block. It was the date marker until
+    /// 2026-08-27, when the marker gained a clone mapping of its own —
+    /// role-less as it is, a group walk reaches one on ordinary data, and an
+    /// error there refused a fork nobody had done anything wrong in. A status
+    /// block is role-less too but is a display record no fork has ever asked
+    /// to carry, so the error shape keeps a witness.
     #[tokio::test]
     async fn an_unclonable_kind_is_named_in_the_error() {
         let s = store();
         let source = make_conv(&s, "p1", "model").await;
-        s.insert_user_blocks(source, vec![text("hello")])
+        let status = s
+            .insert_status_block(source, "stopped".into(), None)
             .await
             .unwrap();
-        let marker = s
-            .list_blocks(source)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|b| b.block_type == "date_marker")
-            .unwrap()
-            .id;
 
         let failed = s
             .fork_continuation(
                 source,
-                marker,
+                status,
                 Continuation::NewThread {
                     system_prompt: None,
                 },
@@ -1880,7 +1884,7 @@ mod tests {
                 block_type,
                 operation,
             }) => {
-                assert_eq!(block_type, "date_marker");
+                assert_eq!(block_type, "status");
                 assert_eq!(operation, "BlockContent::read");
             }
             other => panic!("expected an honest unsupported-kind error, got {other:?}"),

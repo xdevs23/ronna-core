@@ -225,7 +225,7 @@ impl Store {
             super::date_markers::ensure_date_marker(
                 &tx,
                 conversation_id,
-                &super::date_markers::today_local(),
+                &super::date_markers::DateStamp::now_local(),
             )?;
 
             let mut block_ids = Vec::with_capacity(draft_blocks.len());

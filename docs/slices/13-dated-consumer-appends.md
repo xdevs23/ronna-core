@@ -98,16 +98,21 @@ honest about which shape it was checked on.
   constructor beside `today_local()`. The four existing trip sites and the new consumer
   site all take it, so "what a marker records" is decided once. *Rejected:* widening each
   call site's inline argument list (five copies of the same decision).
-- **The timezone sources are the proven ones, each with its own NULL rule, 2026-08-27.**
-  The abbreviation comes from `localtime_r`'s `tm_zone` through the `libc` dependency the
-  tree already carries, NULL when the platform answers nothing usable. The IANA name comes
-  from `iana-time-zone` (already vendored; promote to a direct dependency, and check the
-  promoted version on the web and its registry history for a compromised release before
-  writing it into `Cargo.toml`), NULL when it errors. The two are independent: either may
-  be NULL without the other. A NULL is honest; a guessed value is not. *Rejected:* chrono
-  `%Z` (proven to print the offset); *rejected:* deriving the abbreviation from the name
-  via a tz database crate (a new heavyweight dependency to compute what `tm_zone` already
-  answers).
+- **The timezone sources, amended 2026-08-28 after the build:** the IANA name comes from
+  `iana-time-zone` (promoted to a direct dependency at 0.1.65 after the web and registry
+  check recorded in `docs/dependency-review.md`), NULL when it errors. The abbreviation
+  clause of 2026-08-27 named `localtime_r`'s `tm_zone` via libc — **unbuildable on this
+  tree**, found by the implementer: the workspace forbids unsafe code
+  (`[workspace.lints.rust] unsafe_code = "forbid"`, not liftable by a local allow) and
+  `libc` was transitive, not direct. Production therefore writes `tz_abbrev` NULL and the
+  line renders the spec's own abbrev-NULL degrade form, which carries the zone identity in
+  full (`timezone Europe/Berlin; marker written at HH:MM`). The recorded path to a real
+  abbreviation is `chrono-tz` (derive the abbreviation from the stored IANA name at the
+  stamp's moment), taken in a later slice only after its own registry check — the earlier
+  rejection called it heavyweight against `tm_zone`, and with `tm_zone` off the table that
+  comparison is void. A NULL is honest; a guessed value is not. *Rejected:* chrono `%Z`
+  (proven to print the offset); *rejected:* lifting the unsafe forbid for one FFI call (a
+  workspace-wide guarantee traded for a nicety).
 - **Change detection: dates differ, or the zone knowably changed, 2026-08-27.** A fresh
   marker is inserted when the stored date differs from the stamp's, OR when the stored and
   current `tz_name` are BOTH non-NULL and differ. A NULL on either side of the zone
@@ -218,6 +223,16 @@ deliberately and byte-exactly with the schema.
 - **AC9** The existing seams still work: group-append, draft and both fork sites pass
   their existing pins, now through the stamp — and the two schema pins are updated
   byte-exactly rather than loosened.
+
+## Build outcome notes (2026-08-28)
+
+- Verifier: PASS on AC1-AC9, full gate green including no-default-features.
+- A role-less marker begins its own group boundary, so a fork's deep copy groups
+  [marker][user text …] rather than splitting a user group — reproduced, fixed, and the
+  boundary shift is recorded in `append_consumer_block`'s documentation, not only in a
+  test. The deep-copy multi-block coverage lives in the neighbouring remap test.
+- `tz_abbrev` ships as an always-NULL column with its writer's reason documented at
+  `local_tz_abbrev` — the one statement of the fact. See the amended source decision.
 
 ## Notes for launch
 

@@ -419,25 +419,30 @@ async fn a_consumer_kind_parses_loads_wakes_and_takes_a_turn() {
     // `assert_wake_precedes_turn_end`.
     assert_wake_precedes_turn_end(&mut events, conv).await;
 
-    // The owed turn, answered: the ledger settles as the stored chat message
-    // followed by the scripted prose.
+    // The owed turn, answered: the ledger settles as the day's date marker —
+    // tripped by the user-voiced append inside its own transaction — then the
+    // stored chat message, then the scripted prose.
     let blocks = await_ledger(ctx.store(), conv, "the answered turn", |blocks| {
-        blocks.len() == 2
+        blocks.len() == 3
             && blocks
                 .last()
                 .is_some_and(|b| b.block_type == "text" && b.fields["content"] == json!(ANSWER))
     })
     .await;
+    assert_eq!(
+        blocks[0].block_type, "date_marker",
+        "the marker precedes the message that owes the turn"
+    );
 
     // Loaded through the descriptor path: the row comes back with the role
     // and the declared column read by name into its fields.
-    assert_eq!(blocks[0].id, appended);
-    assert_eq!(blocks[0].block_type, "chat_message");
-    assert_eq!(blocks[0].role, Some(Role::User));
-    assert_eq!(blocks[0].fields["body"], json!("What is the plan?"));
+    assert_eq!(blocks[1].id, appended);
+    assert_eq!(blocks[1].block_type, "chat_message");
+    assert_eq!(blocks[1].role, Some(Role::User));
+    assert_eq!(blocks[1].fields["body"], json!("What is the plan?"));
 
     // Parsed from its stored row, through the derive's chain.
-    match AssistantKind::from_block(&blocks[0]) {
+    match AssistantKind::from_block(&blocks[1]) {
         AssistantKind::ChatMessage(message) => {
             assert_eq!(message.body, "What is the plan?");
             assert_eq!(message.awaiting(), Some(Awaiting::Model));

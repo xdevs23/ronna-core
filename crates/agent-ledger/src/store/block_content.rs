@@ -24,6 +24,12 @@ use super::StoreError;
 /// two approval blocks carry role user precisely so a group walk keeps them
 /// inside the surrounding user turn, which means every deep copy of such a turn
 /// arrives here holding one.
+///
+/// The date marker is in here for the same reason and its mirror image
+/// (2026-08-27): it carries NO role, so the group walk keeps it inside any
+/// role-less run it lands in, and a fork anchored on a role-less block beside
+/// one arrives here holding a marker. Absent, that fork failed with
+/// [`StoreError::UnsupportedBlockKind`] on ordinary data.
 pub(super) enum BlockContent {
     Text {
         role: Option<Role>,
@@ -49,6 +55,12 @@ pub(super) enum BlockContent {
         decision: String,
         system_reason: Option<String>,
         user_reason: Option<String>,
+    },
+    DateMarker {
+        date: String,
+        tz_abbrev: Option<String>,
+        tz_name: Option<String>,
+        written_at: Option<String>,
     },
 }
 
@@ -134,6 +146,7 @@ impl BlockContent {
                     user_reason,
                 })
             }
+            "date_marker" => Self::read_date_marker(conn, block_id),
             other => {
                 // The kind is genuinely outside what this type models — which
                 // is a fact about this type, not a malformed statement. It used
@@ -145,6 +158,31 @@ impl BlockContent {
                 })
             }
         }
+    }
+
+    /// The marker's row: the date it records, plus the three independently
+    /// nullable columns — a source that answered nothing wrote NULL, and a
+    /// marker written before those columns existed carries none of them. Its
+    /// own function because a copy carries the row VERBATIM: whatever a marker
+    /// knew, its clone knows, and nothing is recomputed at copy time.
+    fn read_date_marker(conn: &Connection, block_id: i64) -> Result<Self, StoreError> {
+        let (date, tz_abbrev, tz_name, written_at): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT date, tz_abbrev, tz_name, written_at
+                 FROM block_date_marker WHERE block_id = ?1",
+            [block_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        Ok(Self::DateMarker {
+            date,
+            tz_abbrev,
+            tz_name,
+            written_at,
+        })
     }
 
     /// Insert this content as the payload for `new_block_id`.
@@ -212,6 +250,19 @@ impl BlockContent {
                     ],
                 )?;
             }
+            Self::DateMarker {
+                date,
+                tz_abbrev,
+                tz_name,
+                written_at,
+            } => {
+                conn.execute(
+                    "INSERT INTO block_date_marker
+                        (block_id, date, tz_abbrev, tz_name, written_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![new_block_id, date, tz_abbrev, tz_name, written_at],
+                )?;
+            }
         }
         Ok(())
     }
@@ -230,7 +281,9 @@ impl BlockContent {
             // own, exactly as a quote does with its target.
             Self::ApprovalRequest { for_block_id }
             | Self::ApprovalDecision { for_block_id, .. } => vec![for_block_id],
-            Self::Text { .. } | Self::Code { .. } => Vec::new(),
+            // A marker references nothing: it states a date, and a copy of it
+            // states the same date wherever it lands.
+            Self::Text { .. } | Self::Code { .. } | Self::DateMarker { .. } => Vec::new(),
         };
         for reference in references {
             if let Some(&copied) = remap.get(reference) {
