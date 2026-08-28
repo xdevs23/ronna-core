@@ -33,7 +33,14 @@ pub struct DateMarker {
     /// independently of the abbreviation.
     pub tz_name: Option<String>,
     /// The wall-clock `HH:MM` this marker was written at — the minute the
-    /// day's first user-voiced append landed, never a claim about now.
+    /// day's first user-voiced append landed.
+    ///
+    /// A record fact and never model-facing prose: the projected line does not
+    /// speak it, because a stated time is read as the present and stops being
+    /// true a minute later, while the date it rides with stays true all day.
+    /// A reader that wants the current minute reads the clock
+    /// ([`crate::store::ClockReading`]); this field says when the row was
+    /// written, which is a different question.
     pub written_at: Option<String>,
 }
 
@@ -54,19 +61,25 @@ impl super::LeafKind for DateMarker {
 }
 
 impl DateMarker {
-    /// `Current date: {YYYY-MM-DD} ({Weekday})`, then a timezone clause and a
-    /// writing-minute clause for whichever of them the row carries:
+    /// `Current date: {YYYY-MM-DD} ({Weekday})`, then a timezone clause when
+    /// the row carries a zone:
     ///
     /// ```text
-    /// Current date: 2026-08-27 (Thursday), timezone CEST (Europe/Berlin); marker written at 22:41
+    /// Current date: 2026-08-27 (Thursday), timezone CEST (Europe/Berlin)
     /// ```
     ///
-    /// Each clause is independent of the others and of the date parsing, so a
-    /// row missing any of them simply omits that clause — and a row carrying
-    /// only a date renders exactly the line it rendered before the columns
-    /// existed. A stored date that does not parse degrades to the bare date,
-    /// keeping whatever clauses it has: never a panic, because a ledger row is
-    /// data and a reader that panics on data cannot replay.
+    /// **What the line states stays true for the whole day it names.** The
+    /// row's `written_at` minute is deliberately not spoken: a model reads a
+    /// stated time as the present, and that reading is stale one minute after
+    /// the marker was written, where the date and the zone hold until the next
+    /// marker.
+    ///
+    /// The zone clause is independent of the date parsing, so a row without a
+    /// zone simply omits it — and a row carrying only a date renders exactly
+    /// the line it rendered before the columns existed. A stored date that does
+    /// not parse degrades to the bare date, keeping its zone clause: never a
+    /// panic, because a ledger row is data and a reader that panics on data
+    /// cannot replay.
     fn line(&self) -> String {
         let date = match chrono::NaiveDate::parse_from_str(&self.date, "%Y-%m-%d") {
             Ok(date) => format!("Current date: {} ({})", self.date, date.format("%A")),
@@ -77,11 +90,7 @@ impl DateMarker {
             (Some(zone), None) | (None, Some(zone)) => format!(", timezone {zone}"),
             (None, None) => String::new(),
         };
-        let written = self
-            .written_at
-            .as_ref()
-            .map_or_else(String::new, |at| format!("; marker written at {at}"));
-        format!("{date}{zone}{written}")
+        format!("{date}{zone}")
     }
 }
 
@@ -134,9 +143,11 @@ mod tests {
         DateMarker::parse(block).llm_text().unwrap()
     }
 
-    /// The pre-slice line, spelled out once and used as the all-NULL
+    /// The pre-slice line, spelled out once and used as the zone-less
     /// expectation below: every marker written before the zone columns existed
-    /// must still project THIS, character for character.
+    /// must still project THIS, character for character — and so must a
+    /// zone-less row that does carry its written-at minute, which the line does
+    /// not speak.
     const PRE_SLICE_LINE: &str = "Current date: 2026-08-27 (Thursday)";
 
     /// Every written form, pinned against the line the slice specified.
@@ -149,11 +160,11 @@ mod tests {
                 Some("Europe/Berlin"),
                 Some("22:41")
             )),
-            "Current date: 2026-08-27 (Thursday), timezone CEST (Europe/Berlin); marker written at 22:41"
+            "Current date: 2026-08-27 (Thursday), timezone CEST (Europe/Berlin)"
         );
         assert_eq!(
             line(&marker("2026-08-27", Some("CEST"), None, Some("22:41"))),
-            "Current date: 2026-08-27 (Thursday), timezone CEST; marker written at 22:41",
+            "Current date: 2026-08-27 (Thursday), timezone CEST",
             "no IANA name: the abbreviation carries the zone alone"
         );
         assert_eq!(
@@ -163,13 +174,13 @@ mod tests {
                 Some("Europe/Berlin"),
                 Some("22:41")
             )),
-            "Current date: 2026-08-27 (Thursday), timezone Europe/Berlin; marker written at 22:41",
+            "Current date: 2026-08-27 (Thursday), timezone Europe/Berlin",
             "no abbreviation: the name carries the zone alone, unparenthesized"
         );
         assert_eq!(
             line(&marker("2026-08-27", None, None, Some("22:41"))),
-            "Current date: 2026-08-27 (Thursday); marker written at 22:41",
-            "no zone at all: the clause drops out, the minute stays"
+            PRE_SLICE_LINE,
+            "no zone at all: the clause drops out"
         );
         assert_eq!(
             line(&marker("2026-08-27", None, None, None)),
@@ -178,8 +189,34 @@ mod tests {
         );
     }
 
-    /// A row whose date does not parse keeps the bare-date degrade AND its
-    /// other clauses: no clause depends on the date parsing.
+    /// The written-at minute is a stored fact the line never speaks: a row that
+    /// carries one and a row that does not project the SAME line, whatever the
+    /// zone says. A stated time is read as the present and is stale a minute
+    /// later; the date it rides with is true all day.
+    #[test]
+    fn the_written_minute_is_parsed_and_never_projected() {
+        for zone in [
+            (Some("CEST"), Some("Europe/Berlin")),
+            (Some("CEST"), None),
+            (None, Some("Europe/Berlin")),
+            (None, None),
+        ] {
+            let (abbrev, name) = zone;
+            assert_eq!(
+                line(&marker("2026-08-27", abbrev, name, Some("22:41"))),
+                line(&marker("2026-08-27", abbrev, name, None)),
+                "the minute changes no line"
+            );
+        }
+        assert_eq!(
+            DateMarker::parse(&marker("2026-08-27", None, None, Some("22:41"))).written_at,
+            Some("22:41".to_owned()),
+            "the row's own label is still read off the row"
+        );
+    }
+
+    /// A row whose date does not parse keeps the bare-date degrade AND its zone
+    /// clause: the clause does not depend on the date parsing.
     #[test]
     fn an_unparseable_date_keeps_the_bare_degrade_and_its_clauses() {
         assert_eq!(
@@ -189,7 +226,7 @@ mod tests {
                 Some("Europe/Berlin"),
                 Some("22:41")
             )),
-            "Current date: not-a-date, timezone CEST (Europe/Berlin); marker written at 22:41"
+            "Current date: not-a-date, timezone CEST (Europe/Berlin)"
         );
         assert_eq!(
             line(&marker("not-a-date", None, None, None)),
