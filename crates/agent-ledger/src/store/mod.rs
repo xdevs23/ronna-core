@@ -52,6 +52,7 @@ pub use attachments::{Attachment, ByteRange};
 pub use conversations::{
     BranchPoint, Continuation, Conversation, ConversationModel, ModelOverride,
 };
+pub use date_markers::ClockReading;
 pub use descriptors::{
     Column, ColumnRef, ColumnType, ContentDescriptor, DomainMigrations, StoreConfig,
     concat_descriptors, descriptor_count,

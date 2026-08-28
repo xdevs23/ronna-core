@@ -8,11 +8,114 @@
 //! WHAT a marker records is one value, [`DateStamp`], built by one constructor
 //! and passed to every seam that trips one. A widening argument list at five
 //! call sites would be the same decision written five times.
+//!
+//! WHERE "now, local, named zone" comes from is [`LocalRead`], the one private
+//! read of the machine's clock. [`DateStamp`] is its ledger-facing projection
+//! and [`ClockReading`] its consumer-facing one, so the marker's stamp and a
+//! consumer asking the time can never disagree about their sources — the clock
+//! is one recorded decision, not one per caller.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::StoreError;
 use super::messages::insert_block;
+
+/// One read of the machine's local clock: the instant, and what each timezone
+/// source answered beside it.
+///
+/// **One instant answers every part.** Date, weekday and minute are all
+/// formatted from the same `now`, so a read taken in the last millisecond of a
+/// day cannot carry tomorrow's date beside today's minute — and a caller cannot
+/// reintroduce that skew by reading the clock a second time for one more part,
+/// because there is nothing else here to read.
+///
+/// Both public-facing readings project from this and neither takes its own
+/// read: [`DateStamp::now_local`] for the ledger's markers, and
+/// [`ClockReading::now_local`] for a consumer asking what the clock says.
+struct LocalRead {
+    now: chrono::DateTime<chrono::Local>,
+    tz_abbrev: Option<String>,
+    tz_name: Option<String>,
+}
+
+impl LocalRead {
+    /// Read the clock and both zone sources, once.
+    fn now() -> Self {
+        Self {
+            now: chrono::Local::now(),
+            tz_abbrev: local_tz_abbrev(),
+            tz_name: iana_time_zone::get_timezone().ok(),
+        }
+    }
+
+    /// The local date, `YYYY-MM-DD`.
+    fn date(&self) -> String {
+        self.now.format("%Y-%m-%d").to_string()
+    }
+
+    /// The weekday the date falls on, named in full — `Thursday`.
+    fn weekday(&self) -> String {
+        self.now.format("%A").to_string()
+    }
+
+    /// The wall-clock minute, `HH:MM`.
+    fn time(&self) -> String {
+        self.now.format("%H:%M").to_string()
+    }
+}
+
+/// What the machine's local clock says now: the date the ledger's markers
+/// carry, the weekday it falls on, the timezone as far as this platform answers
+/// for it, and the wall-clock minute.
+///
+/// Read-only and taken once, by [`ClockReading::now_local`] — a value, never a
+/// handle on a clock that moves under its reader. Every part comes from one
+/// instant, so the weekday always belongs to the date it rides with and the
+/// time always belongs to that same date.
+///
+/// This is the answer to "what time is it", and the ledger's date markers are
+/// deliberately not: a marker states the date, which stays true all day, while
+/// the minute it was written at is stale a minute later.
+#[derive(Debug, Clone)]
+pub struct ClockReading {
+    /// The local date, in `YYYY-MM-DD` form.
+    pub date: String,
+    /// The weekday that date falls on, named in full — `Thursday`.
+    pub weekday: String,
+    /// The platform's own zone abbreviation (`CEST`), or `None` when nothing
+    /// here can answer for it — which is every reading this crate takes today.
+    /// The store's `local_tz_abbrev` is the one statement of why, and the day a
+    /// safe reader of the source lands there, a reading carries the value with
+    /// nothing else moving.
+    pub tz_abbrev: Option<String>,
+    /// The IANA zone name (`Europe/Berlin`), or `None` when the resolver
+    /// answers nothing.
+    pub tz_name: Option<String>,
+    /// The wall-clock time, in `HH:MM` form.
+    pub time: String,
+}
+
+impl ClockReading {
+    /// Read the clock: now, in the machine's local timezone.
+    ///
+    /// One instant answers every part, and it is the same read the ledger's own
+    /// date markers are stamped from, so a reading and a marker taken in the
+    /// same moment cannot disagree about the date or the zone.
+    ///
+    /// A source that answers nothing is `None`, never a guess — the same
+    /// honesty the stamp's nullable columns carry.
+    #[must_use]
+    pub fn now_local() -> Self {
+        let read = LocalRead::now();
+        Self {
+            date: read.date(),
+            weekday: read.weekday(),
+            time: read.time(),
+            tz_abbrev: read.tz_abbrev,
+            tz_name: read.tz_name,
+        }
+    }
+}
 
 /// Everything a fresh date marker records: the machine's local date, the
 /// timezone as far as this platform answers for it, and the wall-clock minute
@@ -40,16 +143,16 @@ pub(crate) struct DateStamp {
 impl DateStamp {
     /// The stamp production writes: now, in the machine's local timezone.
     ///
-    /// One instant answers every part, so a marker written in the last
-    /// millisecond of a day cannot carry tomorrow's date beside today's
-    /// minute.
+    /// One instant answers every part ([`LocalRead`]), so a marker written in
+    /// the last millisecond of a day cannot carry tomorrow's date beside
+    /// today's minute.
     pub(crate) fn now_local() -> Self {
-        let now = chrono::Local::now();
+        let read = LocalRead::now();
         Self {
-            date: now.format("%Y-%m-%d").to_string(),
-            tz_abbrev: local_tz_abbrev(),
-            tz_name: iana_time_zone::get_timezone().ok(),
-            written_at: Some(now.format("%H:%M").to_string()),
+            date: read.date(),
+            written_at: Some(read.time()),
+            tz_abbrev: read.tz_abbrev,
+            tz_name: read.tz_name,
         }
     }
 }
@@ -157,7 +260,7 @@ pub(super) fn ensure_date_marker(
 
 #[cfg(test)]
 mod tests {
-    use super::DateStamp;
+    use super::{ClockReading, DateStamp};
     use crate::store::Store;
     use crate::types::InputBlock;
 
@@ -213,6 +316,65 @@ mod tests {
             None,
             "so the stamp production writes carries no abbreviation"
         );
+        assert_eq!(
+            ClockReading::now_local().tz_abbrev,
+            None,
+            "and neither does a reading, which draws on the same source"
+        );
+    }
+
+    /// One instant answers every part of a reading. The weekday is checked
+    /// against the date it rides with, and the date and time against the stamp
+    /// taken around it: a reading assembled from two clock reads could name a
+    /// Thursday date on a Friday, or a date that is already tomorrow beside a
+    /// minute that is still today.
+    ///
+    /// The window the stamps bracket is the honest form of "the same moment" a
+    /// test of a live clock can assert. A midnight crossing between the two
+    /// reads is not a failure of the reading, so it is excluded rather than
+    /// flaked on — what would fail here is a reading that splits its own parts.
+    #[test]
+    fn one_instant_answers_every_part_of_a_reading() {
+        let before = DateStamp::now_local();
+        let reading = ClockReading::now_local();
+        let after = DateStamp::now_local();
+
+        let date = chrono::NaiveDate::parse_from_str(&reading.date, "%Y-%m-%d")
+            .expect("the date is YYYY-MM-DD");
+        assert_eq!(
+            reading.weekday,
+            date.format("%A").to_string(),
+            "the weekday names the day its own date falls on"
+        );
+        assert!(
+            chrono::NaiveTime::parse_from_str(&reading.time, "%H:%M").is_ok(),
+            "the time is HH:MM, got {}",
+            reading.time
+        );
+
+        if before.date == after.date {
+            assert_eq!(
+                reading.date, before.date,
+                "the reading's date is the date the ledger stamps in the same moment"
+            );
+            assert!(
+                before.written_at <= Some(reading.time.clone())
+                    && Some(reading.time) <= after.written_at,
+                "the reading's minute falls inside the minutes bracketing it"
+            );
+        }
+    }
+
+    /// The reading and the stamp are two projections of one private read, so
+    /// they answer the zone identically — the clock is one recorded decision
+    /// and a consumer asking the time cannot learn a different zone from the
+    /// one the day's marker states.
+    #[test]
+    fn a_reading_and_a_stamp_agree_on_the_zone() {
+        let reading = ClockReading::now_local();
+        let stamp = DateStamp::now_local();
+        assert_eq!(reading.tz_abbrev, stamp.tz_abbrev);
+        assert_eq!(reading.tz_name, stamp.tz_name);
     }
 
     /// The first user message trips "no marker yet is not today" for free: one
@@ -406,9 +568,10 @@ mod tests {
 
     /// Replay, end to end and through the real fold: a marker written with
     /// every part, read back through the block query, parsed by the kind and
-    /// grouped by the projection, speaks the full line. This is the pin that
-    /// fails if the read path is widened only halfway — the columns written
-    /// and never selected.
+    /// grouped by the projection, speaks the full line — and every written
+    /// column comes back off the row, including the minute the line does not
+    /// speak. This is the pin that fails if the read path is widened only
+    /// halfway: the columns written and never selected.
     #[tokio::test]
     async fn a_written_marker_replays_through_the_read_path_and_the_projection() {
         let (store, conv) = fixture().await;
@@ -429,11 +592,13 @@ mod tests {
         let system = serde_json::to_value(&messages[0]).unwrap();
         assert_eq!(
             system["content"],
-            serde_json::json!(
-                "Current date: 2026-08-27 (Thursday), timezone CEST (Europe/Berlin); \
-                 marker written at 22:41"
-            ),
-            "what was written is what the model is told"
+            serde_json::json!("Current date: 2026-08-27 (Thursday), timezone CEST (Europe/Berlin)"),
+            "what was written is what the model is told — minus the minute, which \
+             the line does not speak"
+        );
+        assert_eq!(
+            blocks[0].fields["written_at"], "22:41",
+            "the minute is stored and read back; only the projection drops it"
         );
     }
 
