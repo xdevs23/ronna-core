@@ -24,8 +24,10 @@ hazard exists in the current shape and none may be introduced. Range:
 `quoted_text_blocks` walks the junction-visible span (`:655-690`), with the membership
 rule documented at `:564-574` and `:618-654` — the range covers only what the quoting
 conversation can see, because block ids are global. A date-marker row inside a span
-contributes nothing by construction: it has no `block_text` row, so the walk's JOIN
-excludes it — pinned by this slice so the fork consequence below can rely on it.
+contributes nothing after this slice for a stated reason: no descriptor can ever claim
+the `date_marker` kind (the core-kinds collision refusal,
+`store/descriptors.rs:521-528`), so the widened walk's descriptor lookup misses it —
+pinned by this slice so the fork consequence below can rely on it.
 
 **Three callers share the resolution.** The block loader (`blocks.rs:528`), the drafts
 path (`store/drafts.rs:171` — a composer previewing a quote), and the fork's deep copy
@@ -45,16 +47,19 @@ consults the domain gate and refuses on a failed consumer migration (the invaria
 resolver's functions return bare `String`/`Vec`, not `Result`. The slice must take a
 side, and does, below.
 
-**Erasure semantics come free and must stay free.** The consumer nulls a chat
-message's text column on erasure; a resolver that reads the declared column through
-`COALESCE` resolves an erased message to the empty string, and the projection renders
-an empty quote as nothing. No erasure special case may appear in the resolver. The
-FORK is the one place a real copy appears: a fork whose quoted range spans a consumer
-block deep-copies the row into the consumer's own content table
-(`clone_consumer_content`, `descriptors.rs:1197`), and that clone carries the source
-row's principal and origin columns — so the person-keyed erasure pass, which walks the
-consumer table by principal, reaches the clone by construction, while the deletion
-mirror stays conversation-scoped by design. Stated and pinned, not assumed.
+**Erasure semantics come free and must stay free — and the passes are the
+consumer's, not this library's.** The consumer nulls a chat message's text column on
+erasure; a resolver that reads the declared column through `COALESCE` resolves an
+erased message to the empty string, and the projection renders an empty quote as
+nothing. No erasure special case may appear in the resolver. The FORK is the one
+place a real copy appears: a fork whose quoted range spans a consumer block
+deep-copies the row into the consumer's own content table (`clone_consumer_content`,
+`descriptors.rs:1197`), copying EVERY declared column — so whatever principal or
+origin columns the consumer declares ride to the clone, and the consumer's own
+erasure passes (which live in the consumer repository, not here) reach the clone
+exactly as they reach any row of that table. This slice pins the copy's completeness;
+the erasure-parity pin over clones belongs to consumer unit 31, stated so neither
+side assumes the other did it.
 
 ## Decisions taken with this slice
 
@@ -66,13 +71,23 @@ mirror stays conversation-scoped by design. Stated and pinned, not assumed.
   store-read, before kinds are parsed, and the store must not construct agency types;
   *rejected:* mirroring consumer text into `block_text` (two copies of a member's message,
   and the copy erasure does not know about).
+- **Membership follows the DECLARATION; text follows the gate, 2026-08-29.** The
+  span walk's membership becomes: a `block_text` row, OR a stored type whose
+  descriptor declares a quotable column — a static, compile-time fact, so what a
+  span covers never depends on runtime state. A kind with no declaration is NOT a
+  member: exactly today's walk, so forks copy exactly today's set for undeclared
+  kinds. A declared kind IS a member even when its domain gate is closed — its text
+  resolves empty (below) and a fork's clone of it writes through the gate like every
+  consumer write, failing the fork loudly if the schema is in doubt, the store's
+  standing discipline. Recorded because the fork consumes the same walk
+  (`collect_quote_targets`), so membership here IS the fork's copy set, not a text
+  detail.
 - **The resolver consults the descriptor when `block_text` has nothing, 2026-08-28.** For
-  each block in the span: read `block_text` as today; where the block's row is absent
-  there, look up its stored type's descriptor and, where one declares a quotable column,
-  read that column under the descriptor's domain, `COALESCE`d to empty. Character
-  offsets apply unchanged; the two text sources interleave in ledger id order, the
-  walk's own order. The membership rule (`quoted_text_blocks`) stays the single gate
-  for ranges. *Rejected:* a union view over all text-bearing tables (a schema object
+  each member of the span: read `block_text` as today; where the block's row is absent
+  there, read the declared quotable column under the descriptor's domain, `COALESCE`d
+  to empty. Character offsets apply unchanged; the two text sources interleave in
+  ledger id order, the walk's own order. The membership rule (`quoted_text_blocks`)
+  stays the single gate for ranges. *Rejected:* a union view over all text-bearing tables (a schema object
   encoding a fact the descriptors already state); *rejected:* widening only the
   single-block path (the range path would silently skip consumer blocks — one rule, two
   behaviours).
@@ -106,8 +121,10 @@ mirror stays conversation-scoped by design. Stated and pinned, not assumed.
 
 A consumer kind whose descriptor names a quotable text column is readable by the quote
 resolver: a quote block spanning it resolves that column's text with the same character
-offsets, the same conversation-membership rule and the same empty-on-absence behaviour
-the framework's own text enjoys, at all three call sites. A kind without the
+offsets, the range walk's conversation-membership rule and the same
+empty-on-absence behaviour the framework's own text enjoys, at all three call sites
+(the single-block path stays membership-free, exactly as it is for framework text
+today). A kind without the
 declaration resolves empty, as today; so does a span whose descriptor's domain gate is
 closed, without a raw read. A declaration naming an undeclared, non-text, role, or
 ephemeral-kind column is refused at open. An erased row whose text column is null
@@ -131,16 +148,19 @@ migration, no new dependency, no change to any existing render pin's meaning.
   the endpoints — pinned; and a date-marker row inside a quoted span contributes
   nothing — pinned.
 - **AC5** Absence stays empty, four ways: a kind with no declaration, an erased row
-  (text column null), a dangling reference, and a CLOSED domain gate (no raw read —
-  pinned by observing no query against the consumer table) each resolve to the empty
-  string and render as nothing — pinned per case.
+  (text column null), a dangling reference, and a CLOSED domain gate each resolve to
+  the empty string and render as nothing — pinned per case. The closed-gate pin's
+  no-raw-read proof: close the gate BEFORE the consumer table exists, so any raw
+  read would error — an empty resolution with no error is the proof, no query
+  tracing needed.
 - **AC6** A bad declaration refuses at open: an undeclared column, a non-text column,
   the role column, and a column on an ephemeral kind each fail descriptor open with a
   named error — pinned per case.
 - **AC7** All three sites resolve identically: the loader, the drafts preview, and the
   fork path — the fork pinned by forking a conversation whose quote spans a consumer
   block, loading the destination, and comparing resolutions; the same pin proves the
-  clone landed in the consumer's table and the person-keyed erasure pass nulls it.
+  clone landed in the consumer's table with EVERY declared column copied (the
+  consumer's erasure reach over clones is unit 31's pin, not this one's).
 - **AC8** No shipped behaviour changes: every existing quote, render and fork pin
   passes with its assertions' meanings intact — the mechanical field addition to
   descriptor literals is the one permitted edit, and no expected value moves.
@@ -152,8 +172,11 @@ migration, no new dependency, no change to any existing render pin's meaning.
   slices 13 and 15; only slice 12, async projection, remains unmerged). Sites:
   `store/descriptors.rs` (the field, open-time validation in `validate_columns`),
   `store/blocks.rs` (`resolve_quote_text`, `quoted_text_blocks`),
-  `store/conversations.rs` (`collect_quote_targets` / `deep_copy_group_into`, the fork
-  path), `store/drafts.rs:171` (the preview caller), the derive crate's doc example,
-  and tests beside each.
+  `store/conversations.rs` (`collect_quote_targets` / `deep_copy_group_into`, the
+  fork path), `store/drafts.rs:171` (the preview caller — its move-closure captures
+  the descriptors and the gate), the resolver signatures themselves (they take only
+  `conn` today; the descriptor set and the gate thread through the three callers —
+  a mechanical ripple, and NOT the Result-rethreading the gate decision rejects),
+  the derive crate's doc example, and tests beside each.
 - The consumer's declaration (its chat message naming its text column) belongs to
   consumer unit 31, not here — this slice ships with a test descriptor only.
