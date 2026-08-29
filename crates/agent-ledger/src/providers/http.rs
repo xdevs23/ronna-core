@@ -18,8 +18,14 @@
 
 use std::time::Duration;
 
-/// What this library calls itself when it talks to a provider.
-const USER_AGENT: &str = concat!("agent-ledger/", env!("CARGO_PKG_VERSION"));
+/// What this library calls itself when it talks to a provider: the public
+/// name it is released under, the crate version, and the address anyone
+/// reading a server log can follow to what was knocking.
+const USER_AGENT: &str = concat!(
+    "ronna-core/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/xdevs23/ronna-core)"
+);
 
 /// Per-read inactivity window for a streaming connection. If no bytes arrive
 /// within this span the read fails fast instead of hanging on a half-open

@@ -11,7 +11,11 @@
 # Blank lines and lines beginning with # are ignored by the check.
 
 # Product identity
-ronna
+#  alone left the list 2026-08-29: ronna-core is this library's OWN release
+# name (the repository it ships as, and the name its user agent announces on the
+# operator's ruling), so the bare word is the library's identity, not a product
+# concept. The product built on it stays forbidden:
+ronna-lightspeed
 lightspeed
 
 # Block kinds belonging to a consumer, not to the runtime
