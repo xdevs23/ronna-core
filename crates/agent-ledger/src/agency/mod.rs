@@ -610,11 +610,13 @@ impl FromBlock for BlockKind {
         try_leaf!(block, stored, DateMarker => DateMarker);
         try_leaf!(block, stored, MetadataTitleRequest => MetadataTitleRequest);
         try_leaf!(block, stored, MetadataTitleResponse => MetadataTitleResponse);
-        tracing::warn!(
-            block_id = block.id,
-            block_type = stored,
-            "unknown block type — inert agency"
-        );
+        // A kind this library does not know is the NORMAL case here, not a
+        // fault: every consumer-defined kind lands in this arm whenever a
+        // library scan reads a mixed ledger through the library's own view
+        // (the tool-call resolution walks, the redispatch chain). Logging the
+        // expected case is noise by definition, and this parse cannot tell a
+        // consumer kind from a corrupt one — a place that consults the full
+        // consumer registry could, and a warning belongs there if anywhere.
         Self::Unknown(Unknown::parse(block))
     }
 }
