@@ -1664,7 +1664,13 @@ fn spawn_block_watcher<K: RuntimeKind, E: RuntimeEvent>(ctx: &RuntimeContext<K, 
                         });
                     }
                     Ok(None) => {
-                        tracing::warn!(block_id, change_table = %change.table, change_rowid = change.rowid, "block watcher: no conversation found for block");
+                        // A block with no conversation is a normal transient,
+                        // not a fault: the header and content rows land before
+                        // the junction row inside one flow, so their change
+                        // events can arrive first, and draft blocks live
+                        // unjoined by design. The junction row's own event
+                        // carries the notification, so nothing is missed.
+                        tracing::debug!(block_id, change_table = %change.table, change_rowid = change.rowid, "block watcher: block not joined to a conversation yet");
                     }
                     Err(e) => {
                         tracing::warn!(block_id, change_table = %change.table, change_rowid = change.rowid, error = %e, "block watcher: conversation_for_block failed");
