@@ -115,15 +115,18 @@ side assumes the other did it.
   `RESERVED_COLUMNS` precedent) — and so are a declaration naming the ROLE column (a
   quote resolving to the literal string "user" is a wrong declaration, not a
   behaviour) and one on an EPHEMERAL kind (finalization deletes its rows, so every
-  quote of it would dangle by design). A wrong declaration fails loudly at startup,
-  never quietly at quote time.
+  quote of it would dangle by design) — and a JSON column is refused by VARIANT
+  comparison, not affinity: serialized JSON spliced into quoted text is a wrong
+  declaration even though the store keeps JSON in a text column. A wrong
+  declaration fails loudly at startup, never quietly at quote time.
 - **No behaviour change for any existing store or kind, 2026-08-28.** Every framework
   kind keeps resolving through `block_text`; every consumer kind without the
   declaration keeps resolving empty; no schema changes, no migration — the field is
   compile-time descriptor data. Existing struct literals of `ContentDescriptor` (the
   consumer-kind test suite, the descriptor tests, the derive crate's doc example at
-  `agent-ledger-derive/src/lib.rs:246`) gain the field mechanically; the criterion
-  below binds their BEHAVIOUR, not their bytes.
+  `agent-ledger-derive/src/lib.rs:246`, and the placeholder literal inside
+  `concat_descriptors`, `descriptors.rs:365-372`) gain the field mechanically; the
+  criterion below binds their BEHAVIOUR, not their bytes.
 
 ## The slice's contract
 
@@ -162,7 +165,11 @@ migration, no new dependency, no change to any existing render pin's meaning.
   quotable block while healthy, close the gate through the established
   failed-migrate pattern (`descriptors.rs:2492-2500`), then DROP the consumer table
   with test-owned SQL — a raw read would now error, so an empty resolution with no
-  error proves no read ran.
+  error proves no read ran — driven by calling the resolver directly from the
+  store's internal tests, because the public load of a conversation holding a
+  junctioned consumer block already fails whole at the load's own gate consult;
+  the resolver's decline only ever matters for detached targets, and the pin says
+  so.
 - **AC6** A bad declaration refuses at open: an undeclared column, a non-text column,
   the role column, and a column on an ephemeral kind each fail descriptor open with a
   named error — pinned per case.
@@ -171,9 +178,12 @@ migration, no new dependency, no change to any existing render pin's meaning.
   block, loading the destination, and comparing resolutions; the same pin proves the
   clone landed in the consumer's table with EVERY declared column copied (the
   consumer's erasure reach over clones is unit 31's pin, not this one's). And the
-  fork's gate consult is pinned: a fork whose copy set holds a declared consumer
-  block under a CLOSED gate fails loudly with the migration error and writes
-  nothing raw.
+  fork's gate consult is pinned THROUGH THE DETACHED-TARGET SHAPE — the only shape
+  that reaches the new consult, because a junctioned consumer block already fails
+  the fork at the source load's pre-existing consult: the pin detaches the quoted
+  consumer block first (`detach_block`, `conversations.rs:359`), closes the gate,
+  forks, and requires the loud migration failure with nothing written raw — a pin
+  that passes on pre-change code is the defect this wording exists to prevent.
 - **AC8** No shipped behaviour changes: every existing quote, render and fork pin
   passes with its assertions' meanings intact — the mechanical field addition to
   descriptor literals is the one permitted edit, and no expected value moves.
