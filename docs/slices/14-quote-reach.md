@@ -77,9 +77,17 @@ side assumes the other did it.
   span covers never depends on runtime state. A kind with no declaration is NOT a
   member: exactly today's walk, so forks copy exactly today's set for undeclared
   kinds. A declared kind IS a member even when its domain gate is closed — its text
-  resolves empty (below) and a fork's clone of it writes through the gate like every
-  consumer write, failing the fork loudly if the schema is in doubt, the store's
-  standing discipline. Recorded because the fork consumes the same walk
+  resolves empty (below), and the FORK'S CLONE PATH GAINS THE GATE CONSULT THIS
+  SLICE MAKES NECESSARY: today the clone (`BlockCloner` →
+  `clone_consumer_content`) runs raw because no consumer row could ever be a quote
+  target; the widened walk creates that route, so the clone consults
+  `gate.ensure(descriptor.domain)` before writing and a fork under a closed gate
+  fails loudly with the migration error, never a raw write — named work of this
+  slice, not an assumption (the earlier gate consult at the source load does not
+  cover the detached-target shape). A declared block whose content row is MISSING
+  — damaged data — now enters the copy set and fails the fork loudly with the
+  store's `MissingBlockContent`, where today's JOIN silently skipped it: chosen,
+  loud over silent, and stated. Recorded because the fork consumes the same walk
   (`collect_quote_targets`), so membership here IS the fork's copy set, not a text
   detail.
 - **The resolver consults the descriptor when `block_text` has nothing, 2026-08-28.** For
@@ -150,9 +158,11 @@ migration, no new dependency, no change to any existing render pin's meaning.
 - **AC5** Absence stays empty, four ways: a kind with no declaration, an erased row
   (text column null), a dangling reference, and a CLOSED domain gate each resolve to
   the empty string and render as nothing — pinned per case. The closed-gate pin's
-  no-raw-read proof: close the gate BEFORE the consumer table exists, so any raw
-  read would error — an empty resolution with no error is the proof, no query
-  tracing needed.
+  no-raw-read proof, in the order the store's lifecycle permits: append the
+  quotable block while healthy, close the gate through the established
+  failed-migrate pattern (`descriptors.rs:2492-2500`), then DROP the consumer table
+  with test-owned SQL — a raw read would now error, so an empty resolution with no
+  error proves no read ran.
 - **AC6** A bad declaration refuses at open: an undeclared column, a non-text column,
   the role column, and a column on an ephemeral kind each fail descriptor open with a
   named error — pinned per case.
@@ -160,7 +170,10 @@ migration, no new dependency, no change to any existing render pin's meaning.
   fork path — the fork pinned by forking a conversation whose quote spans a consumer
   block, loading the destination, and comparing resolutions; the same pin proves the
   clone landed in the consumer's table with EVERY declared column copied (the
-  consumer's erasure reach over clones is unit 31's pin, not this one's).
+  consumer's erasure reach over clones is unit 31's pin, not this one's). And the
+  fork's gate consult is pinned: a fork whose copy set holds a declared consumer
+  block under a CLOSED gate fails loudly with the migration error and writes
+  nothing raw.
 - **AC8** No shipped behaviour changes: every existing quote, render and fork pin
   passes with its assertions' meanings intact — the mechanical field addition to
   descriptor literals is the one permitted edit, and no expected value moves.
@@ -168,13 +181,16 @@ migration, no new dependency, no change to any existing render pin's meaning.
 ## Notes for launch
 
 - Branches from `master` (worktree `~/projects/agent-ledger-quote-reach`, branch
-  `unit/quote-reach`, rebased 2026-08-29 onto a2147fe — a master that already carries
-  slices 13 and 15; only slice 12, async projection, remains unmerged). Sites:
+  `unit/quote-reach`; rebase onto master's tip at launch — 738bfe0 or later, which
+  carries slices 13 and 15 plus the user-agent change; only slice 12, async
+  projection, remains unmerged). Sites:
   `store/descriptors.rs` (the field, open-time validation in `validate_columns`),
   `store/blocks.rs` (`resolve_quote_text`, `quoted_text_blocks`),
   `store/conversations.rs` (`collect_quote_targets` / `deep_copy_group_into`, the
-  fork path), `store/drafts.rs:171` (the preview caller — its move-closure captures
-  the descriptors and the gate), the resolver signatures themselves (they take only
+  fork path), `store/block_cloner.rs` and `clone_consumer_content` (the clone's
+  gate consult, this slice's named work), `store/drafts.rs:171` (the preview
+  caller — its move-closure captures the descriptors and the gate), the resolver
+  signatures themselves (they take only
   `conn` today; the descriptor set and the gate thread through the three callers —
   a mechanical ripple, and NOT the Result-rethreading the gate decision rejects),
   the derive crate's doc example, and tests beside each.
