@@ -445,7 +445,7 @@ impl Store {
                         new_id,
                         &super::date_markers::DateStamp::now_local(),
                     )?;
-                    deep_copy_group_into(&tx, descriptors, source_id, new_id, &group)?;
+                    deep_copy_group_into(&tx, descriptors, &gate, source_id, new_id, &group)?;
                     new_id
                 }
             };
@@ -780,6 +780,8 @@ fn insert_system_prompt_block(
 /// range comes out inverted and reads back empty.
 fn collect_quote_targets(
     conn: &rusqlite::Connection,
+    descriptors: &'static [super::descriptors::ContentDescriptor],
+    gate: &super::DomainGate,
     source_id: i64,
     group_block_ids: &[i64],
 ) -> Result<Vec<i64>, StoreError> {
@@ -801,7 +803,11 @@ fn collect_quote_targets(
             [block_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let covered = super::blocks::quoted_text_blocks(conn, Some(source_id), sb, eb);
+        let covered = super::blocks::quoted_text_blocks(
+            super::blocks::QuoteScope::new(conn, descriptors, gate, Some(source_id)),
+            sb,
+            eb,
+        );
         for (id, _) in covered {
             if !group.contains(&id) && seen.insert(id) {
                 ordered.push(id);
@@ -819,12 +825,14 @@ fn collect_quote_targets(
 fn deep_copy_group_into(
     conn: &rusqlite::Connection,
     descriptors: &'static [super::descriptors::ContentDescriptor],
+    gate: &super::DomainGate,
     source_id: i64,
     dst_id: i64,
     group: &GroupBounds,
 ) -> Result<(), StoreError> {
-    let detached_targets = collect_quote_targets(conn, source_id, &group.block_ids)?;
-    let mut cloner = BlockCloner::new(conn, descriptors);
+    let detached_targets =
+        collect_quote_targets(conn, descriptors, gate, source_id, &group.block_ids)?;
+    let mut cloner = BlockCloner::new(conn, descriptors, gate);
 
     // Detached first — populates the remap so any quote in the group below
     // picks up the rewritten start and end ids when it is cloned. In ascending

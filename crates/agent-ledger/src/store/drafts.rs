@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::InputBlock;
 
-use super::blocks::resolve_quote_text;
+use super::blocks::{QuoteScope, resolve_quote_text};
 use super::{Store, StoreError, now_iso8601};
 
 /// Block types stored in the draft tables.
@@ -117,6 +117,10 @@ impl Store {
     ///
     /// If the query fails or the store's actor has stopped.
     pub async fn load_draft(&self, conversation_id: i64) -> Result<Vec<DraftBlock>, StoreError> {
+        // The preview resolves quotes exactly as a load does, so it carries the
+        // same descriptor set and the same domain gate into the closure.
+        let descriptors = self.descriptors;
+        let gate = self.gate.clone();
         self.run(move |conn| {
             let draft_id: Option<i64> = conn
                 .prepare("SELECT id FROM drafts WHERE conversation_id = ?1")?
@@ -169,8 +173,7 @@ impl Store {
                         // The draft's own conversation is the quoting one: a
                         // draft quotes what its composer can see.
                         let text = resolve_quote_text(
-                            conn,
-                            Some(conversation_id),
+                            QuoteScope::new(conn, descriptors, &gate, Some(conversation_id)),
                             start_block_id,
                             start_pos,
                             end_block_id,

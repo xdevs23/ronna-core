@@ -251,6 +251,7 @@ struct Leaf<'a> {
 ///         columns: &[Column::new("body", ColumnType::Text)],
 ///         reference_columns: &[],
 ///         ephemeral: false,
+///         quoted_text_column: None,
 ///     }];
 ///     fn parse(_: &Block) -> Self {
 ///         Self
