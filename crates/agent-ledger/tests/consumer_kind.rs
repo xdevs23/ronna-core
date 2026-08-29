@@ -48,6 +48,7 @@ impl LeafKind for ChatMessage {
         ],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     fn parse(block: &Block) -> Self {

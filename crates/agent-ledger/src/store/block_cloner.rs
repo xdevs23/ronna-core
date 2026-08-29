@@ -10,21 +10,30 @@ use std::collections::HashMap;
 
 use rusqlite::{Connection, params};
 
-use super::StoreError;
 use super::block_content::BlockContent;
 use super::descriptors::{ContentDescriptor, clone_consumer_content, descriptor_for_kind};
+use super::{DomainGate, StoreError};
 
 pub(super) struct BlockCloner<'c> {
     conn: &'c Connection,
     descriptors: &'static [ContentDescriptor],
+    /// The consumer domains' health. A clone of a descriptor-claimed kind
+    /// writes into that descriptor's own table, so it answers to the same gate
+    /// every other descriptor-path read and write does.
+    gate: &'c DomainGate,
     remap: HashMap<i64, i64>,
 }
 
 impl<'c> BlockCloner<'c> {
-    pub(super) fn new(conn: &'c Connection, descriptors: &'static [ContentDescriptor]) -> Self {
+    pub(super) fn new(
+        conn: &'c Connection,
+        descriptors: &'static [ContentDescriptor],
+        gate: &'c DomainGate,
+    ) -> Self {
         Self {
             conn,
             descriptors,
+            gate,
             remap: HashMap::new(),
         }
     }
@@ -78,6 +87,16 @@ impl<'c> BlockCloner<'c> {
         // was not — and the kept reference holds its source block alive
         // through the collector's reference predicate.
         let descriptor = descriptor_for_kind(self.descriptors, &block_type);
+        // Consulted BEFORE the header row goes in, so a clone under a failed
+        // consumer migration writes nothing at all rather than a header whose
+        // content row never follows. A quote can now span a consumer kind, so
+        // the fork's deep copy of a quote target reaches this path with a row
+        // it must copy out of a schema in doubt — and the answer is the same
+        // one every descriptor read gives: refuse loudly with the migration
+        // failure, never a raw write.
+        if let Some(descriptor) = descriptor {
+            self.gate.ensure(descriptor.domain)?;
+        }
         let core_content = if descriptor.is_some() {
             None
         } else {

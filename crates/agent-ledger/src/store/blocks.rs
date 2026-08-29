@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::block::{Block, OpaquePayload, ReasoningDetailEntry, Role};
 
 use super::block_content::parse_role;
-use super::descriptors::{ContentDescriptor, overlay_consumer_content};
+use super::descriptors::{ContentDescriptor, overlay_consumer_content, read_quoted_text};
 use super::{DomainGate, StoreError};
 
 /// One statement joining every LIBRARY content table by name — the core kinds'
@@ -112,8 +112,7 @@ pub(super) fn load_blocks_for_conversation(
     }
     overlay_consumer_content(conn, descriptors, gate, &mut blocks)?;
     Ok(resolve_quotes(
-        conn,
-        Some(conversation_id),
+        QuoteScope::new(conn, descriptors, gate, Some(conversation_id)),
         resolve_reasoning_payloads(conn, blocks),
     ))
 }
@@ -135,11 +134,12 @@ pub(super) fn load_single_block(
     overlay_consumer_content(conn, descriptors, gate, &mut blocks)?;
     // No conversation is named here, so a quote resolves along whichever
     // conversation carries the quoting block.
-    Ok(
-        resolve_quotes(conn, None, resolve_reasoning_payloads(conn, blocks))
-            .into_iter()
-            .next(),
+    Ok(resolve_quotes(
+        QuoteScope::new(conn, descriptors, gate, None),
+        resolve_reasoning_payloads(conn, blocks),
     )
+    .into_iter()
+    .next())
 }
 
 fn col_opt<T: rusqlite::types::FromSql>(
@@ -525,18 +525,74 @@ fn load_reasoning_details(conn: &Connection, block_id: i64) -> Vec<ReasoningDeta
     .unwrap_or_default()
 }
 
-fn resolve_quotes(
-    conn: &Connection,
+/// What a quote resolves against.
+///
+/// A quote's text is not one lookup but four facts held together: the
+/// connection, the conversation whose visibility bounds the span, the
+/// descriptor set that says which consumer kinds carry quotable text and in
+/// which column, and the domain gate those descriptor reads answer to. The
+/// three call sites — the block loader, the drafts preview and the fork's
+/// target collection — each build one of these and hand it over whole, so
+/// none of them can supply three of the four and quietly resolve differently
+/// from the other two.
+#[derive(Clone, Copy)]
+pub(super) struct QuoteScope<'a> {
+    conn: &'a Connection,
+    descriptors: &'a [ContentDescriptor],
+    gate: &'a DomainGate,
+    /// The conversation the quote is read from, or `None` when the caller was
+    /// handed a bare block id.
     conversation_id: Option<i64>,
-    mut blocks: Vec<Block>,
-) -> Vec<Block> {
+}
+
+impl<'a> QuoteScope<'a> {
+    pub(super) fn new(
+        conn: &'a Connection,
+        descriptors: &'a [ContentDescriptor],
+        gate: &'a DomainGate,
+        conversation_id: Option<i64>,
+    ) -> Self {
+        Self {
+            conn,
+            descriptors,
+            gate,
+            conversation_id,
+        }
+    }
+
+    /// The same scope read from another conversation — how the single-block
+    /// load, handed no conversation, resolves along whichever one carries the
+    /// quoting block.
+    fn within(self, conversation_id: Option<i64>) -> Self {
+        Self {
+            conversation_id,
+            ..self
+        }
+    }
+
+    /// The stored type strings whose descriptors declare quotable text. This
+    /// is compile-time descriptor data, so span membership never depends on
+    /// runtime state.
+    fn quotable_kinds(self) -> Vec<&'a str> {
+        self.descriptors
+            .iter()
+            .filter(|d| d.quoted_text_column.is_some())
+            .flat_map(|d| d.kinds.iter().copied())
+            .collect()
+    }
+}
+
+fn resolve_quotes(scope: QuoteScope<'_>, mut blocks: Vec<Block>) -> Vec<Block> {
     for block in &mut blocks {
         if block.block_type == "quote" {
-            let quoting_conversation = conversation_id.or_else(|| conversation_of(conn, block.id));
+            let scope = scope.within(
+                scope
+                    .conversation_id
+                    .or_else(|| conversation_of(scope.conn, block.id)),
+            );
             let field = |name: &str| block.fields.get(name).and_then(Value::as_i64).unwrap_or(0);
             let text = resolve_quote_text(
-                conn,
-                quoting_conversation,
+                scope,
                 field("start_block_id"),
                 field("start_pos"),
                 field("end_block_id"),
@@ -563,8 +619,8 @@ fn conversation_of(conn: &Connection, block_id: i64) -> Option<i64> {
 
 /// Resolve quote text from a block range.
 ///
-/// Collects text content from every text block the range covers, then applies
-/// the character offsets on the first and last.
+/// Collects text content from every text-carrying block the range covers, then
+/// applies the character offsets on the first and last.
 ///
 /// **The range covers only what the quoting conversation can see** — its own
 /// blocks and the detached ones a fork cloned for it. Block ids are global and
@@ -573,22 +629,17 @@ fn conversation_of(conn: &Connection, block_id: i64) -> Option<i64> {
 /// — another conversation's text, spliced into a quote nobody wrote that way.
 /// [`quoted_text_blocks`] holds that membership rule for both quote sites.
 pub(super) fn resolve_quote_text(
-    conn: &Connection,
-    conversation_id: Option<i64>,
+    scope: QuoteScope<'_>,
     start_block_id: i64,
     start_pos: i64,
     end_block_id: i64,
     end_pos: i64,
 ) -> String {
     if start_block_id == end_block_id {
-        // Single-block quote — just a substring. No range, so nothing to walk.
-        let full: String = conn
-            .query_row(
-                "SELECT COALESCE(bt.content, '') FROM block_text bt WHERE bt.block_id = ?1",
-                [start_block_id],
-                |row| row.get(0),
-            )
-            .unwrap_or_default();
+        // Single-block quote — just a substring. No range, so nothing to walk,
+        // and no membership rule to apply: exactly as it has always been for
+        // the library's own text.
+        let full = single_quoted_text(scope, start_block_id);
         let s = usize::try_from(start_pos.max(0)).unwrap_or(0);
         let e = usize::try_from(end_pos.max(0)).unwrap_or(0).min(full.len());
         return if s < e {
@@ -598,7 +649,7 @@ pub(super) fn resolve_quote_text(
         };
     }
 
-    let parts = quoted_text_blocks(conn, conversation_id, start_block_id, end_block_id);
+    let parts = quoted_text_blocks(scope, start_block_id, end_block_id);
 
     let mut result = String::new();
     for (id, text) in &parts {
@@ -620,7 +671,23 @@ pub(super) fn resolve_quote_text(
 ///
 /// This is the one place that decides what "between these two blocks" means,
 /// and both quote sites — the resolved text and the fork's target collection —
-/// go through it, so the two can never answer differently.
+/// go through it for every RANGE, so the two can never answer differently
+/// there. A single-block quote is the one asymmetry: resolution takes the
+/// membership-free substring path above, while the fork's collection still
+/// walks through here — a shape the library has always had for its own text.
+///
+/// **Text-carrying means a `block_text` row OR a declaration.** The library's
+/// own text kinds store their content in `block_text`; a consumer kind carries
+/// quotable text when its descriptor names the column
+/// ([`ContentDescriptor::quoted_text_column`]), and only then. That
+/// declaration is compile-time data, so what a span covers is a static fact:
+/// a kind that declares nothing is not a member, which is exactly the walk as
+/// it stood before consumer kinds could be quoted at all, and a kind that
+/// declares one IS a member even while its domain gate is shut. Membership and
+/// text are decided separately on purpose — the fork's deep copy takes this
+/// walk as its copy set, so a span that shrank when a consumer migration
+/// failed would make a fork copy a different set of blocks depending on
+/// runtime health.
 ///
 /// **A block is in the range when it lies between the endpoints AND belongs to
 /// the quoting conversation** — where belonging has two shapes, because a quote
@@ -653,19 +720,52 @@ pub(super) fn resolve_quote_text(
 /// until then the fork's single transaction is what keeps its clones
 /// consecutive.
 pub(super) fn quoted_text_blocks(
-    conn: &Connection,
-    conversation_id: Option<i64>,
+    scope: QuoteScope<'_>,
     start_block_id: i64,
     end_block_id: i64,
 ) -> Vec<(i64, String)> {
+    let mut members = span_members(scope, start_block_id, end_block_id);
+    fill_declared_text(scope, &mut members);
+    members
+        .into_iter()
+        .map(|member| (member.id, member.text.unwrap_or_default()))
+        .collect()
+}
+
+/// One block a quote span covers: its id, its stored type, and its
+/// `block_text` content where it has one.
+///
+/// `text: None` is "no `block_text` row", which is the question the descriptor
+/// half of the resolution answers — and, once that has had its turn, is the
+/// absence that resolves to the empty string.
+struct SpanMember {
+    id: i64,
+    block_type: String,
+    text: Option<String>,
+}
+
+/// The span's membership walk: the endpoints, the quoting conversation's
+/// visibility, and the text-carrying rule, in one statement.
+fn span_members(scope: QuoteScope<'_>, start_block_id: i64, end_block_id: i64) -> Vec<SpanMember> {
     // Conversation ids start at 1, so a caller holding no conversation passes 0
     // and the junction half of the rule matches nothing — leaving the detached
     // half standing alone, which is the whole answer available to it.
-    let quoting = conversation_id.unwrap_or(0);
-    let sql = "SELECT b.id, COALESCE(bt.content, '')
+    let quoting = scope.conversation_id.unwrap_or(0);
+    let quotable_kinds = scope.quotable_kinds();
+    // Bound, never interpolated: a stored type string is consumer-supplied and
+    // is not checked as an identifier anywhere. The list is empty for a
+    // core-only store, and `IN ()` is legal in this engine — it matches
+    // nothing, which is precisely the answer a store with no declaration owes.
+    let kind_placeholders = (0..quotable_kinds.len())
+        .map(|i| format!("?{}", i + 4))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT b.id, b.block_type, bt.content
              FROM blocks b
-             JOIN block_text bt ON bt.block_id = b.id
+             LEFT JOIN block_text bt ON bt.block_id = b.id
              WHERE b.id >= ?2 AND b.id <= ?3
+               AND (bt.block_id IS NOT NULL OR b.block_type IN ({kind_placeholders}))
                AND (
                    EXISTS (
                        SELECT 1 FROM conversation_blocks cb
@@ -675,16 +775,107 @@ pub(super) fn quoted_text_blocks(
                        SELECT 1 FROM conversation_blocks cb WHERE cb.block_id = b.id
                    )
                )
-             ORDER BY b.id";
-    let params = [quoting, start_block_id, end_block_id];
+             ORDER BY b.id"
+    );
 
-    conn.prepare(sql)
+    let mut params: Vec<rusqlite::types::Value> =
+        vec![quoting.into(), start_block_id.into(), end_block_id.into()];
+    params.extend(
+        quotable_kinds
+            .iter()
+            .map(|kind| rusqlite::types::Value::Text((*kind).to_owned())),
+    );
+
+    scope
+        .conn
+        .prepare(&sql)
         .and_then(|mut stmt| {
-            let rows: Vec<(i64, String)> = stmt
-                .query_map(params, |row| Ok((row.get(0)?, row.get(1)?)))?
+            let rows: Vec<SpanMember> = stmt
+                .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                    Ok(SpanMember {
+                        id: row.get(0)?,
+                        block_type: row.get(1)?,
+                        text: row.get(2)?,
+                    })
+                })?
                 .filter_map(Result::ok)
                 .collect();
             Ok(rows)
         })
         .unwrap_or_default()
+}
+
+/// The `block_text`-less members' text, read from whichever descriptor claims
+/// their kind through its declared quotable column.
+///
+/// **A closed domain gate declines the read.** A failed consumer migration
+/// leaves that domain's schema in doubt, and the store's standing discipline
+/// is that nothing runs raw against it; a quote is display enrichment, so
+/// declining leaves the member's text absent — the empty resolution the
+/// projection renders as nothing — instead of failing every load of every
+/// conversation that happens to hold such a quote. The member stays in the
+/// span either way: membership is the declaration's answer, not the gate's.
+fn fill_declared_text(scope: QuoteScope<'_>, members: &mut [SpanMember]) {
+    for descriptor in scope.descriptors {
+        if descriptor.quoted_text_column.is_none() {
+            continue;
+        }
+        let targets: Vec<usize> = members
+            .iter()
+            .enumerate()
+            .filter(|(_, member)| {
+                member.text.is_none() && descriptor.kinds.contains(&member.block_type.as_str())
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if targets.is_empty() || scope.gate.ensure(descriptor.domain).is_err() {
+            continue;
+        }
+
+        let ids: Vec<i64> = targets.iter().map(|&index| members[index].id).collect();
+        // A read that fails leaves the text absent, which is how every other
+        // failure this resolver can meet already answers.
+        let found = read_quoted_text(scope.conn, descriptor, &ids).unwrap_or_default();
+        for index in targets {
+            members[index].text = found.get(&members[index].id).cloned();
+        }
+    }
+}
+
+/// The single-block path's text: one block's `block_text` content, or its
+/// declared quotable column where it has no `block_text` row.
+///
+/// It runs the same two-source rule [`fill_declared_text`] holds, on a span of
+/// one, so the single-block and range paths can never disagree about where a
+/// kind's text comes from. What it does NOT run is the membership rule: a
+/// single-block quote names its block outright, exactly as it always has for
+/// the library's own text.
+fn single_quoted_text(scope: QuoteScope<'_>, block_id: i64) -> String {
+    let Some(member) = scope
+        .conn
+        .query_row(
+            "SELECT b.id, b.block_type, bt.content
+             FROM blocks b
+             LEFT JOIN block_text bt ON bt.block_id = b.id
+             WHERE b.id = ?1",
+            [block_id],
+            |row| {
+                Ok(SpanMember {
+                    id: row.get(0)?,
+                    block_type: row.get(1)?,
+                    text: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    else {
+        return String::new();
+    };
+
+    let mut members = [member];
+    fill_declared_text(scope, &mut members);
+    let [member] = members;
+    member.text.unwrap_or_default()
 }

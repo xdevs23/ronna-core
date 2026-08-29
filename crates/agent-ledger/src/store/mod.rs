@@ -1478,9 +1478,10 @@ mod tests {
         // Both cloned, target first: the answer's anchor follows the clone.
         let c2 = make_conv(&s, "p1", "model").await;
         let descriptors = s.descriptors;
+        let gate = s.gate.clone();
         let (msg_clone, answer_clone) = s
             .run(move |conn| {
-                let mut cloner = block_cloner::BlockCloner::new(conn, descriptors);
+                let mut cloner = block_cloner::BlockCloner::new(conn, descriptors, &gate);
                 let m = cloner.clone_linked(msg, c2)?;
                 let a = cloner.clone_linked(answer, c2)?;
                 Ok((m, a))
@@ -1496,9 +1497,10 @@ mod tests {
 
         // The answer alone: the anchor is kept, naming the source's block.
         let c3 = make_conv(&s, "p1", "model").await;
+        let gate = s.gate.clone();
         let kept_clone = s
             .run(move |conn| {
-                let mut cloner = block_cloner::BlockCloner::new(conn, descriptors);
+                let mut cloner = block_cloner::BlockCloner::new(conn, descriptors, &gate);
                 cloner.clone_linked(answer, c3)
             })
             .await
@@ -1549,9 +1551,10 @@ mod tests {
         // reference — the cross-conversation shape deletion has to null.
         let c2 = make_conv(&s, "p1", "model").await;
         let descriptors = s.descriptors;
+        let gate = s.gate.clone();
         let fork_answer = s
             .run(move |conn| {
-                let mut cloner = block_cloner::BlockCloner::new(conn, descriptors);
+                let mut cloner = block_cloner::BlockCloner::new(conn, descriptors, &gate);
                 cloner.clone_linked(answer, c2)
             })
             .await

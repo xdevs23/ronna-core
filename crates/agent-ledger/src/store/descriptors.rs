@@ -180,6 +180,34 @@ pub struct ContentDescriptor {
     /// asserts the two agree for every kind a descriptor set declares, and a
     /// consumer's conformance tests run it over their set.
     pub ephemeral: bool,
+    /// The one declared column holding this kind's quotable text, if the kind
+    /// has one. `None` — the default a kind takes by saying nothing — means
+    /// the kind's content cannot be quoted: a quote spanning it resolves to
+    /// the empty string, which the projection renders as nothing.
+    ///
+    /// A quote block stores a span reference and resolves it to text at
+    /// store-read time, before any kind is parsed, so the resolver cannot ask
+    /// the kind what it says. This declaration is how a kind answers that
+    /// question in advance, and it is the ONLY thing that makes a consumer
+    /// kind reachable by a quote.
+    ///
+    /// **The declaration is what a span covers, and the gate is what it
+    /// reads.** A kind naming a column here joins the quote range walk as a
+    /// member — a compile-time fact, so what a span covers never depends on
+    /// runtime state, and the fork's deep copy (which copies exactly the
+    /// span's members) is decided the same way. The column's TEXT, by
+    /// contrast, is read under the descriptor's domain gate like every other
+    /// descriptor-path read: with that domain's migrations in a failed state
+    /// the resolver declines the read and the quote resolves empty, rather
+    /// than running raw against a schema in doubt.
+    ///
+    /// Validated at open: the name must be one of this descriptor's own
+    /// [`columns`](Self::columns), declared [`ColumnType::Text`] — by
+    /// variant, so [`ColumnType::Json`] is refused even though the store
+    /// keeps JSON in a text column — never the `role` column, and never on an
+    /// [`ephemeral`](Self::ephemeral) kind, whose rows finalization deletes
+    /// out from under every quote of them.
+    pub quoted_text_column: Option<&'static str>,
 }
 
 /// One domain's migrations, submitted at open. Entry `i` of `sqls` is that
@@ -369,6 +397,7 @@ pub const fn concat_descriptors<const N: usize>(
         columns: &[],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     };
     let mut out = [placeholder; N];
     let mut at = 0;
@@ -536,7 +565,8 @@ pub(super) fn validate(
 /// existence, the role column's text form, and — for every declared type —
 /// that the column's affinity holds it losslessly. BLOB affinity (a declared
 /// BLOB or a typeless column) holds nothing and is refused here at open,
-/// instead of erroring on first read.
+/// instead of erroring on first read. The quotable-text declaration is checked
+/// here too, against the same declared columns.
 fn validate_columns(
     descriptor: &ContentDescriptor,
     shape: &[TableColumn],
@@ -583,6 +613,57 @@ fn validate_columns(
                 column.name, column.ty, existing.declared_type
             ));
         }
+    }
+
+    validate_quotable_column(descriptor, &fail)?;
+    Ok(())
+}
+
+/// The quotable-text declaration against the declaration it points into.
+///
+/// A wrong declaration is refused at open rather than left to answer quotes
+/// with nonsense: the quote resolver reads this column raw into the quoted
+/// span, so a name that resolves to nothing, to a serialized payload, to a
+/// role word, or to a row finalization is about to delete is a mistake in the
+/// descriptor and nowhere else.
+fn validate_quotable_column(
+    descriptor: &ContentDescriptor,
+    fail: &impl Fn(String) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let Some(quotable) = descriptor.quoted_text_column else {
+        return Ok(());
+    };
+
+    let Some(column) = descriptor.columns.iter().find(|c| c.name == quotable) else {
+        return fail(format!(
+            "quoted_text_column '{quotable}' is not one of the descriptor's declared \
+             columns — a quote reads the column through this declaration, so it must \
+             name one the descriptor already declares"
+        ));
+    };
+    if quotable == ROLE_COLUMN {
+        return fail(
+            "quoted_text_column names the role column, which carries the block's \
+             voice — a quote of it would resolve to the literal role word, never to \
+             what the block said"
+                .into(),
+        );
+    }
+    // By VARIANT, not by affinity: the store keeps JSON in a text column, so
+    // an affinity check would admit ColumnType::Json and splice a serialized
+    // payload into quoted text.
+    if column.ty != ColumnType::Text {
+        return fail(format!(
+            "quoted_text_column '{quotable}' is declared {:?}; quotable text is \
+             ColumnType::Text",
+            column.ty
+        ));
+    }
+    if descriptor.ephemeral {
+        return fail(format!(
+            "quoted_text_column '{quotable}' is declared on an ephemeral kind, whose \
+             rows finalization deletes — every quote of it would dangle by design"
+        ));
     }
     Ok(())
 }
@@ -904,6 +985,45 @@ fn read_content_rows(
                 }
             }
             out.insert(block_id, (role, fields));
+        }
+    }
+    Ok(out)
+}
+
+/// One batch read of a descriptor's declared quotable column: block id to
+/// text, for the quote resolver.
+///
+/// A descriptor with no [`quoted_text_column`](ContentDescriptor::quoted_text_column)
+/// answers with nothing, which is how a kind that never declared one resolves
+/// empty without a special case anywhere upstream. A row whose column is NULL
+/// answers with the empty string through `COALESCE` — the shape an erased
+/// message takes, and the reason erasure needs no special case here either. A
+/// block with no row at all is simply absent from the map, exactly as a
+/// missing `block_text` row is.
+///
+/// The caller consults the domain gate before calling: this runs raw, so
+/// nothing may call it for a domain whose migrations are in a failed state.
+pub(super) fn read_quoted_text(
+    conn: &Connection,
+    descriptor: &ContentDescriptor,
+    ids: &[i64],
+) -> Result<HashMap<i64, String>, StoreError> {
+    let Some(column) = descriptor.quoted_text_column else {
+        return Ok(HashMap::new());
+    };
+
+    let mut out = HashMap::new();
+    for chunk in ids.chunks(READ_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT block_id, COALESCE({}, '') FROM {} WHERE block_id IN ({placeholders})",
+            quoted(column),
+            quoted(descriptor.table)
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter()))?;
+        while let Some(row) = rows.next()? {
+            out.insert(row.get(0)?, row.get(1)?);
         }
     }
     Ok(out)
@@ -1486,6 +1606,7 @@ mod tests {
             columns: &[],
             reference_columns: &[],
             ephemeral: false,
+            quoted_text_column: None,
         },
         ContentDescriptor {
             table: "core_ephemeral_check",
@@ -1494,6 +1615,7 @@ mod tests {
             columns: &[],
             reference_columns: &[],
             ephemeral: true,
+            quoted_text_column: None,
         },
     ];
 
@@ -1585,6 +1707,7 @@ mod tests {
                 column: "about_block_id",
             }],
             ephemeral: false,
+            quoted_text_column: None,
         },
         ContentDescriptor {
             table: "block_note_draft",
@@ -1593,6 +1716,7 @@ mod tests {
             columns: &[Column::new("body", ColumnType::Text)],
             reference_columns: &[],
             ephemeral: true,
+            quoted_text_column: None,
         },
     ];
 
@@ -1842,6 +1966,7 @@ mod tests {
         ],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     const PROBE_SCHEMA: &str = "
@@ -1952,6 +2077,7 @@ mod tests {
             column: "order",
         }],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     const KEYWORD_SCHEMA: &str = "
@@ -1998,6 +2124,7 @@ mod tests {
         columns: &[Column::new("order", ColumnType::Integer)],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     /// The registry refuses a reopen whose descriptors rename a kind, not only
@@ -2225,6 +2352,7 @@ mod tests {
             columns: &[Column::new("target_block_id", ColumnType::Integer)],
             reference_columns: &[],
             ephemeral: false,
+            quoted_text_column: None,
         },
         ContentDescriptor {
             table: "block_label",
@@ -2236,6 +2364,7 @@ mod tests {
                 column: "target_block_id",
             }],
             ephemeral: false,
+            quoted_text_column: None,
         },
     ];
 
@@ -2574,6 +2703,7 @@ mod tests {
         columns: &[],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     static COLLIDING_COLUMN: &[ContentDescriptor] = &[ContentDescriptor {
@@ -2583,6 +2713,7 @@ mod tests {
         columns: &[Column::new("type", ColumnType::Text)],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     static UNDECLARED_COLUMN: &[ContentDescriptor] = &[ContentDescriptor {
@@ -2592,6 +2723,7 @@ mod tests {
         columns: &[Column::new("no_such_column", ColumnType::Text)],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     static ANCHOR_COLUMN: &[ContentDescriptor] = &[ContentDescriptor {
@@ -2601,6 +2733,7 @@ mod tests {
         columns: &[Column::new("dispatch_anchor", ColumnType::Integer)],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     static CORE_KIND_COLLISION: &[ContentDescriptor] = &[ContentDescriptor {
@@ -2610,6 +2743,7 @@ mod tests {
         columns: &[Column::new("body", ColumnType::Text)],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     static CORE_TABLE_COLLISION: &[ContentDescriptor] = &[ContentDescriptor {
@@ -2619,6 +2753,7 @@ mod tests {
         columns: &[],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     static CORE_DOMAIN_CLAIM: &[ContentDescriptor] = &[ContentDescriptor {
@@ -2628,6 +2763,7 @@ mod tests {
         columns: &[Column::new("body", ColumnType::Text)],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     static CORE_TABLE_REFERENCE: &[ContentDescriptor] = &[ContentDescriptor {
@@ -2640,6 +2776,7 @@ mod tests {
             column: "source_block_id",
         }],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     /// Two shapes of the same broken key: a `block_id` whose foreign key has
@@ -2668,6 +2805,7 @@ mod tests {
         columns: &[Column::new("body", ColumnType::Text)],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     static KEYLESS: &[ContentDescriptor] = &[ContentDescriptor {
@@ -2677,6 +2815,7 @@ mod tests {
         columns: &[Column::new("body", ColumnType::Text)],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     static KIND_CLAIMED_TWICE: &[ContentDescriptor] = &[
@@ -2687,6 +2826,7 @@ mod tests {
             columns: &[Column::new("body", ColumnType::Text)],
             reference_columns: &[],
             ephemeral: false,
+            quoted_text_column: None,
         },
         ContentDescriptor {
             table: "block_note_draft",
@@ -2695,6 +2835,7 @@ mod tests {
             columns: &[Column::new("body", ColumnType::Text)],
             reference_columns: &[],
             ephemeral: true,
+            quoted_text_column: None,
         },
     ];
 
@@ -2857,6 +2998,7 @@ mod tests {
         columns: &[Column::new("body", ColumnType::Text)],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     static NO_ROWID: &[ContentDescriptor] = &[ContentDescriptor {
@@ -2866,6 +3008,7 @@ mod tests {
         columns: &[Column::new("body", ColumnType::Text)],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     static BLOB_COLUMN: &[ContentDescriptor] = &[ContentDescriptor {
@@ -2875,6 +3018,7 @@ mod tests {
         columns: &[Column::new("body", ColumnType::Text)],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     #[tokio::test]
@@ -2918,6 +3062,7 @@ mod tests {
         columns: &[Column::new("about_block_id", ColumnType::Json)],
         reference_columns: &[],
         ephemeral: false,
+        quoted_text_column: None,
     }];
 
     #[tokio::test]
@@ -3378,5 +3523,640 @@ mod tests {
             blocks[2].fields["date"], "2026-08-27",
             "the copied marker carries the date it recorded, not today's"
         );
+    }
+
+    // ─── Quote reach: the declared column a quote resolves through ───────
+
+    /// A consumer kind that carries quotable text, plus a second declared
+    /// column the fork's clone must carry across untouched. `body` is
+    /// deliberately nullable: an erased row is a null text column, and the
+    /// resolver must answer that with the empty string and no special case.
+    static REMARK_DESCRIPTORS: &[ContentDescriptor] = &[ContentDescriptor {
+        table: "block_remark",
+        domain: "remarks",
+        kinds: &["remark"],
+        columns: &[
+            Column::new("role", ColumnType::Text),
+            Column::new("body", ColumnType::Text),
+            Column::new("origin", ColumnType::Text),
+        ],
+        reference_columns: &[],
+        ephemeral: false,
+        quoted_text_column: Some("body"),
+    }];
+
+    const REMARK_SCHEMA: &str = "
+        CREATE TABLE block_remark (
+            block_id INTEGER PRIMARY KEY REFERENCES blocks(id) ON DELETE CASCADE,
+            role     TEXT,
+            body     TEXT,
+            origin   TEXT
+        );";
+
+    fn remark_migrations() -> Vec<super::DomainMigrations> {
+        vec![super::DomainMigrations {
+            domain: "remarks",
+            sqls: vec![REMARK_SCHEMA],
+        }]
+    }
+
+    fn remark_store() -> Store {
+        Store::in_memory_with(StoreConfig {
+            descriptors: REMARK_DESCRIPTORS,
+            domain_migrations: remark_migrations(),
+        })
+        .unwrap()
+    }
+
+    fn remark_fields(body: &str, origin: &str) -> Map<String, Value> {
+        let mut fields = Map::new();
+        fields.insert("body".into(), Value::String(body.into()));
+        fields.insert("origin".into(), Value::String(origin.into()));
+        fields
+    }
+
+    /// A remark in its own voice — role-less, so it trips no date marker and
+    /// the pins below say what they mean about the blocks they name.
+    async fn append_remark(s: &Store, conv: i64, body: &str, origin: &str) -> i64 {
+        s.append_consumer_block(conv, None, "remark", remark_fields(body, origin), None)
+            .await
+            .unwrap()
+    }
+
+    async fn quote_of(s: &Store, conv: i64, start: i64, from: i64, end: i64, to: i64) -> i64 {
+        s.insert_user_blocks(
+            conv,
+            vec![crate::types::InputBlock::Quote {
+                start_block_id: start,
+                start_pos: from,
+                end_block_id: end,
+                end_pos: to,
+            }],
+        )
+        .await
+        .unwrap()[0]
+    }
+
+    async fn loaded_quote(s: &Store, conv: i64) -> Block {
+        s.list_blocks(conv)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|b| b.block_type == "quote")
+            .expect("the conversation holds its quote")
+    }
+
+    /// What a block contributes to a model request, through the real
+    /// projection fold rather than a re-implementation of it.
+    fn projected(block: &Block) -> String {
+        match crate::providers::render_blocks_to_text::<crate::agency::BlockKind>(
+            std::slice::from_ref(block),
+        ) {
+            crate::providers::MessageContent::Text(text) => text,
+            parts @ crate::providers::MessageContent::Parts(_) => {
+                panic!("a quote contributes text, got {parts:?}")
+            }
+        }
+    }
+
+    /// AC2 and AC3: a quote of a declared consumer kind resolves that kind's
+    /// column, sliced by CHARACTER offsets — the multibyte span slices between
+    /// characters, never through one — and reaches the model as a rendered
+    /// quote. Before the declaration existed, the resolver read `block_text`
+    /// alone and this came back empty.
+    #[tokio::test]
+    async fn a_quote_of_a_declared_consumer_kind_resolves_its_column() {
+        let s = remark_store();
+        let conv = make_conv(&s).await;
+        let remark = append_remark(&s, conv, "grüße — a naïve ☕ note", "somewhere").await;
+        quote_of(&s, conv, remark, 2, remark, 7).await;
+
+        let quote = loaded_quote(&s, conv).await;
+        assert_eq!(
+            quote.fields["text"].as_str().unwrap(),
+            "üße —",
+            "the slice runs from character 2 to character 7, not from byte 2 to byte 7"
+        );
+        assert_eq!(projected(&quote), "> üße —");
+    }
+
+    /// AC4, the conversation half: the membership rule holds for consumer
+    /// blocks exactly as it does for the library's own text. Block ids are
+    /// global, so another conversation's remark landing between the endpoints
+    /// would otherwise be spliced into a quote nobody wrote that way.
+    #[tokio::test]
+    async fn a_consumer_range_quote_reads_only_its_own_conversation() {
+        let s = remark_store();
+        let quoting = make_conv(&s).await;
+        let other = make_conv(&s).await;
+
+        let first = append_remark(&s, quoting, "the beginning", "here").await;
+        append_remark(&s, other, "INTRUDER", "elsewhere").await;
+        let last = append_remark(&s, quoting, " and the end", "here").await;
+        quote_of(&s, quoting, first, 4, last, 8).await;
+
+        let quote = loaded_quote(&s, quoting).await;
+        assert_eq!(quote.fields["text"].as_str().unwrap(), "beginning and the");
+    }
+
+    /// AC4, the date-marker half: a marker sitting inside a quoted span
+    /// contributes nothing, and does so for a stated reason rather than by
+    /// luck — no descriptor can claim the `date_marker` kind (the core-kinds
+    /// collision refusal), so no descriptor declares quotable text for it and
+    /// the widened walk never admits it.
+    #[tokio::test]
+    async fn a_date_marker_inside_a_quoted_span_contributes_nothing() {
+        let s = remark_store();
+        let conv = make_conv(&s).await;
+
+        let first = s
+            .append_consumer_block_stamped(
+                conv,
+                Some(Role::User),
+                "remark",
+                remark_fields("said today", "here"),
+                None,
+                DateStamp::date_only("2026-08-27"),
+            )
+            .await
+            .unwrap();
+        let last = s
+            .append_consumer_block_stamped(
+                conv,
+                Some(Role::User),
+                "remark",
+                remark_fields(" said tomorrow", "here"),
+                None,
+                DateStamp::date_only("2026-08-28"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            kinds_of(&s, conv).await,
+            vec!["date_marker", "remark", "date_marker", "remark"],
+            "the midnight crossing put a marker inside the span about to be quoted"
+        );
+
+        quote_of(&s, conv, first, 0, last, 14).await;
+        let quote = loaded_quote(&s, conv).await;
+        assert_eq!(
+            quote.fields["text"].as_str().unwrap(),
+            "said today said tomorrow",
+            "the marker between the two remarks is not a member of the span"
+        );
+    }
+
+    /// AC5, first way: a consumer kind that declares no quotable column
+    /// resolves empty and renders as nothing — today's behaviour, now stated
+    /// by the declaration instead of falling out of the resolver's reach.
+    #[tokio::test]
+    async fn a_quote_of_an_undeclared_consumer_kind_resolves_empty() {
+        let s = configured_store();
+        let conv = make_conv(&s).await;
+        let note = s
+            .append_consumer_block(
+                conv,
+                None,
+                "note",
+                note_fields("never quotable", None),
+                None,
+            )
+            .await
+            .unwrap();
+        quote_of(&s, conv, note, 0, note, 5).await;
+
+        let quote = loaded_quote(&s, conv).await;
+        assert_eq!(quote.fields["text"].as_str().unwrap(), "");
+        assert_eq!(projected(&quote), "", "an empty quote renders as nothing");
+    }
+
+    /// AC5, second way: erasure nulls the declared column, and the quote of
+    /// the erased row resolves empty through `COALESCE` — no erasure special
+    /// case anywhere in the resolver, which is what keeps the semantics free.
+    #[tokio::test]
+    async fn a_quote_of_an_erased_row_resolves_empty() {
+        let s = remark_store();
+        let conv = make_conv(&s).await;
+        let remark = append_remark(&s, conv, "about to be erased", "somewhere").await;
+        quote_of(&s, conv, remark, 0, remark, 5).await;
+        assert_eq!(
+            loaded_quote(&s, conv).await.fields["text"]
+                .as_str()
+                .unwrap(),
+            "about",
+            "it resolves before the erasure, so the pin is about the erasure"
+        );
+
+        // The consumer's own erasure pass, standing in for it: the text
+        // column goes null and the row stays.
+        s.run(move |conn| {
+            conn.execute(
+                "UPDATE block_remark SET body = NULL WHERE block_id = ?1",
+                [remark],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let quote = loaded_quote(&s, conv).await;
+        assert_eq!(quote.fields["text"].as_str().unwrap(), "");
+        assert_eq!(projected(&quote), "");
+    }
+
+    /// AC5, third way: a quote whose target is not there at all resolves
+    /// empty. The draft preview is where a dangling reference can actually be
+    /// written — its quote rows carry no foreign key — and it is one of the
+    /// three sites the widened resolver serves.
+    #[tokio::test]
+    async fn a_quote_of_a_missing_block_resolves_empty() {
+        let s = remark_store();
+        let conv = make_conv(&s).await;
+        let remark = append_remark(&s, conv, "the only block there is", "somewhere").await;
+
+        s.save_draft(
+            conv,
+            vec![crate::types::InputBlock::Quote {
+                start_block_id: remark + 10_000,
+                start_pos: 0,
+                end_block_id: remark + 10_000,
+                end_pos: 5,
+            }],
+        )
+        .await
+        .unwrap();
+
+        match &s.load_draft(conv).await.unwrap()[..] {
+            [super::super::drafts::DraftBlock::Quote { text, .. }] => {
+                assert_eq!(text, "", "a target that does not exist resolves empty");
+                assert!(crate::agency::render_quote(text).is_empty());
+            }
+            other => panic!("the draft holds one quote, got {other:?}"),
+        }
+    }
+
+    /// AC5, fourth way, and the no-raw-read proof: a closed domain gate
+    /// resolves the quote empty WITHOUT touching the descriptor's table.
+    ///
+    /// The order is the one the store's lifecycle permits — the quotable
+    /// block is appended while the domain is healthy, the gate is then closed
+    /// through the established failed-migrate pattern, and only then is the
+    /// table taken out from under it with test-owned SQL.
+    ///
+    /// The proof runs in two steps, because the resolver answers in a bare
+    /// `String` and therefore swallows a read failure exactly as it swallows
+    /// every other one: an error alone would be invisible, so absence alone
+    /// cannot prove a read was skipped.
+    ///
+    ///   1. The table is DROPPED: the resolution is empty and the call still
+    ///      returns, which is the decision that a closed gate must not fail a
+    ///      whole conversation load over a quote.
+    ///   2. The table is put back holding text a read WOULD find: the
+    ///      resolution is still empty, and that is what proves no read ran —
+    ///      a resolver that touched the table would answer with what it found
+    ///      there.
+    ///
+    /// The resolver is called directly because that is the only place its
+    /// decline can be observed: the public load of a conversation holding a
+    /// junctioned consumer block already fails whole at the load's own gate
+    /// consult, so the decline matters for detached targets and nothing else.
+    #[tokio::test]
+    async fn a_closed_domain_gate_resolves_a_quote_empty_without_reading_the_table() {
+        let s = remark_store();
+        let conv = make_conv(&s).await;
+        let remark = append_remark(&s, conv, "said while healthy", "somewhere").await;
+
+        assert!(
+            domain_migrate(
+                &s.tx(),
+                "remarks",
+                vec![REMARK_SCHEMA, "CREATE TABLE broken (;"],
+            )
+            .await
+            .is_err(),
+            "the second step fails and the gate records it"
+        );
+
+        let resolve = async || {
+            let descriptors = s.descriptors;
+            let gate = s.gate.clone();
+            s.run(move |conn| {
+                Ok(super::super::blocks::resolve_quote_text(
+                    super::super::blocks::QuoteScope::new(conn, descriptors, &gate, Some(conv)),
+                    remark,
+                    0,
+                    remark,
+                    5,
+                ))
+            })
+            .await
+            .expect("the resolver declines rather than failing the load")
+        };
+
+        s.run(|conn| {
+            conn.execute_batch("DROP TABLE block_remark")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let text = resolve().await;
+        assert_eq!(text, "", "the closed gate joins the absence list");
+        assert!(crate::agency::render_quote(&text).is_empty());
+
+        s.run(move |conn| {
+            conn.execute_batch(REMARK_SCHEMA)?;
+            conn.execute(
+                "INSERT INTO block_remark (block_id, body) VALUES (?1, 'READ ANYWAY')",
+                [remark],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            resolve().await,
+            "",
+            "a resolver that read the table would answer with what is in it"
+        );
+    }
+
+    /// AC6: every wrong quotable declaration is refused at descriptor open,
+    /// each with its own named reason. A declaration that survives open would
+    /// otherwise fail quietly at quote time, one resolved quote at a time.
+    #[tokio::test]
+    async fn open_with_refuses_a_wrong_quotable_declaration() {
+        let (_, reason) = open_fails_with(StoreConfig {
+            descriptors: QUOTABLE_UNDECLARED,
+            domain_migrations: remark_migrations(),
+        });
+        assert!(
+            reason.contains("is not one of the descriptor's declared"),
+            "{reason}"
+        );
+
+        let (_, reason) = open_fails_with(StoreConfig {
+            descriptors: QUOTABLE_NON_TEXT,
+            domain_migrations: remark_migrations(),
+        });
+        assert!(reason.contains("is declared Integer"), "{reason}");
+
+        // JSON lives in a text column, so an affinity check would admit it:
+        // the refusal is by declared VARIANT, and this is the pin that says so.
+        let (_, reason) = open_fails_with(StoreConfig {
+            descriptors: QUOTABLE_JSON,
+            domain_migrations: remark_migrations(),
+        });
+        assert!(reason.contains("is declared Json"), "{reason}");
+
+        let (_, reason) = open_fails_with(StoreConfig {
+            descriptors: QUOTABLE_ROLE,
+            domain_migrations: remark_migrations(),
+        });
+        assert!(reason.contains("names the role column"), "{reason}");
+
+        let (_, reason) = open_fails_with(StoreConfig {
+            descriptors: QUOTABLE_EPHEMERAL,
+            domain_migrations: remark_migrations(),
+        });
+        assert!(reason.contains("ephemeral kind"), "{reason}");
+    }
+
+    static QUOTABLE_UNDECLARED: &[ContentDescriptor] = &[ContentDescriptor {
+        table: "block_remark",
+        domain: "remarks",
+        kinds: &["remark"],
+        columns: &[Column::new("body", ColumnType::Text)],
+        reference_columns: &[],
+        ephemeral: false,
+        quoted_text_column: Some("origin"),
+    }];
+
+    static QUOTABLE_NON_TEXT: &[ContentDescriptor] = &[ContentDescriptor {
+        table: "block_remark",
+        domain: "remarks",
+        kinds: &["remark"],
+        columns: &[Column::new("body", ColumnType::Integer)],
+        reference_columns: &[],
+        ephemeral: false,
+        quoted_text_column: Some("body"),
+    }];
+
+    static QUOTABLE_JSON: &[ContentDescriptor] = &[ContentDescriptor {
+        table: "block_remark",
+        domain: "remarks",
+        kinds: &["remark"],
+        columns: &[Column::new("body", ColumnType::Json)],
+        reference_columns: &[],
+        ephemeral: false,
+        quoted_text_column: Some("body"),
+    }];
+
+    static QUOTABLE_ROLE: &[ContentDescriptor] = &[ContentDescriptor {
+        table: "block_remark",
+        domain: "remarks",
+        kinds: &["remark"],
+        columns: &[Column::new("role", ColumnType::Text)],
+        reference_columns: &[],
+        ephemeral: false,
+        quoted_text_column: Some("role"),
+    }];
+
+    static QUOTABLE_EPHEMERAL: &[ContentDescriptor] = &[ContentDescriptor {
+        table: "block_remark",
+        domain: "remarks",
+        kinds: &["remark"],
+        columns: &[Column::new("body", ColumnType::Text)],
+        reference_columns: &[],
+        ephemeral: true,
+        quoted_text_column: Some("body"),
+    }];
+
+    /// AC7: the loader, the drafts preview and the fork all resolve the same
+    /// span to the same text — one resolver, three callers, no second
+    /// decision. The fork's clone is checked in the same pin: the copied row
+    /// lands in the consumer's own table carrying EVERY declared column, which
+    /// is what puts it where the consumer's person-keyed erasure already walks.
+    /// (That erasure's reach over clones is the consumer's own pin, not this
+    /// one's.)
+    #[tokio::test]
+    async fn all_three_quote_sites_resolve_a_consumer_span_identically() {
+        let s = remark_store();
+        let conv = make_conv(&s).await;
+        let remark = append_remark(&s, conv, "what was said earlier", "somewhere").await;
+        quote_of(&s, conv, remark, 5, remark, 14).await;
+
+        let loaded = loaded_quote(&s, conv).await;
+        assert_eq!(loaded.fields["text"].as_str().unwrap(), "was said ");
+
+        s.save_draft(
+            conv,
+            vec![crate::types::InputBlock::Quote {
+                start_block_id: remark,
+                start_pos: 5,
+                end_block_id: remark,
+                end_pos: 14,
+            }],
+        )
+        .await
+        .unwrap();
+        match &s.load_draft(conv).await.unwrap()[..] {
+            [super::super::drafts::DraftBlock::Quote { text, .. }] => {
+                assert_eq!(text, "was said ", "the preview resolves what the load does");
+            }
+            other => panic!("the draft holds one quote, got {other:?}"),
+        }
+
+        let thread = s
+            .fork_continuation(
+                conv,
+                loaded.id,
+                Continuation::NewThread {
+                    system_prompt: None,
+                },
+                ModelOverride::default(),
+            )
+            .await
+            .unwrap();
+
+        // The source goes away entirely: the fork's quote reads its own
+        // detached clone or it reads nothing.
+        s.delete_conversation(conv).await.unwrap();
+        s.gc_orphan_blocks().await.unwrap();
+
+        let forked = loaded_quote(&s, thread).await;
+        assert_eq!(
+            forked.fields["text"].as_str().unwrap(),
+            "was said ",
+            "the fork resolves what the loader and the preview did"
+        );
+
+        let clone_id = forked.fields["start_block_id"].as_i64().unwrap();
+        assert_ne!(
+            clone_id, remark,
+            "the fork copied the remark rather than pointing at it"
+        );
+        let cloned = s
+            .find_block(clone_id)
+            .await
+            .unwrap()
+            .expect("the clone outlived the source");
+        assert_eq!(cloned.block_type, "remark");
+        assert_eq!(
+            cloned.fields["body"],
+            Value::String("what was said earlier".into())
+        );
+        assert_eq!(
+            cloned.fields["origin"],
+            Value::String("somewhere".into()),
+            "every declared column rode to the clone, not just the quotable one"
+        );
+    }
+
+    /// AC7, the fork's gate consult, pinned through the ONLY shape that
+    /// reaches it. A junctioned consumer block fails the fork earlier, at the
+    /// source load's own gate consult; a DETACHED one is invisible to that
+    /// load and arrives at the clone as a quote target. Before this slice the
+    /// clone ran raw there, because no consumer row could ever be a quote
+    /// target — so this pin passes only with the consult in place.
+    #[tokio::test]
+    async fn a_fork_of_a_detached_consumer_quote_target_refuses_under_a_closed_gate() {
+        let s = remark_store();
+        let conv = make_conv(&s).await;
+        let remark = append_remark(&s, conv, "quoted, then detached", "somewhere").await;
+        let quote = quote_of(&s, conv, remark, 0, remark, 6).await;
+
+        // Detached: the remark keeps its row and leaves the junction, which is
+        // what hides it from the fork's source load and hands it to the clone.
+        s.detach_block(conv, remark).await.unwrap();
+        assert!(
+            !kinds_of(&s, conv).await.contains(&"remark".to_owned()),
+            "the source load no longer sees a consumer block, so its own gate consult stays quiet"
+        );
+
+        assert!(
+            domain_migrate(
+                &s.tx(),
+                "remarks",
+                vec![REMARK_SCHEMA, "CREATE TABLE broken (;"],
+            )
+            .await
+            .is_err()
+        );
+
+        match s
+            .fork_continuation(
+                conv,
+                quote,
+                Continuation::NewThread {
+                    system_prompt: None,
+                },
+                ModelOverride::default(),
+            )
+            .await
+        {
+            Err(StoreError::MigrationFailed { domain, .. }) => assert_eq!(domain, "remarks"),
+            other => {
+                panic!("the fork must refuse loudly with the migration failure, got {other:?}")
+            }
+        }
+
+        let clones: i64 = s
+            .run(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM blocks WHERE block_type = 'remark'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            clones, 1,
+            "nothing was written raw — the source remark stands alone"
+        );
+    }
+
+    /// The membership rule's other consequence for the fork, chosen and
+    /// stated: a declared block whose content row is MISSING is damaged data,
+    /// and it now enters the fork's copy set and fails the fork loudly with
+    /// [`StoreError::MissingBlockContent`]. The walk's old `JOIN` dropped such
+    /// a block on the floor, so the fork quietly produced a thread whose quote
+    /// had lost part of its span. Loud beats silent.
+    #[tokio::test]
+    async fn a_fork_over_a_declared_block_with_no_content_row_fails_loudly() {
+        let s = remark_store();
+        let conv = make_conv(&s).await;
+
+        // A header claiming the declared kind, detached and with no content
+        // row behind it — the damage this pin is about.
+        let damaged = s
+            .run(|conn| {
+                conn.execute("INSERT INTO blocks (block_type) VALUES ('remark')", [])?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+        let quote = quote_of(&s, conv, damaged, 0, damaged, 4).await;
+
+        match s
+            .fork_continuation(
+                conv,
+                quote,
+                Continuation::NewThread {
+                    system_prompt: None,
+                },
+                ModelOverride::default(),
+            )
+            .await
+        {
+            Err(StoreError::MissingBlockContent {
+                block_id,
+                block_type,
+            }) => {
+                assert_eq!(block_id, damaged);
+                assert_eq!(block_type, "remark");
+            }
+            other => panic!("the fork must name the damaged block, got {other:?}"),
+        }
     }
 }
