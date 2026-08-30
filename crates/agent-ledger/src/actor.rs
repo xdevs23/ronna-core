@@ -135,15 +135,17 @@ impl<K: RuntimeKind, E> RuntimeContext<K, E> {
         self
     }
 
-    /// The same context with a different tool-call window on its runner
-    /// (2026-08-30) — the shape above, for the numbers that live on the
-    /// runner instead of here.
+    /// The same context with a different CONVERSATION-wide tool-call window on
+    /// its runner (2026-08-30) — the shape above, for the numbers that live on
+    /// the runner instead of here.
     ///
-    /// Test-only by decision: the window's values are the operator's,
-    /// recorded once as the window's own defaults, and a consumer-facing knob
-    /// would be a second place they are decided. The library's own tests
-    /// build a small window through here so the window's behavior is
-    /// provable without spending sixty calls per assertion.
+    /// Test-only by decision, for the GLOBAL numbers alone: they are the
+    /// operator's, recorded once as the window's own defaults, and a
+    /// consumer-facing knob would be a second place they are decided. The
+    /// library's own tests build a small window through here so the window's
+    /// behavior is provable without spending sixty calls per assertion. A
+    /// window bound to ONE tool is the consumer's own number and has a public
+    /// builder of its own ([`Self::with_tool_window`]).
     ///
     /// The write is construction-time and the type says so: this builder
     /// still holds the runner's sole reference, so `Arc::get_mut` hands over
@@ -159,6 +161,69 @@ impl<K: RuntimeKind, E> RuntimeContext<K, E> {
         Arc::get_mut(&mut self.runner)
             .expect("the tool-call window is set while the context still owns its runner alone")
             .set_window(window);
+        self
+    }
+
+    /// The same context with ONE TOOL bound to a window of its own
+    /// (2026-08-30): exactly `calls` calls of `name` run inside any trailing
+    /// `seconds`, and the next one is refused — it resolves with a tool error
+    /// the model reads and re-plans against instead of running.
+    ///
+    /// PUBLIC, and that is the surface decision: which tools exist and how
+    /// hard one of them may be leaned on is the consumer's knowledge, never
+    /// this library's — nothing here ships a tool name, and a context nobody
+    /// calls this on bounds no tool at all. The conversation-wide window's
+    /// numbers stay the operator's, with no consumer knob at all.
+    ///
+    /// Call it once per tool a deployment wants bounded; a second call for the
+    /// same name replaces that tool's bound. A bound of ZERO calls is legal:
+    /// the count includes the call under admission, so the very first one is
+    /// already past it and the tool always refuses. A refused call stays a
+    /// recorded call — it counts against this window and the conversation's
+    /// alike — and a run of refusals ends the turn on the same consecutive
+    /// limit a conversation-wide run does.
+    ///
+    /// `name` must be a tool this context's registry holds. The registry is
+    /// the whole set of names a call can resolve against, and a bound on
+    /// anything else — a typo — would compile, pass and silently protect
+    /// nothing, so the builder fails loudly instead, the same discipline the
+    /// registry's own registration-collision panic carries.
+    ///
+    /// **Configure every window BEFORE the context is shared.** The write is
+    /// construction-time and the type says so: this builder still holds the
+    /// runner's sole reference, so `Arc::get_mut` hands over the exclusive
+    /// borrow the setter needs, and every reader afterwards takes the bound
+    /// without a lock.
+    ///
+    /// # Panics
+    ///
+    /// If `seconds` is zero or negative — a window needs a span to trail.
+    ///
+    /// If `name` names no tool this context's registry holds.
+    ///
+    /// If the context or its runner is ALREADY SHARED — a clone taken, a
+    /// runtime spawned, or a [`runner()`](Self::runner) `Arc` still held. Any
+    /// of those means a reader that would never see this write, so the
+    /// builder fails loudly here rather than leaving the runtime disagreeing
+    /// with itself about a tool's window.
+    #[must_use]
+    pub fn with_tool_window(mut self, name: impl Into<String>, calls: usize, seconds: i64) -> Self {
+        let name = name.into();
+        assert!(
+            seconds > 0,
+            "a tool's window needs a positive span: `{name}` was given {seconds} seconds"
+        );
+        let runner = Arc::get_mut(&mut self.runner)
+            .expect("a tool's window is set while the context still owns its runner alone");
+        assert!(
+            runner.registry().get(&name).is_some(),
+            "a tool's window is bound to a name nothing registered: `{name}`. The registry \
+             is the whole set of names a call can resolve against — bind only a tool it holds"
+        );
+        runner.set_tool_window(
+            name,
+            crate::tools::runner::ToolWindowBound { calls, seconds },
+        );
         self
     }
 
@@ -1186,8 +1251,9 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         tracing::info!(conversation_id = self.id, "sent stream request to provider");
     }
 
-    /// End the turn that is looping on a spent tool-call window, if this one
-    /// is (2026-08-30) — a WRITE, not a question: the end it decides on is
+    /// End the turn that is looping on a spent tool-call window — the
+    /// conversation's or a single tool's — if this one is (2026-08-30) — a
+    /// WRITE, not a question: the end it decides on is
     /// performed here, in the same call, and `true` is the caller's
     /// instruction to stand its dispatch down.
     ///
@@ -1198,8 +1264,9 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     /// that path writes nothing.
     ///
     /// The rule reads the LEDGER, on the dispatch's own snapshot: when the
-    /// turn's trailing tool outcomes are all the window's refusals, as many
-    /// of them as the window's consecutive limit
+    /// turn's trailing tool outcomes are all rate-limit refusals — either
+    /// window's, since both are written with the one machine prefix — as many
+    /// of them as the ONE consecutive limit the runtime carries
     /// ([`ToolCall::trailing_refusal_run`]), the model has stopped making
     /// progress — a history that deep in refusals has gone bad — and every
     /// further round costs a paid request for another refusal. The turn the
@@ -1254,7 +1321,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
                     conversation_id = self.id,
                     anchor,
                     refusals = limit,
-                    "the tool-call window's refusals ended this turn — standing the \
+                    "a run of tool-call rate-limit refusals ended this turn — standing the \
                      dispatch down"
                 );
             }
@@ -3316,9 +3383,9 @@ mod tests {
         /// rounds before the closing prose, each answering with a call of its
         /// own. A model that never stops asking for tools is what the
         /// tool-call window exists for, and this is that model on the wire —
-        /// the only way to drive a RUN of the window's refusals through the
-        /// real loop instead of writing the refusals into the ledger by
-        /// hand.
+        /// the only way to drive a RUN of rate-limit refusals, either
+        /// window's, through the real loop instead of writing the refusals
+        /// into the ledger by hand.
         ManyToolRounds { rounds: usize },
         /// [`Script::TwoToolRounds`] with round ONE's trailing done HELD:
         /// the message end and the whole tool lifecycle go out at once — so
@@ -6621,9 +6688,10 @@ mod tests {
 
     /// `count` refused rounds on one turn, written the way the runner writes
     /// them: a call anchored on the turn, resolved through the public store
-    /// surface with the window's own refusal — rendered from
-    /// [`small_window`]'s own numbers through the one template, so the text
-    /// here is the text the runner would have written under that window. The
+    /// surface with the conversation window's own refusal — rendered from
+    /// [`small_window`]'s own numbers through that window's template (the
+    /// per-tool window has a template of its own), so the text here is the
+    /// text the runner would have written under that window. The
     /// call block between two errors is the reason the run is read as an
     /// outcome SUBSEQUENCE — two tool errors are never neighbours in a
     /// ledger.
@@ -6941,5 +7009,98 @@ mod tests {
             "the end is anchored on the turn the LEDGER still owed"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ─── The per-tool windows (2026-08-30) ───────────────────────────────
+
+    /// AC3 — the five-rule sees PER-TOOL refusals, through the real loop.
+    /// `echo` alone is bound, at a single call per minute, through the public
+    /// builder a consumer would use. So round one runs, every round after it
+    /// is refused by the TOOL's window — with the tool's own text, not the
+    /// conversation's — and after the fifth of those the would-be
+    /// continuation stands down with no provider request, the turn's end
+    /// written down and anchored on the turn. A model looping on one bounded
+    /// tool ends its turn exactly as a burst does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_of_one_tools_refusals_ends_the_turn() {
+        // The consecutive limit comes off the defaults themselves, the
+        // `small_window` discipline: change the operator's limit and this pin
+        // exercises the new one.
+        let defaults = crate::tools::runner::ToolCallWindow::default();
+        // More rounds than the forced end can consume, so the script never
+        // runs out before the rule fires.
+        let rounds = 4 * defaults.consecutive_limit;
+        let (ctx, conv, probe) = scripted_context(Script::ManyToolRounds { rounds }).await;
+        // The conversation's own window, built UNSPENT for this run: its
+        // calls bound is every round the script brings, farther than the
+        // forced end ever lets the run reach. The premise is this test's own
+        // — nothing is borrowed from the shipped numbers, so nothing here
+        // needs an assert about them — and every refusal below names the
+        // tool's window in its own text.
+        let ctx = ctx
+            .with_tool_call_window(crate::tools::runner::ToolCallWindow {
+                calls: rounds,
+                ..defaults
+            })
+            .with_tool_window("echo", 1, 60);
+        spawn_reactor(ctx.clone());
+
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "hi".into(),
+            }],
+        });
+        let blocks = await_ledger(&ctx, conv, "the forced end", |blocks| {
+            blocks.iter().any(|b| b.block_type == "status")
+        })
+        .await;
+
+        let summons = blocks
+            .iter()
+            .find(|b| b.block_type == "text")
+            .expect("the summoning message")
+            .id;
+        let errors: Vec<&str> = blocks
+            .iter()
+            .filter(|b| b.block_type == "tool_error")
+            .map(|b| b.fields["error"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            errors.len(),
+            defaults.consecutive_limit,
+            "one refusal per round after the tool's window was spent, up to the limit — \
+             got {:?}",
+            blocks
+                .iter()
+                .map(|b| b.block_type.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            errors.iter().all(|error| *error
+                == crate::agency::ToolError::per_tool_rate_limit_refusal("echo", 1, 60)),
+            "every refusal is the TOOL's own, naming the tool and its numbers — got {errors:?}"
+        );
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|b| b.block_type == "tool_result")
+                .count(),
+            1,
+            "the tool's one allowed call ran for real"
+        );
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("tool_calls_exhausted".to_owned(), Some(summons))],
+            "one window's refusals or another's, the forced end writes the same \
+             turn end, anchored on the turn"
+        );
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            1 + defaults.consecutive_limit,
+            "one request per round — the allowed call, then the refusals — and nothing \
+             after the last one — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
     }
 }
