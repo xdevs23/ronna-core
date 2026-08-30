@@ -28,8 +28,9 @@ use crate::tools::CallOrigin;
 use crate::types::ApprovalChoice;
 
 use super::{
-    ToolContext, ToolHandler, ToolOutcome, ToolRegistry, ToolRunner, admission::submit_approval,
-    runner::ToolCallWindow,
+    ToolContext, ToolHandler, ToolOutcome, ToolRegistry, ToolRunner,
+    admission::submit_approval,
+    runner::{ToolCallWindow, ToolWindowBound},
 };
 
 /// A gated tool that counts its executions and answers whatever gate decision
@@ -1501,14 +1502,18 @@ async fn a_panicking_body_releases_its_claim_for_the_next_wakeup() {
 
 /// An ungated tool that counts every body execution. The window's whole claim
 /// is that a refused call never reaches one, so the counter is what proves it.
+///
+/// The name is carried rather than baked in: the per-tool window's whole claim
+/// is that it touches ONE name, which takes a second tool to prove.
 struct CountingTool {
+    name: &'static str,
     executions: Arc<AtomicUsize>,
 }
 
 impl ToolHandler<CoreEvent> for CountingTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "counter".into(),
+            name: self.name.into(),
             description: "a test-only tool that counts its runs".into(),
             parameters: serde_json::json!({ "type": "object" }),
         }
@@ -1526,35 +1531,47 @@ impl ToolHandler<CoreEvent> for CountingTool {
     }
 }
 
-/// A runner over one counting tool, with the window the test chose.
-fn window_runner(window: ToolCallWindow) -> (ToolRunner<BlockKind, CoreEvent>, Arc<AtomicUsize>) {
+/// One counting tool under `name`, and the counter proving whether its body
+/// ran.
+fn register_counter(
+    registry: &mut ToolRegistry<CoreEvent>,
+    name: &'static str,
+) -> Arc<AtomicUsize> {
     let executions = Arc::new(AtomicUsize::new(0));
-    let mut registry = ToolRegistry::new();
     registry.register(
-        "counter",
+        name,
         CountingTool {
+            name,
             executions: Arc::clone(&executions),
         },
     );
+    executions
+}
+
+/// A runner over one counting tool, with the window the test chose.
+fn window_runner(window: ToolCallWindow) -> (ToolRunner<BlockKind, CoreEvent>, Arc<AtomicUsize>) {
+    let mut registry = ToolRegistry::new();
+    let executions = register_counter(&mut registry, "counter");
     let mut runner = ToolRunner::<BlockKind, _>::new(Arc::new(registry));
     runner.set_window(window);
     (runner, executions)
 }
 
-/// Record a call and feed the chokepoint its one wakeup — the whole admission
-/// pass, driven by the test rather than by a loop, so a red result names an
-/// assertion instead of a timeout.
-async fn drive_call(
+/// Record a call of `name` and feed the chokepoint its one wakeup — the whole
+/// admission pass, driven by the test rather than by a loop, so a red result
+/// names an assertion instead of a timeout.
+async fn drive_named_call(
     runner: &ToolRunner<BlockKind, CoreEvent>,
     ctx: &AgencyCtx<CoreEvent>,
     tool_call_id: &str,
+    name: &str,
 ) -> i64 {
     let call = runner
         .insert_call(
             ctx,
             false,
             tool_call_id.into(),
-            "counter".into(),
+            name.into(),
             "{}".into(),
             CallOrigin::default(),
         )
@@ -1562,6 +1579,16 @@ async fn drive_call(
         .unwrap();
     runner.run_wakeup(ctx, false, call).await;
     call
+}
+
+/// [`drive_named_call`] for the counting tool the window pins are written
+/// against.
+async fn drive_call(
+    runner: &ToolRunner<BlockKind, CoreEvent>,
+    ctx: &AgencyCtx<CoreEvent>,
+    tool_call_id: &str,
+) -> i64 {
+    drive_named_call(runner, ctx, tool_call_id, "counter").await
 }
 
 /// Every tool error recorded in the conversation, in ledger order.
@@ -1711,7 +1738,7 @@ async fn refused_calls_keep_counting_against_the_window() {
         .await
         .unwrap();
     assert_eq!(
-        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60),
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60, None),
         7,
         "the fold counts the refused calls too — executed and refused alike"
     );
@@ -1750,7 +1777,7 @@ async fn the_window_counts_an_interactive_call() {
         .await
         .unwrap();
     assert_eq!(
-        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60),
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60, None),
         2,
         "the interactive call counts against the window like every recorded call"
     );
@@ -1759,15 +1786,22 @@ async fn the_window_counts_an_interactive_call() {
 /// A tool-call row as the ledger holds one, stamped `age` seconds ago in the
 /// writer's own form — what a store insert would have written that long back.
 fn aged_call(id: i64, age: i64) -> Block {
+    named_aged_call(id, age, "counter")
+}
+
+/// The same row for whichever tool the test names — what a per-tool count has
+/// to tell apart.
+fn named_aged_call(id: i64, age: i64, name: &str) -> Block {
     stamped_call(
         id,
         (crate::store::now_instant() - chrono::TimeDelta::seconds(age))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
+        name,
     )
 }
 
 /// The same row with whatever stamp text the test names.
-fn stamped_call(id: i64, created_at: String) -> Block {
+fn stamped_call(id: i64, created_at: String, name: &str) -> Block {
     Block {
         id,
         role: Some(crate::block::Role::Assistant),
@@ -1776,7 +1810,7 @@ fn stamped_call(id: i64, created_at: String) -> Block {
         dispatch_anchor: None,
         fields: serde_json::Map::from_iter([
             ("tool_call_id".to_owned(), Value::String(format!("c-{id}"))),
-            ("name".to_owned(), Value::String("counter".into())),
+            ("name".to_owned(), Value::String(name.to_owned())),
             ("input".to_owned(), Value::String("{}".into())),
         ]),
     }
@@ -1797,22 +1831,22 @@ fn the_window_count_stops_at_the_first_call_older_than_the_window() {
         aged_call(4, 50),
         // The schema default's form, reachable only by a fixture writing a row
         // without a stamp: unparseable, and no reason to truncate the count.
-        stamped_call(5, "2026-08-30 12:00:00".into()),
+        stamped_call(5, "2026-08-30 12:00:00".into(), "counter"),
         aged_call(6, 10),
     ];
 
     assert_eq!(
-        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60),
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60, None),
         2,
         "the two calls inside the minute, across the unreadable stamp between them"
     );
     assert_eq!(
-        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 3600),
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 3600, None),
         4,
         "a wider window reaches further back, and stops at the call outside it"
     );
     assert_eq!(
-        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 0),
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 0, None),
         0,
         "a window of no length holds nothing"
     );
@@ -1874,6 +1908,340 @@ async fn a_reopened_ledger_keeps_the_window_spent() {
         error_texts(&ctx).await.len(),
         1,
         "and the refusal is recorded as that call's outcome"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ─── The per-tool windows ────────────────────────────────────────────────────
+
+/// A runner over TWO counting tools — `counter` and `other` — with the
+/// conversation-wide window and whatever per-tool bounds the test named. Two
+/// tools, because the per-tool window's whole claim is that it touches one
+/// name.
+struct ToolWindowRig {
+    runner: ToolRunner<BlockKind, CoreEvent>,
+    counter: Arc<AtomicUsize>,
+    other: Arc<AtomicUsize>,
+}
+
+impl ToolWindowRig {
+    fn new(window: ToolCallWindow, bounds: &[(&str, usize, i64)]) -> Self {
+        let mut registry = ToolRegistry::new();
+        let counter = register_counter(&mut registry, "counter");
+        let other = register_counter(&mut registry, "other");
+        let mut runner = ToolRunner::<BlockKind, _>::new(Arc::new(registry));
+        runner.set_window(window);
+        for (name, calls, seconds) in bounds {
+            runner.set_tool_window(
+                (*name).to_owned(),
+                ToolWindowBound {
+                    calls: *calls,
+                    seconds: *seconds,
+                },
+            );
+        }
+        Self {
+            runner,
+            counter,
+            other,
+        }
+    }
+
+    fn counter_runs(&self) -> usize {
+        self.counter.load(Ordering::SeqCst)
+    }
+
+    fn other_runs(&self) -> usize {
+        self.other.load(Ordering::SeqCst)
+    }
+}
+
+/// The per-tool refusal a bound of `calls` per `seconds` on `name` produces —
+/// rendered from the numbers under test rather than copied, so a test never
+/// pins a sentence that lies about its own window. The bytes themselves are
+/// pinned out of crate, where the tool name is a consumer's to speak.
+fn per_tool_refusal(name: &str, calls: usize, seconds: i64) -> String {
+    crate::agency::ToolError::per_tool_rate_limit_refusal(name, calls, seconds)
+}
+
+/// The two templates read as two sentences, and both open with the ONE machine
+/// prefix the forced end matches on — which is what makes a per-tool refusal
+/// feed the same run a conversation-wide one does.
+#[test]
+fn the_two_refusal_templates_differ_and_share_the_one_prefix() {
+    let conversation = crate::agency::ToolError::rate_limit_refusal(6, 60);
+    let per_tool = per_tool_refusal("counter", 6, 60);
+
+    assert!(conversation.starts_with(crate::agency::ToolError::RATE_LIMIT_PREFIX));
+    assert!(per_tool.starts_with(crate::agency::ToolError::RATE_LIMIT_PREFIX));
+    assert_ne!(
+        conversation, per_tool,
+        "the advice tails differ: a bounded tool leaves other tools open"
+    );
+    assert!(
+        per_tool.contains("its 6 counter calls for the last 60 seconds"),
+        "the tool's name and ITS numbers are interpolated — {per_tool}"
+    );
+    assert!(
+        per_tool.ends_with(
+            "Answer with what you already have, or use a different tool, or wait before \
+             calling this one again."
+        ),
+        "the per-tool tail sends the model to another tool — {per_tool}"
+    );
+}
+
+/// AC1 — the per-tool window refuses. With `counter` bound at two calls and
+/// that bound spent, the next fresh admission of `counter` resolves with the
+/// per-tool refusal and its handler never runs; a call to a DIFFERENT tool at
+/// the same moment runs untouched; the same tool in a second conversation runs
+/// untouched, because the count is a fold over ONE conversation's ledger.
+#[tokio::test]
+async fn a_spent_per_tool_window_refuses_that_tool_alone() {
+    let rig = ToolWindowRig::new(ToolCallWindow::default(), &[("counter", 2, 60)]);
+    let o = Oracle::new().await;
+    o.user_text("go").await;
+
+    drive_call(&rig.runner, &o.ctx, "t-1").await;
+    drive_call(&rig.runner, &o.ctx, "t-2").await;
+    assert_eq!(rig.counter_runs(), 2, "the tool's own calls run");
+    assert!(
+        error_texts(&o.ctx).await.is_empty(),
+        "and none of them is refused"
+    );
+
+    drive_call(&rig.runner, &o.ctx, "t-3").await;
+    assert_eq!(
+        rig.counter_runs(),
+        2,
+        "the call past the tool's window never reached the body"
+    );
+    assert_eq!(
+        error_texts(&o.ctx).await,
+        vec![per_tool_refusal("counter", 2, 60)],
+        "the refusal is recorded as the call's outcome, in that tool's own numbers"
+    );
+
+    // The same conversation, the same instant, a tool with no bound.
+    drive_named_call(&rig.runner, &o.ctx, "t-other", "other").await;
+    assert_eq!(rig.other_runs(), 1, "another tool's calls are its own");
+    assert_eq!(
+        error_texts(&o.ctx).await.len(),
+        1,
+        "and nothing new is refused"
+    );
+
+    // The same runner, the same instant, a different conversation.
+    let second = o
+        .ctx
+        .store
+        .create_conversation("p1".into(), "model".into(), "model".into(), String::new())
+        .await
+        .unwrap();
+    let elsewhere = o.scoped_to(second);
+    elsewhere.user_text("go").await;
+    drive_call(&rig.runner, &elsewhere.ctx, "t-elsewhere").await;
+    assert_eq!(
+        rig.counter_runs(),
+        3,
+        "another conversation's per-tool window is its own"
+    );
+    assert!(
+        error_texts(&elsewhere.ctx).await.is_empty(),
+        "and nothing there is refused"
+    );
+}
+
+/// AC2 — both windows compose, in the pinned order. The conversation's window
+/// is the OUTER protection and speaks first: with both spent at the same
+/// moment the conversation-wide text lands, never the tool's. And a refused
+/// call keeps counting against BOTH folds — it is a recorded call.
+#[tokio::test]
+async fn the_conversation_window_speaks_before_a_tool_window() {
+    let rig = ToolWindowRig::new(
+        ToolCallWindow {
+            calls: 2,
+            seconds: 60,
+            consecutive_limit: 5,
+        },
+        &[("counter", 1, 60)],
+    );
+    let o = Oracle::new().await;
+    o.user_text("go").await;
+
+    // One inside both bounds; one past the tool's bound while the
+    // conversation's is cold; one past both.
+    drive_call(&rig.runner, &o.ctx, "c-1").await;
+    drive_call(&rig.runner, &o.ctx, "c-2").await;
+    drive_call(&rig.runner, &o.ctx, "c-3").await;
+
+    assert_eq!(rig.counter_runs(), 1, "only the first call ever ran");
+    assert_eq!(
+        error_texts(&o.ctx).await,
+        vec![
+            per_tool_refusal("counter", 1, 60),
+            crate::agency::ToolError::rate_limit_refusal(2, 60),
+        ],
+        "the tool's window refuses while the conversation's is cold, and the \
+         conversation's answers first once it is spent"
+    );
+
+    let ledger = o
+        .ctx
+        .store
+        .list_blocks(o.ctx.conversation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60, None),
+        3,
+        "every refused call still counts against the conversation's window"
+    );
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60, Some("counter")),
+        3,
+        "and against the tool's own"
+    );
+}
+
+/// AC4 — a tool with no entry in the map meets no per-tool check, under any
+/// state of the conversation's window: it runs past every bound its neighbour
+/// has, and when the conversation's window is spent it is refused by THAT
+/// window's text, never by a per-tool one.
+#[tokio::test]
+async fn an_unbound_tool_meets_no_per_tool_window() {
+    let rig = ToolWindowRig::new(
+        ToolCallWindow {
+            calls: 3,
+            seconds: 60,
+            consecutive_limit: 5,
+        },
+        &[("counter", 1, 60)],
+    );
+    let o = Oracle::new().await;
+    o.user_text("go").await;
+
+    for id in ["u-1", "u-2", "u-3"] {
+        drive_named_call(&rig.runner, &o.ctx, id, "other").await;
+    }
+    assert_eq!(
+        rig.other_runs(),
+        3,
+        "the unbound tool ran past its neighbour's bound"
+    );
+    assert!(
+        error_texts(&o.ctx).await.is_empty(),
+        "and nothing refused it"
+    );
+
+    drive_named_call(&rig.runner, &o.ctx, "u-4", "other").await;
+    assert_eq!(rig.other_runs(), 3, "the conversation's window stopped it");
+    assert_eq!(
+        error_texts(&o.ctx).await,
+        vec![crate::agency::ToolError::rate_limit_refusal(3, 60)],
+        "refused by the conversation's window, with no per-tool bound in sight"
+    );
+}
+
+/// The per-tool count is the same fold with a name filter: it counts one
+/// tool's rows, it ages out with the window exactly as the whole count does,
+/// and the walk's window edge still ends on ANY call older than the span —
+/// which is what keeps a filtered count one walk rather than a full scan.
+#[test]
+fn the_per_tool_count_reads_one_name_and_ages_out() {
+    let ledger: Vec<Block> = vec![
+        named_aged_call(1, 4000, "counter"),
+        named_aged_call(2, 3000, "counter"),
+        named_aged_call(3, 40, "counter"),
+        named_aged_call(4, 30, "other"),
+        named_aged_call(5, 20, "counter"),
+    ];
+
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60, Some("counter")),
+        2,
+        "the bound tool's calls inside the minute, the other tool's skipped"
+    );
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60, Some("other")),
+        1,
+        "and each name answers for itself"
+    );
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60, None),
+        3,
+        "while the unfiltered count is still every call in the span"
+    );
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 3600, Some("counter")),
+        3,
+        "a wider span reaches the older call, and stops at the one outside it"
+    );
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 25, Some("counter")),
+        1,
+        "as the span narrows the tool's window recovers, call by call"
+    );
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 0, Some("counter")),
+        0,
+        "a window of no length holds nothing"
+    );
+}
+
+/// AC5's admission half for a tool's own window — restart safety. The per-tool
+/// count is a fold over the ledger like every other, so a process that lost
+/// every byte of its memory keeps refusing the bound tool off the reopened
+/// store alone, while an unbound tool runs there untouched.
+#[tokio::test]
+async fn a_reopened_ledger_keeps_a_tool_window_spent() {
+    let dir = crate::store::temp_dir("per-tool-window-restart");
+    let db = dir.join("ledger.db");
+    let bounds: &[(&str, usize, i64)] = &[("counter", 2, 60)];
+    let bus = Arc::new(crate::bus::EventBus::<CoreEvent>::new());
+
+    let conv = {
+        let store = Store::open(&db).unwrap();
+        let conv = store
+            .create_conversation("p1".into(), "model".into(), "model".into(), String::new())
+            .await
+            .unwrap();
+        let ctx = AgencyCtx {
+            conversation_id: conv,
+            store,
+            bus: Arc::clone(&bus),
+        };
+        let rig = ToolWindowRig::new(ToolCallWindow::default(), bounds);
+        drive_call(&rig.runner, &ctx, "before-1").await;
+        drive_call(&rig.runner, &ctx, "before-2").await;
+        assert_eq!(rig.counter_runs(), 2, "the tool's window's calls ran");
+        conv
+    };
+
+    let store = Store::open(&db).unwrap();
+    let ctx = AgencyCtx {
+        conversation_id: conv,
+        store,
+        bus,
+    };
+    let rig = ToolWindowRig::new(ToolCallWindow::default(), bounds);
+    drive_call(&rig.runner, &ctx, "after-restart").await;
+    assert_eq!(
+        rig.counter_runs(),
+        0,
+        "the rebooted runner refuses off the ledger alone — nothing in memory told it to"
+    );
+    assert_eq!(
+        error_texts(&ctx).await,
+        vec![per_tool_refusal("counter", 2, 60)],
+        "and the refusal is recorded as that call's outcome"
+    );
+
+    drive_named_call(&rig.runner, &ctx, "after-restart-other", "other").await;
+    assert_eq!(
+        rig.other_runs(),
+        1,
+        "the unbound tool is unbounded across the restart too"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }

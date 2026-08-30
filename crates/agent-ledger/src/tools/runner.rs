@@ -11,9 +11,12 @@
 //! Because no emitter path can route around this pass, three properties hold
 //! under any interleaving: a refused call can never execute, a deferred call
 //! can never execute unapproved, and one call can never carry both a success
-//! and an error.
+//! and an error. ONE restart residual stands against the first of them,
+//! recorded on the `claimed` read's own doc below: a pending body that ran
+//! before a restart can be refused afterwards, and its late result loses the
+//! conditional write — an in-process claim cannot survive the process.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
@@ -55,9 +58,10 @@ impl CallOrigin {
     }
 }
 
-/// The tool-call window's numbers: how many calls a conversation may record
-/// in a trailing span, and how long a run of the window's refusals may get
-/// before the turn is forced to end (2026-08-30).
+/// The CONVERSATION window's numbers: how many calls a conversation may
+/// record in a trailing span, and how long a run of rate-limit refusals —
+/// this window's or a single tool's ([`ToolWindowBound`]) — may get before the
+/// turn is forced to end (2026-08-30).
 ///
 /// The operator of the deployment this slice was cut for chose them: a
 /// runaway turn looped a failing tool for hundreds of rounds, one paid
@@ -78,8 +82,11 @@ pub(crate) struct ToolCallWindow {
     pub calls: usize,
     /// The span, in seconds, the count is taken over.
     pub seconds: i64,
-    /// How many of a turn's trailing tool outcomes must all be this window's
-    /// refusals before the turn is forced to end between rounds.
+    /// How many of a turn's trailing tool outcomes must all be rate-limit
+    /// refusals before the turn is forced to end between rounds. ONE number
+    /// for the whole runtime: a refusal from this window and a refusal from a
+    /// tool's own [`ToolWindowBound`] lengthen the same run, because both say
+    /// the model is spending rounds on refusals.
     pub consecutive_limit: usize,
 }
 
@@ -91,6 +98,47 @@ impl Default for ToolCallWindow {
             consecutive_limit: 5,
         }
     }
+}
+
+/// ONE TOOL's own window: how many calls of that name a conversation may
+/// record in a trailing span (2026-08-30).
+///
+/// The conversation window bounds PACE, and a slow grind is in-rate: a turn
+/// that ground one failing tool for hours, well under sixty calls a minute,
+/// never tripped it. This bound closes the gap from the other side — a model
+/// leaning that hard on one tool is looping, whatever its overall pace.
+///
+/// The CONSUMER's numbers, unlike [`ToolCallWindow`]'s: which tools exist and
+/// how hard one may be leaned on is knowledge only the embedder has, so the
+/// map these live in ships EMPTY and this library names no tool anywhere. A
+/// tool with no entry meets no per-tool bound at all.
+///
+/// No consecutive limit of its own: the run that forces a turn to end is one
+/// number for the whole runtime
+/// ([`ToolCallWindow::consecutive_limit`]), and both windows' refusals feed it
+/// through the one machine prefix.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ToolWindowBound {
+    /// How many calls of this tool one conversation may record in the
+    /// trailing span. The call under admission is itself recorded, and the
+    /// refusal fires when the count EXCEEDS this — so exactly this many calls
+    /// of the tool run inside any trailing span, and the next one is refused.
+    pub calls: usize,
+    /// The span, in seconds, the count is taken over.
+    pub seconds: i64,
+}
+
+/// Is a bound spent — the ONE comparison both windows answer through
+/// (2026-08-30).
+///
+/// The count is the ledger's ([`ToolCall::calls_in_trailing_window`]), and the
+/// call under admission is one of the rows it counts: insert-first put it
+/// there before any hook ran. So a bound is spent when the count EXCEEDS it —
+/// the bound's worth of calls all run, and the first one past it inside any
+/// trailing span is refused. `of_tool` is what makes the same fold answer for
+/// one tool instead of for the conversation.
+fn window_spent(ledger: &[Block], calls: usize, seconds: i64, of_tool: Option<&str>) -> bool {
+    ToolCall::calls_in_trailing_window(ledger, seconds, of_tool) > calls
 }
 
 /// The admission chokepoint, holding the registry it resolves calls against.
@@ -105,15 +153,27 @@ impl Default for ToolCallWindow {
 pub struct ToolRunner<K: RuntimeKind, E> {
     registry: Arc<ToolRegistry<E>>,
     in_flight: Mutex<HashSet<(i64, i64)>>,
-    /// The tool-call window in force. Written EXACTLY ONCE, at construction:
-    /// a production build takes [`ToolCallWindow`]'s defaults — the
-    /// operator's numbers — and nothing in the crate can write it after the
-    /// runner is shared, because the only other writer takes `&mut self`
-    /// ([`Self::set_window`], test-only) and the compiler grants that
-    /// exclusively while the builder still holds the sole reference. An
+    /// The conversation-wide tool-call window in force. Written EXACTLY ONCE,
+    /// at construction: a production build takes [`ToolCallWindow`]'s
+    /// defaults — the operator's numbers — and nothing in the crate can write
+    /// it after the runner is shared, because the only other writer takes
+    /// `&mut self` ([`Self::set_window`], test-only) and the compiler grants
+    /// that exclusively while the builder still holds the sole reference. An
     /// immutable field needs no lock, and carrying one would have said the
     /// opposite: that some runtime writer exists.
     window: ToolCallWindow,
+    /// The per-tool windows in force, keyed by the name a call records —
+    /// EMPTY by default, because this library ships no tool names
+    /// (2026-08-30).
+    ///
+    /// A SECOND plain field beside `window`, not a map inside it: a window
+    /// carrying the map would lose its `Copy` and clone a map on every
+    /// admission, where this is read by shared reference — a `get` by name.
+    /// Written exactly like `window` is, at construction through
+    /// [`Self::set_tool_window`], whose `&mut self` is the same compiler proof
+    /// that the write lands while the builder still holds the sole reference,
+    /// so every reader afterwards takes it without a lock.
+    tool_windows: HashMap<String, ToolWindowBound>,
     /// The kind the live-tail drive at the insert seam parses through — a
     /// type-level collaborator the runner never owns. The `fn() -> K` form is
     /// what says so to the compiler: the runner's auto traits and drop check
@@ -163,6 +223,7 @@ impl<K: RuntimeKind, E> ToolRunner<K, E> {
             registry,
             in_flight: Mutex::new(HashSet::new()),
             window: ToolCallWindow::default(),
+            tool_windows: HashMap::new(),
             _kind: PhantomData,
         }
     }
@@ -173,21 +234,25 @@ impl<K: RuntimeKind, E> ToolRunner<K, E> {
         &self.registry
     }
 
-    /// The tool-call window in force — read by this runner's own refusal and,
-    /// through the context's runner accessor, by the forced end the actor
-    /// runs between rounds. One field, both readers.
+    /// The conversation-wide tool-call window in force — read by this runner's
+    /// own refusal and, through the context's runner accessor, by the forced
+    /// end the actor runs between rounds. One field, both readers.
     pub(crate) fn window(&self) -> ToolCallWindow {
         self.window
     }
 
-    /// Set the window, at construction time.
+    /// Set the conversation-wide window, at construction time.
     ///
-    /// Test-only, and that IS the surface decision: the numbers are the
-    /// operator's, recorded once as [`ToolCallWindow`]'s defaults, so a
-    /// production build has nothing that can disagree with them. The library's
-    /// own suites need a small window to prove the behavior without spending
-    /// sixty calls per assertion, and they reach it through the context
-    /// builder that calls this.
+    /// Test-only, and that IS the surface decision for the GLOBAL numbers:
+    /// they are the operator's, recorded once as [`ToolCallWindow`]'s
+    /// defaults, so a production build has nothing that can disagree with
+    /// them. The library's own suites need a small window to prove the
+    /// behavior without spending sixty calls per assertion, and they reach it
+    /// through the context builder that calls this. A per-tool bound is
+    /// inherently the CONSUMER's and reaches this runner through the public
+    /// context builder (`RuntimeContext::with_tool_window`), which calls the
+    /// crate-private [`Self::set_tool_window`] — a different decision about
+    /// different numbers, not a hole in this one.
     ///
     /// `&mut self` is the point, not an incidental signature: it is the
     /// compiler's own proof that the write lands while the runner is still
@@ -196,6 +261,25 @@ impl<K: RuntimeKind, E> ToolRunner<K, E> {
     #[cfg(test)]
     pub(crate) fn set_window(&mut self, window: ToolCallWindow) {
         self.window = window;
+    }
+
+    /// Bind one tool to a window of its own, at construction time
+    /// (2026-08-30). A second call for the same name replaces that tool's
+    /// bound; every other tool is untouched.
+    ///
+    /// Crate-private and NOT test-gated, unlike [`Self::set_window`]: these
+    /// numbers are the consumer's, and production's one caller is the PUBLIC
+    /// builder [`RuntimeContext::with_tool_window`](crate::RuntimeContext::with_tool_window),
+    /// which reaches this through the sole reference it still holds. Public
+    /// HERE it must not be: the context hands out cloneable `Arc`s of the
+    /// runner through its accessor, so a public setter would let any holder
+    /// write the map mid-flight — and the map is read without a lock exactly
+    /// because nothing can.
+    ///
+    /// `&mut self` carries the same proof it carries above: the write lands
+    /// while the runner is still unshared.
+    pub(crate) fn set_tool_window(&mut self, name: String, bound: ToolWindowBound) {
+        self.tool_windows.insert(name, bound);
     }
 
     /// The in-flight set's ONE lock, poison recovery included: a panicking
@@ -343,8 +427,9 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
     /// 2. **Already resolved?** Return. This is what makes a duplicate wakeup
     ///    free, and it comes FIRST so no later step can re-run a completed
     ///    body.
-    /// 3. **Is the conversation's tool-call window spent?** (2026-08-30) If
-    ///    it is, this call resolves with the window's refusal and NOTHING
+    /// 3. **Is a tool-call window spent** — the conversation's, or this
+    ///    tool's own (2026-08-30)? If either is, this call resolves with that
+    ///    window's refusal and NOTHING
     ///    else runs. It comes before every other refusal, the unknown tool
     ///    included: a hot window meeting an unknown tool name would otherwise
     ///    loop on the teaching text, a second unbounded shape. What the
@@ -393,7 +478,14 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
             return;
         }
 
-        if self.window_refuses(ctx, &ledger, &call).await {
+        // The human's standing with this call is folded ONCE on this
+        // immutable snapshot and handed to both halves below: the windows'
+        // fresh-admission skip and the gate's own admit read the same
+        // ledger, and asking it twice would be two folds that exist only to
+        // agree with each other.
+        let approval = approval_state(&ledger, call.id);
+
+        if self.window_refuses(ctx, &ledger, &call, approval).await {
             return;
         }
 
@@ -421,57 +513,115 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
             return;
         };
 
-        if handler.gated() && !self.admit(ctx, handler, &ledger, &call).await {
+        if handler.gated() && !self.admit(ctx, handler, &call, approval).await {
             return;
         }
         self.run_body(ctx, handler, &call).await;
     }
 
-    /// The tool-call window's admission answer (2026-08-30): is this
-    /// conversation's window spent, and is this a call the window may refuse?
+    /// The tool-call windows' admission answer (2026-08-30): is this
+    /// conversation's window spent, is THIS TOOL's own window spent, and is
+    /// this a call either may refuse?
     ///
     /// Answers whether the call was refused — `true` means the refusal is
     /// already recorded and the caller must stop, exactly like the gate's
     /// own refusal path.
     ///
-    /// The count is the ledger's ([`ToolCall::calls_in_trailing_window`]), and
-    /// the call under admission is one of the rows it counts: insert-first
-    /// put it there before any hook ran. So the refusal fires when the count
-    /// EXCEEDS the window — the window's worth of calls all run, and the
-    /// first one past it inside any trailing span is refused. A refused call
-    /// stays a recorded call and keeps counting: a window that forgot its own
-    /// refusals would drain while the model spams and hand the whole
-    /// protection to the forced end.
-    async fn window_refuses(&self, ctx: &AgencyCtx<E>, ledger: &[Block], call: &ToolCall) -> bool {
+    /// ONE pass at the door, for both bounds. The fresh-admission skips run
+    /// ONCE and cover the two: a call whose body may already have run — one
+    /// claimed by this process, one carrying a granted human approval — and
+    /// an interactive call, whose admission belongs to the human, are no more
+    /// refusable by a tool's window than by the conversation's. The human's
+    /// standing arrives from the caller, folded once on the snapshot this
+    /// skip and the gate's own admit below both read.
+    ///
+    /// The GLOBAL window speaks FIRST and a tool's own second (2026-08-30).
+    /// The order is observable only in which text lands, and the
+    /// conversation's window is the outer protection: it answers while it
+    /// can. A tool with no entry in the map meets no second check at all.
+    ///
+    /// Both counts are the ledger's ([`ToolCall::calls_in_trailing_window`]),
+    /// one walk each, differing only in the name filter — and both are spent
+    /// on the one comparison ([`window_spent`]), the call under admission
+    /// included. A refused call stays a recorded call and keeps counting
+    /// against BOTH windows: a window that forgot its own refusals would
+    /// drain while the model spams and hand the whole protection to the
+    /// forced end.
+    async fn window_refuses(
+        &self,
+        ctx: &AgencyCtx<E>,
+        ledger: &[Block],
+        call: &ToolCall,
+        approval: ApprovalState,
+    ) -> bool {
         if call.interactive || self.claimed(ctx.conversation_id, call.id) {
             return false;
         }
-        if approval_state(ledger, call.id) == ApprovalState::Approved {
+        if approval == ApprovalState::Approved {
             return false;
         }
+
         let window = self.window();
-        if ToolCall::calls_in_trailing_window(ledger, window.seconds) <= window.calls {
+        if window_spent(ledger, window.calls, window.seconds, None) {
+            return self
+                .record_window_refusal(
+                    ctx,
+                    call,
+                    "the conversation's tool-call window",
+                    window.calls,
+                    window.seconds,
+                    ToolError::rate_limit_refusal(window.calls, window.seconds),
+                )
+                .await;
+        }
+
+        let Some(bound) = self.tool_windows.get(&call.name) else {
+            return false;
+        };
+        if !window_spent(ledger, bound.calls, bound.seconds, Some(&call.name)) {
             return false;
         }
+        self.record_window_refusal(
+            ctx,
+            call,
+            "this tool's own window",
+            bound.calls,
+            bound.seconds,
+            ToolError::per_tool_rate_limit_refusal(&call.name, bound.calls, bound.seconds),
+        )
+        .await
+    }
+
+    /// Record one window's refusal and answer `true`: the spent window's log
+    /// line, the rendered refusal and the conditional write that resolves the
+    /// call are ONE shape every window refusal takes, so a future change to
+    /// how a refusal is recorded is made here once. The conversation's
+    /// window and a tool's own differ only in `which` window spent, the
+    /// rendered text and the numbers it names.
+    async fn record_window_refusal(
+        &self,
+        ctx: &AgencyCtx<E>,
+        call: &ToolCall,
+        which: &str,
+        calls: usize,
+        seconds: i64,
+        refusal: String,
+    ) -> bool {
         info!(
             name = call.name,
             conversation_id = ctx.conversation_id,
-            calls = window.calls,
-            seconds = window.seconds,
-            "tool runner: the conversation's tool-call window is spent — refusing"
+            calls,
+            seconds,
+            "tool runner: {which} is spent — refusing"
         );
-        self.resolve_with_error(
-            ctx,
-            &call.tool_call_id,
-            ToolError::rate_limit_refusal(window.calls, window.seconds),
-            call.id,
-        )
-        .await;
+        self.resolve_with_error(ctx, &call.tool_call_id, refusal, call.id)
+            .await;
         true
     }
 
-    /// The admission half: read what is recorded about this call, and consult
-    /// the tool's own gate only where nothing is recorded yet.
+    /// The admission half: act on the human's standing with this call —
+    /// handed down folded once on the admission snapshot both halves read —
+    /// and consult the tool's own gate only where nothing is recorded yet.
     ///
     /// Answers whether the body may run. Every refusal it makes is RECORDED
     /// before it returns — that is the whole point of the split: the caller
@@ -481,10 +631,10 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
         &self,
         ctx: &AgencyCtx<E>,
         handler: &dyn ToolHandler<E>,
-        ledger: &[Block],
         call: &ToolCall,
+        approval: ApprovalState,
     ) -> bool {
-        match approval_state(ledger, call.id) {
+        match approval {
             ApprovalState::Approved => true,
             // Undecided: the human still owes this. Denied: the verdict already
             // resolved the call with its error, atomically, so there is nothing

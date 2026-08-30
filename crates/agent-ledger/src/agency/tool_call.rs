@@ -156,7 +156,19 @@ impl ToolCall {
     }
 
     /// How many tool calls this ledger recorded inside the trailing
-    /// `seconds` — the tool-call window's own count (2026-08-30).
+    /// `seconds` — the tool-call windows' own count (2026-08-30), over every
+    /// recorded call when `of_tool` is `None` and over ONE tool's calls when
+    /// it names one.
+    ///
+    /// The name filter is the per-tool window's whole difference from the
+    /// conversation's (2026-08-30): it reads the parsed kind's own
+    /// [`name`](Self::name), the same parse this fold already runs, so a
+    /// per-tool count is ONE walk of the ledger and never a second one beside
+    /// it. What the filter never touches is the walk's window edge below,
+    /// which ends on ANY call older than the cutoff whatever its name: the
+    /// stamps ascend along ledger order for the whole conversation, so the
+    /// first call outside the span completes the answer for every name at
+    /// once.
     ///
     /// A fold, never a counter: "how much has this conversation spent
     /// lately" is derivable from the rows themselves, so it is not state
@@ -194,14 +206,21 @@ impl ToolCall {
     /// a conversation that is spending nothing. A stamp that does not parse
     /// carries no time to compare, so it neither counts nor ends the walk.
     #[must_use]
-    pub(crate) fn calls_in_trailing_window(ledger: &[Block], seconds: i64) -> usize {
-        // A `seconds` outside the representable span of a delta — reachable
-        // only through an absurd configured value, since the numbers are the
-        // operator's compiled defaults — degrades to a zero-length window,
-        // which counts nothing and therefore refuses nothing. The same
-        // direction as the fallback below, and deliberate for the same
-        // reason: the window bounds spending, it never becomes the reason a
-        // conversation stops working.
+    pub(crate) fn calls_in_trailing_window(
+        ledger: &[Block],
+        seconds: i64,
+        of_tool: Option<&str>,
+    ) -> usize {
+        // A `seconds` outside the representable span of a delta degrades to
+        // a zero-length window, which counts nothing and therefore refuses
+        // nothing. The same direction as the fallback below, and deliberate
+        // for the same reason: the window bounds spending, it never becomes
+        // the reason a conversation stops working. The numbers arrive as the
+        // operator's compiled defaults or as a consumer's
+        // `with_tool_window` arguments, and the builder's positive-span
+        // assertion is the fence in front of the obvious misconfiguration —
+        // what still reaches here past that fence is an absurd span, not a
+        // mistaken one, and it degrades for exactly that reason.
         let span = chrono::TimeDelta::try_seconds(seconds).unwrap_or_else(chrono::TimeDelta::zero);
         let Some(cutoff) = crate::store::now_instant().checked_sub_signed(span) else {
             // A clock so far from the epoch that the window cannot be
@@ -211,11 +230,15 @@ impl ToolCall {
         };
         let mut calls = 0;
         for block in ledger.iter().rev() {
-            if !matches!(BlockKind::from_block(block), BlockKind::ToolCall(_)) {
+            let BlockKind::ToolCall(call) = BlockKind::from_block(block) else {
                 continue;
-            }
+            };
             match crate::store::parse_stamp(&block.created_at) {
-                Some(at) if at >= cutoff => calls += 1,
+                Some(at) if at >= cutoff => {
+                    if of_tool.is_none_or(|wanted| call.name == wanted) {
+                        calls += 1;
+                    }
+                }
                 Some(_) => break,
                 None => {}
             }
@@ -223,7 +246,7 @@ impl ToolCall {
         calls
     }
 
-    /// How many of the turn's LAST tool outcomes are tool-call window
+    /// How many of the turn's LAST tool outcomes are tool-call rate-limit
     /// refusals, counted back from the newest until one is not (2026-08-30).
     ///
     /// The outcome SUBSEQUENCE, never raw block adjacency: every refused
@@ -233,8 +256,16 @@ impl ToolCall {
     /// errors anchored on `anchor` are the subsequence, in ledger order —
     /// which is the ids' own order for a conversation's appends — and a
     /// result, a gate refusal or any other failure ends the run as an
-    /// ordinary outcome: only the window's own refusals mean the model is
-    /// looping on the window.
+    /// ordinary outcome: only a rate-limit refusal means the model is
+    /// looping on a window.
+    ///
+    /// EITHER window's refusal counts (2026-08-30, the per-tool windows):
+    /// the conversation's own and a single tool's alike, because both are
+    /// recorded through the one machine prefix
+    /// ([`ToolError::RATE_LIMIT_PREFIX`](super::ToolError::RATE_LIMIT_PREFIX))
+    /// and both mean the same thing — the model is spending rounds on
+    /// refusals. A model looping on one bounded tool therefore ends its turn
+    /// exactly as a burst does, on the one consecutive limit.
     ///
     /// Anchor-keyed like every other turn fold here, which is also what
     /// keeps an out-of-band call — recorded with a NULL anchor — out of the
