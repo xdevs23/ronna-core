@@ -71,8 +71,13 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
 - **The window is a ledger fold, never memory, 2026-08-30.** "Tool calls in this
   conversation in the trailing sixty seconds" is a count over the conversation's
   tool-call blocks by their own `created_at` stamps; "five consecutive rate-limit
-  errors" is the trailing run of tool-error blocks carrying the refusal text,
-  ordered by block id and scoped to the OPEN TURN by dispatch anchor. Both are
+  errors" is a fold over the open turn's tool OUTCOMES — result and error
+  blocks, ordered by block id, scoped to the open turn by dispatch anchor
+  (the outcomes-anchored idiom, `actor.rs:849`) — asking whether the trailing
+  five all carry the refusal prefix. The outcome subsequence, never raw block
+  adjacency: every refusal round appends the NEXT round's call block after the
+  previous error, so consecutive tool-error block ids never occur in the
+  ledger and a literal block-run reading would never fire. Both are
   reads at the existing seams, both survive a restart, and no in-memory copy is
   authoritative. The window compare parses the stamps' real form (offset-aware
   RFC3339 instants, millisecond resolution) and takes "now" from the stamp
@@ -106,7 +111,14 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
   pending call whose body ran, or a deferred call the human admitted, proceeds:
   refusing it would falsify "this call was not run" in the ledger and orphan
   the real result at its conditional write. The window governs FRESH admissions
-  alone. With the window cold, the unknown-tool and gate refusals
+  alone. The claim record is the runner's own in-flight set (`runner.rs:67`),
+  peeked at the refusal site — and it is per-process, an accepted residual
+  stated openly: a re-driven pending call whose body ran BEFORE a restart
+  carries no claim mark afterwards, so a hot window refuses it, the pinned
+  "not run" text lands false for that call and the pre-restart result loses
+  its conditional write — rare, restart-shaped, and no worse than the
+  check-to-append race the forced-end decision records for itself. With the
+  window cold, the unknown-tool and gate refusals
   behave exactly as today, and their errors reset the consecutive run as
   ordinary failures — they are not the model looping on the window.
   *Rejected:* a machine-key column for tool errors — the error string's own
@@ -124,8 +136,12 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
 - **Five consecutive refusals end the turn between rounds, without latching and
   without burying anyone, 2026-08-30.** The check runs in `handle_blocks_ready`,
   before the dispatch spends: when the open turn's trailing five tool outcomes
-  are all rate-limit refusals (the run ordered by block id, scoped to the open
-  turn by anchor), the dispatch stands down instead of sending. The forced end,
+  are all rate-limit refusals (the outcome fold of the first decision), the
+  dispatch stands down instead of sending. The turn the check scopes to is
+  the RESOLVED anchor — the held `open_turn` else the fresh anchor the
+  ledger owes (`actor.rs:1074-1076`) — never the held field alone, so the
+  rule survives a restart that clears the held identity while the ledger
+  still owes the dead turn's continuation. The forced end,
   in order: an anchored status block with the machine key `tool_calls_exhausted`
   joins the ledger, and the key JOINS `Status::records_turn_end`
   (`records.rs:42-50`) so the walk reads through it — the tree's own recorded
@@ -207,7 +223,9 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
   mid-window, the conversation keeps refusing until the window genuinely
   recovers — pinned through a path-backed store reopen (named harness work: the
   in-memory idiom cannot reopen; the first handle drops to release the lock and
-  the rebooted runtime is driven by an append).
+  the rebooted runtime is driven by an append). The five-rule survives the same
+  reopen: refusals landed before the stop still force the end after it,
+  because the check reads the resolved anchor, not the held field (pin).
 - **AC6 — interactive calls are counted, never runner-refused.** Pinned at the
   counting site; the refusal-site interactive skip is defensive only — no
   interactive call reaches `execute_ready_call` today (`tool_call.rs:228-241`)
@@ -230,7 +248,10 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
   `frontier_transparent` doc's "Exactly one shape answers true"
   (`agency/mod.rs:156`), and the coordination follow-up pinning transparency to
   "the two turn-closure keys" (`docs/coordination/
-  08-dispatch-identity-follow-ups.md`, item 7). The runtime reference's
+  08-dispatch-identity-follow-ups.md`, item 7), and the `Status` struct-level
+  doc's close-appended framing ("appended by a close that ends a turn over an
+  unanswered outcome", `records.rs:16-25`), which recurs inside the cited
+  `agency/mod.rs` paragraph (`:151-164`). The runtime reference's
   cancellation bullet concerns the interrupted key alone and stays as it is.
 - The consumer's auto-compaction on the status key is the consumer's own unit
   (with `/compact`), deliberately out of this slice.
