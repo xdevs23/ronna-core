@@ -39,13 +39,16 @@ gate's `Refuse{reason}` are the teaching-text precedents (`runner.rs:290-346`).
 Interactive calls never reach the runner (`tools/mod.rs:133-147`).
 
 **Counting is a fold, by doctrine, over the stamps as they really are.** Every
-block's `created_at` is written by `insert_block` from `now_iso8601`
-(`store/messages.rs:174-177`, `store/mod.rs:758-762`): RFC3339 at millisecond
-resolution in LOCAL time with a fixed numeric offset — the schema's UTC
-`datetime('now')` default (`migrations.rs:105`) is dead for blocks. The window
+production insert names `created_at` itself — `insert_block` stamps
+`now_iso8601` (`store/messages.rs:174-177`, `store/mod.rs:758-762`): RFC3339 at
+millisecond resolution in LOCAL time with a fixed numeric offset; the fork
+cloner copies the source block's stamp (history keeps its time) and drafts
+stamp their own the same way — so the schema's UTC `datetime('now')` default
+(`migrations.rs:105`) fires only in fixtures, and every tool call rides
+`insert_block`. The window
 fold therefore parses offset-aware instants and never compares lexically (two
 offsets straddling a DST boundary do not sort as strings), and its "now" comes
-from the same clock that writes the stamps — slice 15's one-clock law, honored.
+from the same clock that writes the stamps (stated on its own terms; slice 15's one-reading rule for date markers is the neighboring precedent, not a general law).
 Every call joins its conversation (`migrations.rs:110-115`) and every outcome
 copies its call's dispatch anchor (`tool_calls.rs:75-76, 112-113`). "Derived,
 never stored — if a fact can be folded from the ledger, it is not a column" is
@@ -59,8 +62,9 @@ turns from inside a stream and both LATCH the conversation; the forced end this
 slice needs fires BETWEEN rounds, when no stream is open, and must not latch — the
 conversation lives on. Only `settle_turn_identity` releases a held `open_turn`
 today; leaving it held inherits the dead turn's anchor onto the next summons
-(`actor.rs:743-760`). A status block projects no model content (`records.rs:70-74`)
-and caps the frontier, resting the loop.
+(`actor.rs:743-760`). A status block projects no model content (`records.rs:70-74`); the turn-end
+status family is walk-TRANSPARENT (`records.rs:45-50`), and the loop rests
+through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
 
 ## Decisions taken with this slice
 
@@ -72,7 +76,13 @@ and caps the frontier, resting the loop.
   reads at the existing seams, both survive a restart, and no in-memory copy is
   authoritative. The window compare parses the stamps' real form (offset-aware
   RFC3339 instants, millisecond resolution) and takes "now" from the stamp
-  writer's own clock — never a lexical compare, never a second clock. *Rejected:* a window in the runner's mutex or the actor's state —
+  writer's own clock — never a lexical compare, never a second clock. The
+  predicate, exactly: count every recorded call in the trailing window, the one
+  under admission included, and refuse when that count EXCEEDS the window — the
+  sixty allowed calls all run, the sixty-first inside any trailing minute is the
+  first refused. Out-of-band calls record NULL anchors and sit outside the open
+  turn's consecutive run; they can only shorten it, never fake it — safe by
+  direction, and the window still counts them. *Rejected:* a window in the runner's mutex or the actor's state —
   a decision in memory while the ledger says otherwise, the exact shape the tools
   layer's recorded war story forbids, and it forgets on restart while the burn it
   bounds does not.
@@ -84,10 +94,11 @@ and caps the frontier, resting the loop.
   shape. The refusal is two constants, one decision each: the stable machine
   prefix the consecutive fold matches with a starts-with test,
   `tool-call rate limit:`
-  and the rendered detail, which interpolates the CONFIGURED window values so an
+  and the rendered detail, whose one template interpolates the CONFIGURED
+  values as plain numbers of calls and seconds (no unit-word branches) so an
   overridden deployment never lies about its own numbers; at the defaults the
   full text reads, pinned byte for byte:
-  `tool-call rate limit: this conversation has spent its 60 tool calls for the last minute, and this call was not run. Answer with what you already have, or wait before calling tools again.`
+  `tool-call rate limit: this conversation has spent its 60 tool calls for the last 60 seconds, and this call was not run. Answer with what you already have, or wait before calling tools again.`
   Interactive calls are counted by the window (they are recorded calls) and
   never refused by it: interactive admission belongs to the human, stated as the
   recorded boundary. With the window cold, the unknown-tool and gate refusals
@@ -95,7 +106,10 @@ and caps the frontier, resting the loop.
   ordinary failures — they are not the model looping on the window.
   *Rejected:* a machine-key column for tool errors — the error string's own
   fixed prefix is the native form, the same way status blocks carry their
-  documented keys; *rejected:* baking the numbers into one un-interpolated
+  documented keys; a handler whose own error opened with the exact prefix would
+  feed the five-rule, accepted knowingly: it is vanishingly unlikely, and five
+  consecutive claimed rate limits ending the turn is defensible behavior even
+  then; *rejected:* baking the numbers into one un-interpolated
   string — a test or deployment overriding the values would ship a message that
   lies.
 - **Refused calls count, 2026-08-30.** The operator's design has every over-limit
@@ -118,7 +132,9 @@ and caps the frontier, resting the loop.
   release edge beside `settle_turn_identity`'s — so the next summons opens a
   fresh turn with a fresh anchor; if the append fails, nothing releases and the
   next drive re-enters the check off the durable fold and retries — no latch,
-  no retry queue, the ledger-first shape self-heals. The conversation is NOT
+  no retry queue; in a quiet system that next drive is the next store change or
+  member message, and the wait is the stated residual (no dispatch is spent
+  meanwhile). The conversation is NOT
   latched, and the count is per open turn, never per conversation lifetime. The
   embedder observes the status block (BlocksChanged and the durable fold);
   keying a compaction on it is the embedder's own policy. *Rejected:* an opaque
@@ -127,22 +143,27 @@ and caps the frontier, resting the loop.
   *rejected:* a new bus event vocabulary — the keyed status block IS the native
   signal; *rejected:* a non-rate-limit error breaking the turn — only the
   refusal run means the model is looping on the window.
-- **The values are named consts carried by the runtime context, 2026-08-30.**
-  `WINDOW_CALLS = 60`, `WINDOW_SECS = 60`, `CONSECUTIVE_LIMIT = 5`, the
-  operator's numbers, defined once. The carrier is a builder-style field on
-  `RuntimeContext` (the `without_title_derivation` shape): the runner — built
-  inside `RuntimeContext::new`, deliberately non-injectable — reads it at
-  construction, and the actor reads it through the context, so both sites share
-  ONE config with no second copy; tests build a context with a small window
-  instead of waiting a minute. *Rejected:* a consumer-facing config surface —
-  no such registry exists in this tree, and the numbers are the operator's
-  decision; *rejected:* a runner constructor parameter — the runner is
-  deliberately not constructible by consumers.
+- **The values are named consts carried by the runtime context and read at the
+  check, 2026-08-30.** `WINDOW_CALLS = 60`, `WINDOW_SECS = 60`,
+  `CONSECUTIVE_LIMIT = 5`, the operator's numbers, defined once as the defaults
+  of a `RuntimeContext` field set builder-style (the `without_title_derivation`
+  shape) and read LAZILY at each check — the `title_derivation` pattern, read
+  where it is used, never captured at construction. The runner's admission path
+  already runs with the runtime context in hand and the actor reads its own;
+  one field, no second copy, and a test-built context with a small window
+  reaches both checks because nothing snapshots the value early. *Rejected:* a
+  consumer-facing config surface — no such registry exists in this tree, and
+  the numbers are the operator's decision; *rejected:* delivering the values at
+  the runner's construction — the runner is built eagerly inside
+  `RuntimeContext::new`, before any builder runs, so a construction-time read
+  could never see an override (the context's runner field is private and
+  non-injectable; `ToolRunner::new` itself is public but not the seam).
 - **The cost arithmetic is stated honestly, 2026-08-30.** The window bounds TOOL
   CALLS, not paid requests: a refused call still buys its continuation round, so
   a runaway burns up to the window plus five refusal rounds before the forced
-  end, and each later summons costs about six requests (five refusals and the
-  stand-down) while the window stays hot. Bounded and small, and the operator
+  end, and each later summons costs five paid requests (the dispatch buying
+  each refusal; the stand-down after the fifth spends nothing) while the window
+  stays hot. Bounded and small, and the operator
   chose the numbers; recorded so nobody reads the window as a request ceiling.
 
 ## Acceptance criteria
@@ -167,8 +188,10 @@ and caps the frontier, resting the loop.
 - **AC5 — restart safety.** The fold derives from the ledger: reopened mid-window,
   the conversation keeps refusing until the window genuinely recovers (pin
   through a store reopen).
-- **AC6 — interactive calls are counted, never runner-refused.** Stated and
-  pinned at the counting site.
+- **AC6 — interactive calls are counted, never runner-refused.** Pinned at the
+  counting site; the refusal-site interactive skip is defensive only — no
+  interactive call reaches `execute_ready_call` today (`tool_call.rs:228-241`)
+  — and is stated as such, not tested through an unreachable path.
 - **AC7 — the multi-round pins stand, on an extended harness.** The existing
   Script-driven multi-round and close-edge tests pass unchanged; the Script
   vocabulary gains a parameterized many-round variant to drive AC3/AC4 (named
@@ -182,6 +205,10 @@ and caps the frontier, resting the loop.
 - Worktree `~/projects/agent-ledger-toolcap`, branch `slice/tool-round-ceiling`,
   from `master` (`f2bf250`). Build first step: `git rebase master`.
 - The status-record key vocabulary documentation gains `tool_calls_exhausted`
-  beside the existing keys; the slice doc is this file.
+  beside the existing keys, and the two recorded claims that go stale with the
+  widening are touched in the same change: the coordination follow-up pinning
+  transparency to "the two turn-closure keys" (`docs/coordination/
+  08-dispatch-identity-follow-ups.md`, item 7) and the runtime reference's
+  status-key passage (`docs/reference/event-sourced-agent-runtime.md:279`).
 - The consumer's auto-compaction on the status key is the consumer's own unit
   (with `/compact`), deliberately out of this slice.
