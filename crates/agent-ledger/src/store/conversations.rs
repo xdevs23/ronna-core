@@ -353,6 +353,12 @@ impl Store {
     /// Detaching a block a conversation does not hold changes nothing, so the
     /// operation is idempotent.
     ///
+    /// This is the one-row spelling of
+    /// [`detach_blocks`](Store::detach_blocks) and calls it with a one-element
+    /// list. The two doors are one contract and one delete: the many-row door
+    /// is not a second version of this operation, it is this operation run over
+    /// a list.
+    ///
     /// # Errors
     ///
     /// If the delete fails or the store's actor has stopped.
@@ -361,12 +367,55 @@ impl Store {
         conversation_id: i64,
         block_id: i64,
     ) -> Result<(), StoreError> {
+        self.detach_blocks(conversation_id, vec![block_id]).await
+    }
+
+    /// Detach many blocks from one conversation in ONE transaction — one round
+    /// trip and one commit, however many rows.
+    ///
+    /// Each row is detached under exactly the contract
+    /// [`detach_block`](Store::detach_block) states, and it is that same
+    /// contract rather than a second reading of it: the junction row alone is
+    /// removed, while the block itself, its content, and its membership in
+    /// every other conversation stand untouched.
+    ///
+    /// An empty list is a no-op that opens no transaction. An id this
+    /// conversation has no junction row for is simply absent from the effect,
+    /// exactly as [`detach_block`](Store::detach_block) treats it — the call
+    /// detaches what is there and is not an existence check, so a list mixing
+    /// held and unheld ids lands the held ones and reports success.
+    ///
+    /// The per-row door is the right shape for one row and the wrong shape for
+    /// a set: taking a thousand rows through it serializes a thousand
+    /// transactions behind whatever lock the caller holds, so the loop lives
+    /// inside one transaction here instead of around a thousand of them.
+    ///
+    /// # Errors
+    ///
+    /// If a delete fails — in which case the whole set rolls back and no row is
+    /// detached — or if the store's actor has stopped.
+    pub async fn detach_blocks(
+        &self,
+        conversation_id: i64,
+        block_ids: Vec<i64>,
+    ) -> Result<(), StoreError> {
+        if block_ids.is_empty() {
+            return Ok(());
+        }
         self.run(move |conn| {
-            conn.execute(
-                "DELETE FROM conversation_blocks WHERE conversation_id = ?1 AND block_id = ?2",
-                params![conversation_id, block_id],
-            )?;
-            Ok(())
+            transact(conn, |tx| {
+                // The one row predicate both doors delete through, prepared
+                // once and run per id: a junction row is named by its
+                // conversation and its block, and nothing else is touched.
+                let mut detach = tx.prepare(
+                    "DELETE FROM conversation_blocks
+                     WHERE conversation_id = ?1 AND block_id = ?2",
+                )?;
+                for block_id in block_ids {
+                    detach.execute(params![conversation_id, block_id])?;
+                }
+                Ok(())
+            })
         })
         .await
     }
