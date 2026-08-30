@@ -1207,6 +1207,132 @@ mod tests {
             .expect("detaching what is not held changes nothing");
     }
 
+    /// A sweep detaches its whole set through one door: the conversation loses
+    /// every named block in one step, and a sibling fork that shares the very
+    /// same block rows still reads them whole — a membership went, no content
+    /// did.
+    #[tokio::test]
+    async fn a_bulk_detach_clears_its_set_and_leaves_a_sibling_reading() {
+        let s = store();
+        let source = make_conv(&s, "p1", "model").await;
+
+        let mut said = Vec::new();
+        for turn in 0..6 {
+            said.push(
+                s.insert_text_block(source, Role::User, format!("turn {turn}"))
+                    .await
+                    .expect("the message is recorded"),
+            );
+        }
+        let last = *said.last().expect("six blocks were written");
+
+        let swept = s
+            .fork_conversation(source, last, ModelOverride::default())
+            .await
+            .expect("the sweeping fork inherits the history");
+        let sibling = s
+            .fork_conversation(source, last, ModelOverride::default())
+            .await
+            .expect("the sibling fork inherits the same history");
+
+        let detached: Vec<i64> = said[1..4].to_vec();
+        s.detach_blocks(swept, detached.clone())
+            .await
+            .expect("the whole set detaches");
+
+        let left: Vec<i64> = s
+            .list_blocks(swept)
+            .await
+            .expect("the swept fork reads")
+            .into_iter()
+            .map(|block| block.id)
+            .collect();
+        assert_eq!(
+            left,
+            vec![said[0], said[4], said[5]],
+            "one step took the whole set out of the projection and nothing else"
+        );
+
+        let sibling_blocks = s.list_blocks(sibling).await.expect("the sibling reads");
+        assert_eq!(
+            sibling_blocks
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<i64>>(),
+            said,
+            "the sibling still holds every block the sweep detached"
+        );
+        for (turn, block) in sibling_blocks.iter().enumerate() {
+            assert_eq!(
+                block.fields["content"].as_str().expect("the text reads"),
+                format!("turn {turn}"),
+                "the shared blocks keep their content: a membership went, not a block"
+            );
+        }
+    }
+
+    /// The bulk door detaches what is there and asks no existence question: an
+    /// empty list changes nothing at all, and an id the conversation does not
+    /// hold costs its list nothing.
+    #[tokio::test]
+    async fn a_bulk_detach_is_a_no_op_when_empty_and_skips_what_is_not_held() {
+        let s = store();
+        let conversation = make_conv(&s, "p1", "model").await;
+        let kept = s
+            .insert_text_block(conversation, Role::User, "kept".into())
+            .await
+            .expect("the message is recorded");
+        let going = s
+            .insert_text_block(conversation, Role::User, "going".into())
+            .await
+            .expect("the message is recorded");
+
+        let elsewhere = make_conv(&s, "p1", "model").await;
+        let stranger = s
+            .insert_text_block(elsewhere, Role::User, "another conversation's".into())
+            .await
+            .expect("the message is recorded");
+
+        s.detach_blocks(conversation, Vec::new())
+            .await
+            .expect("an empty list is a no-op");
+        assert_eq!(
+            s.list_blocks(conversation)
+                .await
+                .expect("the conversation reads")
+                .into_iter()
+                .map(|block| block.id)
+                .collect::<Vec<i64>>(),
+            vec![kept, going],
+            "the empty list detached nothing"
+        );
+
+        s.detach_blocks(conversation, vec![stranger, going, i64::MAX])
+            .await
+            .expect("unheld ids do not fail the call");
+
+        assert_eq!(
+            s.list_blocks(conversation)
+                .await
+                .expect("the conversation reads")
+                .into_iter()
+                .map(|block| block.id)
+                .collect::<Vec<i64>>(),
+            vec![kept],
+            "the held id in the list landed while the unheld ones detached nothing"
+        );
+        assert_eq!(
+            s.list_blocks(elsewhere)
+                .await
+                .expect("the other conversation reads")
+                .into_iter()
+                .map(|block| block.id)
+                .collect::<Vec<i64>>(),
+            vec![stranger],
+            "naming another conversation's block detached it from nowhere"
+        );
+    }
+
     #[tokio::test]
     async fn fork_conversation_shares_blocks() {
         let s = store();
