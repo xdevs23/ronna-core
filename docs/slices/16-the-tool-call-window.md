@@ -23,7 +23,7 @@ A tool round closes through `close_dispatch` and `settle_turn_identity`
 (`actor.rs:773-799, 917-971`): while a continuation is due the turn identity is
 held and the next `handle_blocks_ready` is the continuation. Nothing bounds rounds:
 the drain deadline bounds a stream's tail, the provider retry budget bounds
-rate-limit waiting within one request cycle (`bind.rs:44-52, 384-385`), and no
+rate-limit waiting per stream cycle (`bind.rs:44-52, 384-385`; its own doc says "the whole turn", one stream cycle per turn there), and no
 document records the absence as a decision — it is silence.
 
 **The single admission door, and what a failed tool looks like.** Every call enters
@@ -101,7 +101,12 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
   `tool-call rate limit: this conversation has spent its 60 tool calls for the last 60 seconds, and this call was not run. Answer with what you already have, or wait before calling tools again.`
   Interactive calls are counted by the window (they are recorded calls) and
   never refused by it: interactive admission belongs to the human, stated as the
-  recorded boundary. With the window cold, the unknown-tool and gate refusals
+  recorded boundary. The refusal also never touches a call that is already
+  claimed, already resolved, or carrying a granted human approval — a re-driven
+  pending call whose body ran, or a deferred call the human admitted, proceeds:
+  refusing it would falsify "this call was not run" in the ledger and orphan
+  the real result at its conditional write. The window governs FRESH admissions
+  alone. With the window cold, the unknown-tool and gate refusals
   behave exactly as today, and their errors reset the consecutive run as
   ordinary failures — they are not the model looping on the window.
   *Rejected:* a machine-key column for tool errors — the error string's own
@@ -134,7 +139,11 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
   next drive re-enters the check off the durable fold and retries — no latch,
   no retry queue; in a quiet system that next drive is the next store change or
   member message, and the wait is the stated residual (no dispatch is spent
-  meanwhile). The conversation is NOT
+  meanwhile). One residual is inherited from the marker semantics, the same one
+  `settle_turn_identity` records for itself: an outcome that commits between
+  the five-check's snapshot and the status append reads as answered by the
+  marker and never gets its continuation — the sibling edge is no cleaner than
+  its predecessor, said openly. The conversation is NOT
   latched, and the count is per open turn, never per conversation lifetime. The
   embedder observes the status block (BlocksChanged and the durable fold);
   keying a compaction on it is the embedder's own policy. *Rejected:* an opaque
@@ -143,21 +152,30 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
   *rejected:* a new bus event vocabulary — the keyed status block IS the native
   signal; *rejected:* a non-rate-limit error breaking the turn — only the
   refusal run means the model is looping on the window.
-- **The values are named consts carried by the runtime context and read at the
-  check, 2026-08-30.** `WINDOW_CALLS = 60`, `WINDOW_SECS = 60`,
-  `CONSECUTIVE_LIMIT = 5`, the operator's numbers, defined once as the defaults
-  of a `RuntimeContext` field set builder-style (the `without_title_derivation`
-  shape) and read LAZILY at each check — the `title_derivation` pattern, read
-  where it is used, never captured at construction. The runner's admission path
-  already runs with the runtime context in hand and the actor reads its own;
-  one field, no second copy, and a test-built context with a small window
-  reaches both checks because nothing snapshots the value early. *Rejected:* a
-  consumer-facing config surface — no such registry exists in this tree, and
-  the numbers are the operator's decision; *rejected:* delivering the values at
-  the runner's construction — the runner is built eagerly inside
-  `RuntimeContext::new`, before any builder runs, so a construction-time read
-  could never see an override (the context's runner field is private and
-  non-injectable; `ToolRunner::new` itself is public but not the seam).
+- **The values live on the runner, in one lock-guarded field, 2026-08-30.**
+  `WINDOW_CALLS = 60`, `WINDOW_SECS = 60`, `CONSECUTIVE_LIMIT = 5`, the
+  operator's numbers, are the defaults of a config held BY THE RUNNER — a
+  lock-guarded field beside its existing in-flight set, since the runner is the
+  admission owner and the check is its own (`execute_ready_call` reads
+  `self`; the deliberately blind `AgencyCtx` is untouched — "the restriction is
+  the point" stands). The actor's five-check reads the SAME field through the
+  context's public runner accessor (`RuntimeContext::runner()`), so one home
+  serves both readers. Writing it is crate-private: a `RuntimeContext` builder
+  method in the `without_title_derivation` shape sets the runner's field
+  through a crate-visible setter, tests build a context with a small window,
+  and no consumer-facing surface appears — the numbers are the operator's
+  decision. Verified against the tree before deciding: the runner is built
+  eagerly inside `RuntimeContext::new` (`actor.rs:123`) behind a private field
+  with a public getter (`actor.rs:164-165`), `AgencyCtx` carries only the
+  conversation id, store and bus (`agency/mod.rs:105-112`), and the runner
+  already holds a `Mutex` for in-flight state — the config field is the same
+  idiom. *Rejected:* a consumer-facing config surface — no such registry exists
+  and the numbers are decided; *rejected:* a `RuntimeContext` field read at the
+  check — the admission site never holds the context, only its blind
+  derivation, the trap two review rounds circled; *rejected:* widening
+  `AgencyCtx` — the struct's own doc records the blindness as the point;
+  *rejected:* threading values through the public call signatures — a
+  delivery-time snapshot with a public-surface ripple.
 - **The cost arithmetic is stated honestly, 2026-08-30.** The window bounds TOOL
   CALLS, not paid requests: a refused call still buys its continuation round, so
   a runaway burns up to the window plus five refusal rounds before the forced
@@ -185,9 +203,11 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
   tool error resolved out of band on a pending call (`fail_tool_call_block`, the
   public store surface), another refusal: the turn does not end — the run is
   id-ordered, so it reads the same however the window moved meanwhile (pin).
-- **AC5 — restart safety.** The fold derives from the ledger: reopened mid-window,
-  the conversation keeps refusing until the window genuinely recovers (pin
-  through a store reopen).
+- **AC5 — restart safety.** The fold derives from the ledger: reopened
+  mid-window, the conversation keeps refusing until the window genuinely
+  recovers — pinned through a path-backed store reopen (named harness work: the
+  in-memory idiom cannot reopen; the first handle drops to release the lock and
+  the rebooted runtime is driven by an append).
 - **AC6 — interactive calls are counted, never runner-refused.** Pinned at the
   counting site; the refusal-site interactive skip is defensive only — no
   interactive call reaches `execute_ready_call` today (`tool_call.rs:228-241`)
@@ -204,11 +224,13 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
 
 - Worktree `~/projects/agent-ledger-toolcap`, branch `slice/tool-round-ceiling`,
   from `master` (`f2bf250`). Build first step: `git rebase master`.
-- The status-record key vocabulary documentation gains `tool_calls_exhausted`
-  beside the existing keys, and the two recorded claims that go stale with the
-  widening are touched in the same change: the coordination follow-up pinning
-  transparency to "the two turn-closure keys" (`docs/coordination/
-  08-dispatch-identity-follow-ups.md`, item 7) and the runtime reference's
-  status-key passage (`docs/reference/event-sourced-agent-runtime.md:279`).
+- The key vocabulary's recorded claims that go stale with the widening are
+  touched in the same change: `Status::records_turn_end`'s own doc ("the exact
+  two machine keys the close writes", `records.rs:42-44`), the
+  `frontier_transparent` doc's "Exactly one shape answers true"
+  (`agency/mod.rs:156`), and the coordination follow-up pinning transparency to
+  "the two turn-closure keys" (`docs/coordination/
+  08-dispatch-identity-follow-ups.md`, item 7). The runtime reference's
+  cancellation bullet concerns the interrupted key alone and stays as it is.
 - The consumer's auto-compaction on the status key is the consumer's own unit
   (with `/compact`), deliberately out of this slice.
