@@ -1,6 +1,6 @@
 # Slice 17 — a window per tool, beside the conversation's
 
-Date: 2026-08-31. Slice 16's window caught the burst it was designed for and missed
+Date: 2026-08-30. Slice 16's window caught the burst it was designed for and missed
 the very next incident: a turn ground one failing lookup tool at well under sixty
 calls a minute, hour after hour, and the per-conversation window never tripped —
 it bounds rate, and a slow grind is in-rate. The operator's design closes the gap
@@ -29,25 +29,50 @@ builder holds the runner's sole reference (slice 16's carrier decision);
 ## Decisions taken with this slice
 
 - **Per-tool windows are the consumer's numbers, on a public builder,
-  2026-08-31.** The runner's window config gains a map from tool name to a
-  per-tool bound `{calls, seconds}`; the default map is EMPTY — the framework
-  ships no tool names, because which tools exist and how hard they may be leaned
-  on is knowledge only the embedder has, and a general mechanism must not know a
-  concrete tool (the no-smearing rule). `RuntimeContext` gains the PUBLIC builder
-  method `with_tool_window(name, calls, seconds)` in the `without_title_derivation`
-  shape, writing through the same sole-reference construction-time path as the
-  global window; slice 16's rejection of a consumer surface covered the GLOBAL
-  numbers, which are the operator's — a per-tool bound is inherently the
-  consumer's. *Rejected:* framework-shipped defaults naming tools — smearing;
-  *rejected:* a config registry — one builder method is the whole surface.
+  2026-08-30.** The runner gains a SECOND plain field beside `window`: a map
+  from tool name to a per-tool bound `ToolWindowBound { calls, seconds }`,
+  empty by default — the framework ships no tool names, because which tools
+  exist and how hard they may be leaned on is knowledge only the embedder has,
+  and a general mechanism must not know a concrete tool (the no-smearing
+  rule). `ToolCallWindow` is untouched: it keeps `Copy` and `window()` keeps
+  returning it by value; the per-tool check reads the map by reference on
+  `&self`, a `get` by name, never a clone per admission. The write path,
+  decided exactly: the runner gains a CRATE-PRIVATE `set_tool_window` sibling
+  beside the test-only `set_window` — crate-private and NOT test-gated,
+  because production's one caller is `RuntimeContext`'s new PUBLIC builder
+  method `with_tool_window(name, calls, seconds)` in the
+  `without_title_derivation` shape, which reaches the runner through
+  `Arc::get_mut` while the builder still holds the sole reference. The
+  global window's test-only surface decision STANDS — those numbers are the
+  operator's; a per-tool bound is inherently the consumer's, and slice 16's
+  rejection of a consumer surface covered the global numbers alone. A
+  consumer that clones or shares the context (or its runner) before calling
+  the builder hits `Arc::get_mut`'s `None` and the builder PANICS loudly —
+  the ordering requirement (configure windows before sharing) is stated on
+  the builder's doc, and the panic is the immutability guarantee made
+  observable. *Rejected:* framework-shipped defaults naming tools — smearing;
+  *rejected:* a config registry — one builder method is the whole surface;
+  *rejected:* the map inside `ToolCallWindow` — it drops `Copy`, breaks the
+  by-value `window()`, and clones a map on every admission;
+  *rejected:* a public setter on the runner — the public `runner()` accessor
+  hands out cloneable `Arc`s, and a public setter would let any holder write
+  mid-flight.
 - **The per-tool check sits beside the global one, at the same door, refusing
-  with the same prefix, 2026-08-31.** In `execute_ready_call`, after the global
+  with the same prefix, 2026-08-30.** In `execute_ready_call`, after the global
   window check and before everything else, a fresh admission whose tool name
   carries a bound is counted — the same reverse fold over the conversation's call
   blocks, filtered to that name, offset-aware, the call under admission included —
-  and refused when the count EXCEEDS the bound. The refusal rides
+  and refused when the count EXCEEDS the bound. One pass at the door: the
+  fresh-admission skips (interactive, claimed, human-approved) run ONCE and
+  cover both bounds; the global check speaks first, the per-tool check
+  second; the count is the SAME reverse fold — `calls_in_trailing_window`
+  gains an optional name filter reading the parsed kind's own `name`, its
+  existing call sites passing no filter — never a duplicated walk. The
+  refusal rides
   `resolve_with_error` with the SAME machine prefix and a per-tool detail
-  template interpolating the tool's name and ITS configured numbers; at the
+  template (`per_tool_rate_limit_refusal`, a second template beside the
+  global one — two templates, one decision each, since the advice tails
+  differ) interpolating the tool's name and ITS configured numbers; at the
   design bound the text reads, pinned byte for byte with `lookup_release` at
   six per sixty as the representative:
   `tool-call rate limit: this conversation has spent its 6 lookup_release calls for the last 60 seconds, and this call was not run. Answer with what you already have, or use a different tool, or wait before calling this one again.`
@@ -60,7 +85,7 @@ builder holds the runner's sole reference (slice 16's carrier decision);
   need a prefix list, two decisions where one stands; *rejected:* checking
   per-tool BEFORE the global window — order is observable only in which text
   lands, and the global bound is the outer protection: it speaks first.
-- **The failing lookup is bound by its embedder, 2026-08-31.** The assistant
+- **The failing lookup is bound by its embedder, 2026-08-30.** The assistant
   application (this framework's sibling consumer) sets `lookup_release` to six
   calls per sixty seconds at its runtime construction — one builder line in the
   app, landing with the app pin that consumes this slice. Recorded here so the
@@ -86,9 +111,12 @@ builder holds the runner's sole reference (slice 16's carrier decision);
 - **AC5 — restart safety.** The per-tool fold derives from the ledger: reopened
   path-backed mid-window, the bound tool keeps refusing until its window
   genuinely recovers (pin, the slice-16 harness shape).
-- **AC6 — the builder is the one surface.** `with_tool_window` is public, writes
-  at construction time through the sole-reference path, and no other writer
-  exists outside tests (pin: the map is immutable after construction).
+- **AC6 — the builder is the one surface.** `with_tool_window` is public and
+  writes at construction time through the sole-reference path; the runner's
+  `set_tool_window` is crate-private; a builder call after the context or
+  runner is shared panics loudly (should_panic pin); the public surface
+  itself is pinned from the OUT-OF-CRATE tests directory, where publicity is
+  provable.
 - **AC7 — the checks.** fmt, clippy with warnings denied, the full suite, the
   doc build, exit codes read bare.
 
@@ -99,6 +127,19 @@ builder holds the runner's sole reference (slice 16's carrier decision);
 - The app's one builder line (`lookup_release`, six per sixty) is the consuming
   application's own commit, landing with the pin move that ships this slice —
   named here, built there.
-- The stale-claim sweep: slice 16's refusal-text pin comments describe ONE
-  refusal text; wherever they say so exclusively, they widen to name the
-  per-tool template beside the default one.
+- The stale-claim sweep, by site — every recorded claim the slice falsifies
+  moves in the same change:
+  - the surface-decision docs saying the window write is test-only by
+    decision (`runner.rs:185`, `runner.rs:108-115`, `actor.rs:142-146`)
+    narrow to the GLOBAL numbers — the per-tool map is the consumer's,
+    public by this slice's decision;
+  - the one-template claims (`tool_error.rs:39`, `:44`, the test helper doc
+    at `actor.rs:6625`) become two templates, one decision each;
+  - the refusal-provenance claims ("must all be this window's refusals",
+    `runner.rs:81-83`; "all the window's refusals", `actor.rs:1201-1202`)
+    widen: the five-run counts rate-limit refusals from EITHER window, and
+    the consecutive limit stays one global number.
+- The byte-for-byte pin naming `lookup_release` lands in the out-of-crate
+  `crates/agent-ledger/tests/` directory, outside the forbidden-vocabulary
+  grep over `src/` — the library's source stays product-blind; in-src tests
+  use a neutral tool name.
