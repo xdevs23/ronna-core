@@ -1395,12 +1395,12 @@ pub(super) fn clone_consumer_content(
 /// the write path.
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use serde_json::{Map, json};
 
     use super::super::date_markers::DateStamp;
-    use super::super::{Continuation, ModelOverride, StoreConfig, domain_migrate, domain_run};
+    use super::super::{
+        Continuation, ModelOverride, StoreConfig, domain_migrate, domain_run, temp_dir,
+    };
     use super::*;
     use crate::block::Role;
 
@@ -1763,22 +1763,6 @@ mod tests {
             fields.insert("about_block_id".into(), Value::Number(id.into()));
         }
         fields
-    }
-
-    /// A directory of this test process's own, named so two tests never share
-    /// one.
-    fn temp_dir(label: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "agent-ledger-{label}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
     }
 
     // ─── The lifecycle, each step pinned ─────────────────────────────────

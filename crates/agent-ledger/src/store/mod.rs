@@ -753,12 +753,60 @@ pub async fn domain_migrate(
     done_rx.await.map_err(|_| StoreError::ActorStopped)?
 }
 
+/// The clock every ledger stamp is written from: the machine's local time,
+/// carried as a fixed numeric offset so the instant survives the string.
+///
+/// One clock, one home. A fold that compares stamps against "now" reads THIS,
+/// never a second clock of its own — a window measured against UTC while the
+/// rows are stamped in local time is off by the offset, silently, and only
+/// where the offset is not zero.
+pub(crate) fn now_instant() -> chrono::DateTime<chrono::FixedOffset> {
+    chrono::Local::now().fixed_offset()
+}
+
 /// An ISO 8601 timestamp with the local timezone offset, for example
 /// `2026-03-01T19:17:09.524+02:00`.
 pub(crate) fn now_iso8601() -> String {
-    chrono::Local::now()
-        .fixed_offset()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, false)
+    now_instant().to_rfc3339_opts(chrono::SecondsFormat::Millis, false)
+}
+
+/// Read a stored stamp back as the instant it names — the inverse of
+/// [`now_iso8601`], and the only place the stored form is parsed.
+///
+/// Offset-aware, never lexical: two stamps written either side of a daylight
+/// saving change carry different offsets, and comparing them as strings sorts
+/// them by the wall-clock digits rather than by time.
+///
+/// `None` for anything that is not the written form. Every production insert
+/// stamps through [`now_iso8601`], so the one shape that lands here is the
+/// schema's own `datetime('now')` column default — a space-separated UTC
+/// string, reachable only by a fixture writing a row without a stamp. Reading
+/// that as unparseable rather than as "just now" is deliberate: a caller
+/// folding a trailing window over the stamps leaves an unreadable row OUT of
+/// the window instead of holding one forever.
+pub(crate) fn parse_stamp(stamp: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(stamp).ok()
+}
+
+/// A directory of this test process's own, named so two tests never share
+/// one — where a suite that needs a store on DISK puts it (the in-memory
+/// store is what every other test uses, and it cannot be reopened).
+///
+/// One definition for the whole crate: two test modules were writing the same
+/// eight lines, and two more were about to.
+#[cfg(test)]
+pub(crate) fn temp_dir(label: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut dir = std::env::temp_dir();
+    dir.push(format!(
+        "agent-ledger-{label}-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 /// The store's own tests.
@@ -3043,21 +3091,5 @@ mod tests {
         let rows = s.list_metadata_blocks(conv).await.unwrap();
         assert_eq!(rows.len(), 1, "the failed transaction left nothing behind");
         assert_eq!(rows[0].fields["content"], "kept");
-    }
-
-    /// A directory of this test process's own, named so two tests never share
-    /// one.
-    fn temp_dir(label: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "agent-ledger-{label}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
     }
 }

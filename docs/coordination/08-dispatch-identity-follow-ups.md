@@ -131,15 +131,18 @@ reserved-name breaks the slice introduces beside the field itself.
    change. The key feeds the agency trait's new `frontier_transparent`
    hook (2026-08-23, the verified burial defect): the owed-turn frontier
    reads THROUGH a dead turn's trailing closure run — the trailing
-   `turn_ended:*` markers plus the trailing blocks anchored on the turns
+   turn-closure markers plus the trailing blocks anchored on the turns
    they disown — so an addressed message absorbed anywhere in a dead
    turn's window, the stretch between a call and its result included,
    still summons its turn at the close's re-check — anchored on itself —
    instead of resting behind the marker forever. A composed kind enum picks the hook up by regenerating
    the derive; a hand-written `Agency` impl that delegates per hook adds
    the one-line delegation. Consumer statuses and the interrupt's
-   `interrupted` stay opaque — transparency is scoped to the two
-   turn-closure keys, now published as constants on the status kind.
+   `interrupted` stay opaque — transparency is scoped to the turn-closure
+   keys, published as constants on the status kind: the two the close
+   writes, and (2026-08-30, the tool-call window) `tool_calls_exhausted`,
+   which the forced end writes between rounds when a run of the window's
+   refusals ends a turn.
 
 ## Residuals recorded at the slice's close, 2026-08-23
 
