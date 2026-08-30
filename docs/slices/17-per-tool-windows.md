@@ -66,8 +66,8 @@ builder holds the runner's sole reference (slice 16's carrier decision);
   fresh-admission skips (interactive, claimed, human-approved) run ONCE and
   cover both bounds; the global check speaks first, the per-tool check
   second; the count is the SAME reverse fold — `calls_in_trailing_window`
-  gains an optional name filter reading the parsed kind's own `name`, its
-  existing call sites passing no filter — never a duplicated walk. The
+  gains an optional name filter reading the parsed kind's own `name` — the
+  one production call site and the in-src test sites pass no filter — never a duplicated walk. The
   refusal rides
   `resolve_with_error` with the SAME machine prefix and a per-tool detail
   template (`per_tool_rate_limit_refusal`, a second template beside the
@@ -116,7 +116,8 @@ builder holds the runner's sole reference (slice 16's carrier decision);
   `set_tool_window` is crate-private; a builder call after the context or
   runner is shared panics loudly (should_panic pin); the public surface
   itself is pinned from the OUT-OF-CRATE tests directory, where publicity is
-  provable.
+  provable; the crate-privacy of `set_tool_window` is a source-review
+  property — no compile-fail harness exists and none is added for it.
 - **AC7 — the checks.** fmt, clippy with warnings denied, the full suite, the
   doc build, exit codes read bare.
 
@@ -135,10 +136,14 @@ builder holds the runner's sole reference (slice 16's carrier decision);
     public by this slice's decision;
   - the one-template claims (`tool_error.rs:39`, `:44`, the test helper doc
     at `actor.rs:6625`) become two templates, one decision each;
-  - the refusal-provenance claims ("must all be this window's refusals",
-    `runner.rs:81-83`; "all the window's refusals", `actor.rs:1201-1202`)
-    widen: the five-run counts rate-limit refusals from EITHER window, and
-    the consecutive limit stays one global number.
+  - the refusal-provenance claims widen — the five-run counts rate-limit
+    refusals from EITHER window and the consecutive limit stays one global
+    number — at ALL their homes: "must all be this window's refusals"
+    (`runner.rs:81-83`), "all the window's refusals" (`actor.rs:1201-1202`),
+    the `ToolCallWindow` type doc's "run of the window's refusals"
+    (`runner.rs:59-60`), `trailing_refusal_run`'s "only the window's own
+    refusals" (`tool_call.rs:236`), and the forced-end log line "the
+    tool-call window's refusals ended this turn" (`actor.rs:1257`).
 - The byte-for-byte pin naming `lookup_release` lands in the out-of-crate
   `crates/agent-ledger/tests/` directory, outside the forbidden-vocabulary
   grep over `src/` — the library's source stays product-blind; in-src tests
