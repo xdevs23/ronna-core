@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex};
 
 use tracing::{info, warn};
 
-use crate::agency::{AgencyCtx, BlockKind, FromBlock, GateDecision, RuntimeKind, ToolCall};
+use crate::agency::{
+    AgencyCtx, BlockKind, FromBlock, GateDecision, RuntimeKind, ToolCall, ToolError,
+};
 use crate::block::{Block, Role};
 use crate::bus::RuntimeEvent;
 use crate::store::{BlockDestination, StoreError, ToolCallInsert};
@@ -53,6 +55,44 @@ impl CallOrigin {
     }
 }
 
+/// The tool-call window's numbers: how many calls a conversation may record
+/// in a trailing span, and how long a run of the window's refusals may get
+/// before the turn is forced to end (2026-08-30).
+///
+/// The operator of the deployment this slice was cut for chose them: a
+/// runaway turn looped a failing tool for hundreds of rounds, one paid
+/// request each, until the provider refused payment. The defaults below ARE
+/// that decision; the type exists so a test can run a small window without a
+/// second copy of the numbers appearing anywhere.
+///
+/// Held by the runner, because the runner owns admission and the window is an
+/// admission answer. The forced end reads the same field through the
+/// context's runner accessor rather than keeping a copy: one home, two
+/// readers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ToolCallWindow {
+    /// How many calls one conversation may record in the trailing span. The
+    /// call under admission is itself recorded, and the refusal fires when
+    /// the count EXCEEDS this — so exactly this many calls run inside any
+    /// trailing span, and the next one is refused.
+    pub calls: usize,
+    /// The span, in seconds, the count is taken over.
+    pub seconds: i64,
+    /// How many of a turn's trailing tool outcomes must all be this window's
+    /// refusals before the turn is forced to end between rounds.
+    pub consecutive_limit: usize,
+}
+
+impl Default for ToolCallWindow {
+    fn default() -> Self {
+        Self {
+            calls: 60,
+            seconds: 60,
+            consecutive_limit: 5,
+        }
+    }
+}
+
 /// The admission chokepoint, holding the registry it resolves calls against.
 ///
 /// One per running application. The in-flight set is a SAME-PROCESS duplicate
@@ -65,6 +105,15 @@ impl CallOrigin {
 pub struct ToolRunner<K: RuntimeKind, E> {
     registry: Arc<ToolRegistry<E>>,
     in_flight: Mutex<HashSet<(i64, i64)>>,
+    /// The tool-call window in force. Written EXACTLY ONCE, at construction:
+    /// a production build takes [`ToolCallWindow`]'s defaults — the
+    /// operator's numbers — and nothing in the crate can write it after the
+    /// runner is shared, because the only other writer takes `&mut self`
+    /// ([`Self::set_window`], test-only) and the compiler grants that
+    /// exclusively while the builder still holds the sole reference. An
+    /// immutable field needs no lock, and carrying one would have said the
+    /// opposite: that some runtime writer exists.
+    window: ToolCallWindow,
     /// The kind the live-tail drive at the insert seam parses through — a
     /// type-level collaborator the runner never owns. The `fn() -> K` form is
     /// what says so to the compiler: the runner's auto traits and drop check
@@ -113,6 +162,7 @@ impl<K: RuntimeKind, E> ToolRunner<K, E> {
         Self {
             registry,
             in_flight: Mutex::new(HashSet::new()),
+            window: ToolCallWindow::default(),
             _kind: PhantomData,
         }
     }
@@ -123,19 +173,51 @@ impl<K: RuntimeKind, E> ToolRunner<K, E> {
         &self.registry
     }
 
+    /// The tool-call window in force — read by this runner's own refusal and,
+    /// through the context's runner accessor, by the forced end the actor
+    /// runs between rounds. One field, both readers.
+    pub(crate) fn window(&self) -> ToolCallWindow {
+        self.window
+    }
+
+    /// Set the window, at construction time.
+    ///
+    /// Test-only, and that IS the surface decision: the numbers are the
+    /// operator's, recorded once as [`ToolCallWindow`]'s defaults, so a
+    /// production build has nothing that can disagree with them. The library's
+    /// own suites need a small window to prove the behavior without spending
+    /// sixty calls per assertion, and they reach it through the context
+    /// builder that calls this.
+    ///
+    /// `&mut self` is the point, not an incidental signature: it is the
+    /// compiler's own proof that the write lands while the runner is still
+    /// unshared, which is what lets every reader take the field without a
+    /// lock.
+    #[cfg(test)]
+    pub(crate) fn set_window(&mut self, window: ToolCallWindow) {
+        self.window = window;
+    }
+
+    /// The in-flight set's ONE lock, poison recovery included: a panicking
+    /// tool body must not disable the guard for the rest of the process, and
+    /// the set carries no invariant a panic could break — it is a set of
+    /// claims — so the poison is cleared and the guard taken anyway. Every
+    /// site that touches the set comes through here, so the recovery is
+    /// decided once.
+    fn lock_in_flight(&self) -> std::sync::MutexGuard<'_, HashSet<(i64, i64)>> {
+        self.in_flight.lock().unwrap_or_else(|poisoned| {
+            self.in_flight.clear_poison();
+            poisoned.into_inner()
+        })
+    }
+
     /// Claim a call for this process, or `None` when it is already claimed.
     ///
     /// The lock is released before anything is awaited: holding a
     /// synchronous lock across an await point parks every other conversation's
     /// runner behind whichever tool body happens to be slowest.
     fn claim(&self, conversation_id: i64, call_block_id: i64) -> Option<Claim<'_, K, E>> {
-        let mut in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| {
-            // A panicking tool body must not disable the guard for the rest of
-            // the process. The set carries no invariant a panic could break —
-            // it is a set of claims — so the claim is taken anyway.
-            self.in_flight.clear_poison();
-            poisoned.into_inner()
-        });
+        let mut in_flight = self.lock_in_flight();
         in_flight
             .insert((conversation_id, call_block_id))
             .then(|| Claim {
@@ -146,13 +228,24 @@ impl<K: RuntimeKind, E> ToolRunner<K, E> {
             })
     }
 
+    /// Whether this process currently holds a claim on the call — the read
+    /// half of [`Self::claim`], peeked by the window's refusal.
+    ///
+    /// PER-PROCESS, and the residual is stated openly (2026-08-30): a
+    /// re-driven pending call whose body ran BEFORE a restart carries no
+    /// claim mark afterwards, so a hot window refuses it, the refusal's "this
+    /// call was not run" lands false for that one call, and the pre-restart
+    /// result loses its conditional write. Rare, restart-shaped, and no worse
+    /// than the check-to-append race the forced end records for itself.
+    fn claimed(&self, conversation_id: i64, call_block_id: i64) -> bool {
+        self.lock_in_flight()
+            .contains(&(conversation_id, call_block_id))
+    }
+
     /// Release a claim once the call is resolved in the ledger.
     fn release(&self, conversation_id: i64, call_block_id: i64) {
-        let mut in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| {
-            self.in_flight.clear_poison();
-            poisoned.into_inner()
-        });
-        in_flight.remove(&(conversation_id, call_block_id));
+        self.lock_in_flight()
+            .remove(&(conversation_id, call_block_id));
     }
 }
 
@@ -250,11 +343,24 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
     /// 2. **Already resolved?** Return. This is what makes a duplicate wakeup
     ///    free, and it comes FIRST so no later step can re-run a completed
     ///    body.
-    /// 3. **Resolve the tool.** Unknown resolves the call with an error rather
+    /// 3. **Is the conversation's tool-call window spent?** (2026-08-30) If
+    ///    it is, this call resolves with the window's refusal and NOTHING
+    ///    else runs. It comes before every other refusal, the unknown tool
+    ///    included: a hot window meeting an unknown tool name would otherwise
+    ///    loop on the teaching text, a second unbounded shape. What the
+    ///    window never touches is a call whose body may already have run —
+    ///    one claimed by this process, one carrying a granted human approval
+    ///    (step 6's `Approved`) — and an interactive call, whose admission
+    ///    belongs to the human; refusing any of those would write "this call
+    ///    was not run" over a call that did run, and orphan its real result
+    ///    at the conditional write. The window governs FRESH admissions
+    ///    alone. The interactive skip is defensive only: an interactive call
+    ///    is answered by the human and never reaches this pass at all.
+    /// 4. **Resolve the tool.** Unknown resolves the call with an error rather
     ///    than leaving it dangling: a call nobody can run is still a call the
     ///    model is waiting on.
-    /// 4. **Ungated?** Straight to the body. No evaluation, no record of one.
-    /// 5. **Read the recorded standing** and, only where nothing is recorded
+    /// 5. **Ungated?** Straight to the body. No evaluation, no record of one.
+    /// 6. **Read the recorded standing** and, only where nothing is recorded
     ///    yet, ask the tool's own gate — which records its answer before
     ///    anything acts on it.
     async fn execute_ready_call(&self, ctx: &AgencyCtx<E>, call_block_id: i64) {
@@ -287,6 +393,10 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
             return;
         }
 
+        if self.window_refuses(ctx, &ledger, &call).await {
+            return;
+        }
+
         let Some(handler) = self.registry.get(&call.name) else {
             warn!(name = call.name, "tool runner: no handler registered");
             // The refusal carries the fix: the names that WOULD resolve, in
@@ -315,6 +425,49 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
             return;
         }
         self.run_body(ctx, handler, &call).await;
+    }
+
+    /// The tool-call window's admission answer (2026-08-30): is this
+    /// conversation's window spent, and is this a call the window may refuse?
+    ///
+    /// Answers whether the call was refused — `true` means the refusal is
+    /// already recorded and the caller must stop, exactly like the gate's
+    /// own refusal path.
+    ///
+    /// The count is the ledger's ([`ToolCall::calls_in_trailing_window`]), and
+    /// the call under admission is one of the rows it counts: insert-first
+    /// put it there before any hook ran. So the refusal fires when the count
+    /// EXCEEDS the window — the window's worth of calls all run, and the
+    /// first one past it inside any trailing span is refused. A refused call
+    /// stays a recorded call and keeps counting: a window that forgot its own
+    /// refusals would drain while the model spams and hand the whole
+    /// protection to the forced end.
+    async fn window_refuses(&self, ctx: &AgencyCtx<E>, ledger: &[Block], call: &ToolCall) -> bool {
+        if call.interactive || self.claimed(ctx.conversation_id, call.id) {
+            return false;
+        }
+        if approval_state(ledger, call.id) == ApprovalState::Approved {
+            return false;
+        }
+        let window = self.window();
+        if ToolCall::calls_in_trailing_window(ledger, window.seconds) <= window.calls {
+            return false;
+        }
+        info!(
+            name = call.name,
+            conversation_id = ctx.conversation_id,
+            calls = window.calls,
+            seconds = window.seconds,
+            "tool runner: the conversation's tool-call window is spent — refusing"
+        );
+        self.resolve_with_error(
+            ctx,
+            &call.tool_call_id,
+            ToolError::rate_limit_refusal(window.calls, window.seconds),
+            call.id,
+        )
+        .await;
+        true
     }
 
     /// The admission half: read what is recorded about this call, and consult

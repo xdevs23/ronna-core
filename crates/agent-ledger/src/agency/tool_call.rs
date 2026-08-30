@@ -155,6 +155,115 @@ impl ToolCall {
             .count()
     }
 
+    /// How many tool calls this ledger recorded inside the trailing
+    /// `seconds` — the tool-call window's own count (2026-08-30).
+    ///
+    /// A fold, never a counter: "how much has this conversation spent
+    /// lately" is derivable from the rows themselves, so it is not state
+    /// anywhere. It therefore survives a restart, which the burn it bounds
+    /// also does, and no in-memory copy can disagree with it.
+    ///
+    /// Read on the stamps as they really are: every call rides
+    /// `insert_block`, which names the row's `created_at` from the machine's
+    /// local clock with a fixed numeric offset, so the compare parses each
+    /// stamp to an INSTANT ([`parse_stamp`](crate::store::parse_stamp)) and
+    /// takes "now" from that same clock ([`now_instant`](crate::store::now_instant)).
+    /// A lexical compare would be wrong twice over: two offsets straddling a
+    /// daylight saving change do not sort as strings, and the window would
+    /// silently mean something else wherever the offset is not zero. A stamp
+    /// that does not parse is outside the window — the reasoning is recorded
+    /// on `parse_stamp`.
+    ///
+    /// Every recorded call counts: executed, refused by the window itself,
+    /// refused by a gate, interactive, out of band. The caller scopes the
+    /// ledger — one conversation's blocks — and every call joins exactly one
+    /// conversation, so this is the per-conversation count without the fold
+    /// naming a conversation at all.
+    ///
+    /// **Bounded by the window, never by the ledger.** The walk runs BACKWARD
+    /// from the newest block and stops at the first call stamped before the
+    /// cutoff: the answer is complete there, and the ledger behind it — an
+    /// append-only history a consumer keeps without retention — is never
+    /// touched. The stop rests on the stamps ascending along ledger order,
+    /// which is what the stamp doc above already describes: every call in one
+    /// conversation is stamped at insert by the one writer's clock, and a
+    /// fork's copies carry their older source stamps ahead of everything
+    /// appended after them. A clock stepped BACKWARD is the only way that
+    /// assumption breaks, and it breaks toward under-counting — the same
+    /// direction the out-of-range fallbacks below take, never toward refusing
+    /// a conversation that is spending nothing. A stamp that does not parse
+    /// carries no time to compare, so it neither counts nor ends the walk.
+    #[must_use]
+    pub(crate) fn calls_in_trailing_window(ledger: &[Block], seconds: i64) -> usize {
+        // A `seconds` outside the representable span of a delta — reachable
+        // only through an absurd configured value, since the numbers are the
+        // operator's compiled defaults — degrades to a zero-length window,
+        // which counts nothing and therefore refuses nothing. The same
+        // direction as the fallback below, and deliberate for the same
+        // reason: the window bounds spending, it never becomes the reason a
+        // conversation stops working.
+        let span = chrono::TimeDelta::try_seconds(seconds).unwrap_or_else(chrono::TimeDelta::zero);
+        let Some(cutoff) = crate::store::now_instant().checked_sub_signed(span) else {
+            // A clock so far from the epoch that the window cannot be
+            // subtracted from it: count nothing rather than refuse
+            // everything.
+            return 0;
+        };
+        let mut calls = 0;
+        for block in ledger.iter().rev() {
+            if !matches!(BlockKind::from_block(block), BlockKind::ToolCall(_)) {
+                continue;
+            }
+            match crate::store::parse_stamp(&block.created_at) {
+                Some(at) if at >= cutoff => calls += 1,
+                Some(_) => break,
+                None => {}
+            }
+        }
+        calls
+    }
+
+    /// How many of the turn's LAST tool outcomes are tool-call window
+    /// refusals, counted back from the newest until one is not (2026-08-30).
+    ///
+    /// The outcome SUBSEQUENCE, never raw block adjacency: every refused
+    /// round appends the next round's call block behind the previous error,
+    /// so two tool-error rows are never neighbours in the ledger and a
+    /// literal run of blocks would never find a run at all. Results and
+    /// errors anchored on `anchor` are the subsequence, in ledger order —
+    /// which is the ids' own order for a conversation's appends — and a
+    /// result, a gate refusal or any other failure ends the run as an
+    /// ordinary outcome: only the window's own refusals mean the model is
+    /// looping on the window.
+    ///
+    /// Anchor-keyed like every other turn fold here, which is also what
+    /// keeps an out-of-band call — recorded with a NULL anchor — out of the
+    /// open turn's run entirely: it can never lengthen one.
+    ///
+    /// **Bounded by the turn, never by the ledger.** The reverse walk stops
+    /// at the anchor's own block: an outcome anchored on this turn was
+    /// appended after the block the anchor names, so nothing at or before
+    /// that block can belong to the run, and the history in front of the
+    /// turn — append-only and kept without retention — is never scanned. Ids
+    /// answer "at or before" because they ascend along junction order in
+    /// every conversation, the same property the fork's inherited-history
+    /// cursor is derived from.
+    #[must_use]
+    pub(crate) fn trailing_refusal_run(ledger: &[Block], anchor: i64) -> usize {
+        ledger
+            .iter()
+            .rev()
+            .take_while(|block| block.id > anchor)
+            .filter(|block| block.dispatch_anchor == Some(anchor))
+            .filter_map(|block| match BlockKind::from_block(block) {
+                BlockKind::ToolError(error) => Some(error.records_rate_limit_refusal()),
+                BlockKind::ToolResult(_) => Some(false),
+                _ => None,
+            })
+            .take_while(|refusal| *refusal)
+            .count()
+    }
+
     /// The newest tool outcome in the ledger — a result or an error — whose
     /// turn is still UNANSWERED, answered as that turn's anchor.
     ///

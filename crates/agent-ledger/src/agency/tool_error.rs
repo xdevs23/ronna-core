@@ -21,6 +21,46 @@ pub struct ToolError {
     pub error: String,
 }
 
+impl ToolError {
+    /// The stable machine prefix of the tool-call window's refusal
+    /// (2026-08-30). The error string's own fixed prefix IS the machine key
+    /// here, the way a status row carries its documented key: an error is
+    /// already a durable block the model reads, and a column beside it would
+    /// be a second place recording what one string already says.
+    ///
+    /// Read back with a starts-with test, in one place, which is how the
+    /// forced end counts a run of refusals. A handler whose own error opened
+    /// with these bytes would feed that count — knowingly accepted: it is
+    /// vanishingly unlikely, and five consecutive claimed rate limits ending
+    /// the turn is defensible behavior even then.
+    pub const RATE_LIMIT_PREFIX: &'static str = "tool-call rate limit:";
+
+    /// The window's refusal, rendered for the model: the machine prefix above,
+    /// then the one detail template.
+    ///
+    /// The numbers are INTERPOLATED from the window actually in force —
+    /// `calls` per `seconds` — rather than baked into the sentence, so a
+    /// deployment or a test running its own window never ships a message that
+    /// lies about it. Plain numbers, no unit-word branches: one template, one
+    /// decision, one place it reads from.
+    #[must_use]
+    pub(crate) fn rate_limit_refusal(calls: usize, seconds: i64) -> String {
+        let prefix = Self::RATE_LIMIT_PREFIX;
+        format!(
+            "{prefix} this conversation has spent its {calls} tool calls for the last \
+             {seconds} seconds, and this call was not run. Answer with what you already have, \
+             or wait before calling tools again."
+        )
+    }
+
+    /// Whether this error is the tool-call window's own refusal — the read
+    /// half of [`RATE_LIMIT_PREFIX`](Self::RATE_LIMIT_PREFIX), and the only
+    /// place the prefix is matched.
+    pub(crate) fn records_rate_limit_refusal(&self) -> bool {
+        self.error.starts_with(Self::RATE_LIMIT_PREFIX)
+    }
+}
+
 impl super::LeafKind for ToolError {
     const KINDS: &'static [&'static str] = &["tool_error"];
 

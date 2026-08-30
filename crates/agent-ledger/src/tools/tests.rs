@@ -29,6 +29,7 @@ use crate::types::ApprovalChoice;
 
 use super::{
     ToolContext, ToolHandler, ToolOutcome, ToolRegistry, ToolRunner, admission::submit_approval,
+    runner::ToolCallWindow,
 };
 
 /// A gated tool that counts its executions and answers whatever gate decision
@@ -1494,4 +1495,385 @@ async fn a_panicking_body_releases_its_claim_for_the_next_wakeup() {
         .collect();
     assert_eq!(results.len(), 1, "the retry resolved the call");
     assert_eq!(results[0].fields["content"], Value::from("recovered"));
+}
+
+// ─── The tool-call window ────────────────────────────────────────────────────
+
+/// An ungated tool that counts every body execution. The window's whole claim
+/// is that a refused call never reaches one, so the counter is what proves it.
+struct CountingTool {
+    executions: Arc<AtomicUsize>,
+}
+
+impl ToolHandler<CoreEvent> for CountingTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "counter".into(),
+            description: "a test-only tool that counts its runs".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _input: &'a str,
+        _ctx: ToolContext<'a, CoreEvent>,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            ToolOutcome::Done("ran".into())
+        })
+    }
+}
+
+/// A runner over one counting tool, with the window the test chose.
+fn window_runner(window: ToolCallWindow) -> (ToolRunner<BlockKind, CoreEvent>, Arc<AtomicUsize>) {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(
+        "counter",
+        CountingTool {
+            executions: Arc::clone(&executions),
+        },
+    );
+    let mut runner = ToolRunner::<BlockKind, _>::new(Arc::new(registry));
+    runner.set_window(window);
+    (runner, executions)
+}
+
+/// Record a call and feed the chokepoint its one wakeup — the whole admission
+/// pass, driven by the test rather than by a loop, so a red result names an
+/// assertion instead of a timeout.
+async fn drive_call(
+    runner: &ToolRunner<BlockKind, CoreEvent>,
+    ctx: &AgencyCtx<CoreEvent>,
+    tool_call_id: &str,
+) -> i64 {
+    let call = runner
+        .insert_call(
+            ctx,
+            false,
+            tool_call_id.into(),
+            "counter".into(),
+            "{}".into(),
+            CallOrigin::default(),
+        )
+        .await
+        .unwrap();
+    runner.run_wakeup(ctx, false, call).await;
+    call
+}
+
+/// Every tool error recorded in the conversation, in ledger order.
+async fn error_texts(ctx: &AgencyCtx<CoreEvent>) -> Vec<String> {
+    ctx.store
+        .list_blocks(ctx.conversation_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|block| block.block_type == "tool_error")
+        .map(|block| block.fields["error"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The window's numbers ARE the operator's decision, recorded once as the
+/// defaults, and its refusal reads exactly as specified at those defaults —
+/// pinned byte for byte, because the model reads this sentence and the forced
+/// end matches its prefix.
+#[test]
+fn the_default_window_and_its_refusal_are_pinned() {
+    let window = ToolCallWindow::default();
+    assert_eq!(window.calls, 60);
+    assert_eq!(window.seconds, 60);
+    assert_eq!(window.consecutive_limit, 5);
+
+    assert_eq!(
+        crate::agency::ToolError::rate_limit_refusal(window.calls, window.seconds),
+        "tool-call rate limit: this conversation has spent its 60 tool calls for the last 60 \
+         seconds, and this call was not run. Answer with what you already have, or wait \
+         before calling tools again."
+    );
+    // The numbers are interpolated, never baked in: a deployment or a test
+    // running its own window never ships a sentence that lies about it.
+    assert!(
+        crate::agency::ToolError::rate_limit_refusal(3, 30)
+            .contains("its 3 tool calls for the last 30 seconds"),
+        "the template carries the window actually in force"
+    );
+    assert!(
+        crate::agency::ToolError::rate_limit_refusal(3, 30)
+            .starts_with(crate::agency::ToolError::RATE_LIMIT_PREFIX),
+        "every refusal opens with the machine prefix"
+    );
+}
+
+/// AC1 — the window refuses. With the window spent, the next call resolves
+/// with the pinned refusal and its handler never runs; a second conversation
+/// on the same runner, at the same moment, runs its call untouched, because
+/// the count is a fold over ONE conversation's ledger.
+#[tokio::test]
+async fn a_spent_window_refuses_the_next_call_and_never_runs_its_body() {
+    let (runner, executions) = window_runner(ToolCallWindow {
+        calls: 2,
+        seconds: 60,
+        consecutive_limit: 5,
+    });
+    let o = Oracle::new().await;
+    o.user_text("go").await;
+
+    drive_call(&runner, &o.ctx, "w-1").await;
+    drive_call(&runner, &o.ctx, "w-2").await;
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        2,
+        "the window's own calls run"
+    );
+    assert!(
+        error_texts(&o.ctx).await.is_empty(),
+        "and none of them is refused"
+    );
+
+    drive_call(&runner, &o.ctx, "w-3").await;
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        2,
+        "the call past the window never reached the body"
+    );
+    assert_eq!(
+        error_texts(&o.ctx).await,
+        vec![
+            "tool-call rate limit: this conversation has spent its 2 tool calls for the last \
+             60 seconds, and this call was not run. Answer with what you already have, or \
+             wait before calling tools again."
+                .to_owned()
+        ],
+        "the refusal is recorded as the call's outcome, in the window's own numbers"
+    );
+
+    // The same runner, the same instant, a different conversation: untouched.
+    let second = o
+        .ctx
+        .store
+        .create_conversation("p1".into(), "model".into(), "model".into(), String::new())
+        .await
+        .unwrap();
+    let other = o.scoped_to(second);
+    other.user_text("go").await;
+    drive_call(&runner, &other.ctx, "w-other").await;
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        3,
+        "another conversation's window is its own"
+    );
+    assert!(
+        error_texts(&other.ctx).await.is_empty(),
+        "and nothing there is refused"
+    );
+}
+
+/// AC2 — refusals keep the window spent. A refused call is a recorded call and
+/// keeps counting: a window that forgot its own refusals would drain while the
+/// model spams and hand the whole protection to the forced end.
+#[tokio::test]
+async fn refused_calls_keep_counting_against_the_window() {
+    let (runner, executions) = window_runner(ToolCallWindow {
+        calls: 3,
+        seconds: 60,
+        consecutive_limit: 5,
+    });
+    let o = Oracle::new().await;
+    o.user_text("go").await;
+
+    for id in ["r-1", "r-2", "r-3"] {
+        drive_call(&runner, &o.ctx, id).await;
+    }
+    for id in ["r-4", "r-5", "r-6", "r-7"] {
+        drive_call(&runner, &o.ctx, id).await;
+    }
+
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        3,
+        "three ran, and the window never recovered while the run continued"
+    );
+    let errors = error_texts(&o.ctx).await;
+    assert_eq!(errors.len(), 4, "every call past the window is refused");
+    assert!(
+        errors
+            .iter()
+            .all(|error| error.starts_with(crate::agency::ToolError::RATE_LIMIT_PREFIX))
+    );
+
+    let ledger = o
+        .ctx
+        .store
+        .list_blocks(o.ctx.conversation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60),
+        7,
+        "the fold counts the refused calls too — executed and refused alike"
+    );
+}
+
+/// AC6 — an interactive call is COUNTED by the window: it is a recorded call
+/// and a paid round's product like any other. It is never runner-refused, and
+/// that skip is defensive only — an interactive call is answered by the human
+/// outright and never reaches the chokepoint at all, so there is no reachable
+/// path to test it through.
+#[tokio::test]
+async fn the_window_counts_an_interactive_call() {
+    let o = Oracle::new().await;
+    o.user_text("go").await;
+    o.call("plain").await;
+    o.ctx
+        .store
+        .insert_tool_call_block(
+            o.ctx.conversation_id,
+            crate::block::Role::Assistant,
+            crate::store::ToolCallInsert {
+                tool_call_id: "asked".into(),
+                name: "ask".into(),
+                input: "{}".into(),
+                interactive: true,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let ledger = o
+        .ctx
+        .store
+        .list_blocks(o.ctx.conversation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60),
+        2,
+        "the interactive call counts against the window like every recorded call"
+    );
+}
+
+/// A tool-call row as the ledger holds one, stamped `age` seconds ago in the
+/// writer's own form — what a store insert would have written that long back.
+fn aged_call(id: i64, age: i64) -> Block {
+    stamped_call(
+        id,
+        (crate::store::now_instant() - chrono::TimeDelta::seconds(age))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
+    )
+}
+
+/// The same row with whatever stamp text the test names.
+fn stamped_call(id: i64, created_at: String) -> Block {
+    Block {
+        id,
+        role: Some(crate::block::Role::Assistant),
+        block_type: "tool_call".into(),
+        created_at,
+        dispatch_anchor: None,
+        fields: serde_json::Map::from_iter([
+            ("tool_call_id".to_owned(), Value::String(format!("c-{id}"))),
+            ("name".to_owned(), Value::String("counter".into())),
+            ("input".to_owned(), Value::String("{}".into())),
+        ]),
+    }
+}
+
+/// The count is bounded by the WINDOW, not by the ledger: the walk runs back
+/// from the newest row and stops at the first call older than the window, so a
+/// history of any depth in front of it costs nothing — and the answer is the
+/// same one the whole-ledger fold gave. An unreadable stamp carries no time to
+/// compare with, so it neither counts nor ends the walk: the in-window calls
+/// behind it still count.
+#[test]
+fn the_window_count_stops_at_the_first_call_older_than_the_window() {
+    let ledger: Vec<Block> = vec![
+        aged_call(1, 4000),
+        aged_call(2, 3000),
+        aged_call(3, 2000),
+        aged_call(4, 50),
+        // The schema default's form, reachable only by a fixture writing a row
+        // without a stamp: unparseable, and no reason to truncate the count.
+        stamped_call(5, "2026-08-30 12:00:00".into()),
+        aged_call(6, 10),
+    ];
+
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 60),
+        2,
+        "the two calls inside the minute, across the unreadable stamp between them"
+    );
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 3600),
+        4,
+        "a wider window reaches further back, and stops at the call outside it"
+    );
+    assert_eq!(
+        crate::agency::ToolCall::calls_in_trailing_window(&ledger, 0),
+        0,
+        "a window of no length holds nothing"
+    );
+}
+
+/// AC5's admission half — restart safety. The window is a fold over the
+/// ledger, so a process that lost every byte of its memory still refuses:
+/// the store is reopened from disk (the in-memory idiom cannot reopen), the
+/// first handle is dropped to release it, and the rebooted runtime — a fresh
+/// runner with an empty in-flight set — is driven by an append.
+#[tokio::test]
+async fn a_reopened_ledger_keeps_the_window_spent() {
+    let dir = crate::store::temp_dir("tool-call-window-restart");
+    let db = dir.join("ledger.db");
+    let window = ToolCallWindow {
+        calls: 2,
+        seconds: 60,
+        consecutive_limit: 5,
+    };
+    let bus = Arc::new(crate::bus::EventBus::<CoreEvent>::new());
+
+    let conv = {
+        let store = Store::open(&db).unwrap();
+        let conv = store
+            .create_conversation("p1".into(), "model".into(), "model".into(), String::new())
+            .await
+            .unwrap();
+        let ctx = AgencyCtx {
+            conversation_id: conv,
+            store,
+            bus: Arc::clone(&bus),
+        };
+        let (runner, executions) = window_runner(window);
+        drive_call(&runner, &ctx, "before-1").await;
+        drive_call(&runner, &ctx, "before-2").await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            2,
+            "the window's calls ran"
+        );
+        conv
+    };
+
+    let store = Store::open(&db).unwrap();
+    let ctx = AgencyCtx {
+        conversation_id: conv,
+        store,
+        bus,
+    };
+    let (runner, executions) = window_runner(window);
+    drive_call(&runner, &ctx, "after-restart").await;
+
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "the rebooted runner refuses off the ledger alone — nothing in memory told it to"
+    );
+    assert_eq!(
+        error_texts(&ctx).await.len(),
+        1,
+        "and the refusal is recorded as that call's outcome"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

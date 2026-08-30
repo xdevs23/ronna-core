@@ -85,7 +85,10 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
   predicate, exactly: count every recorded call in the trailing window, the one
   under admission included, and refuse when that count EXCEEDS the window — the
   sixty allowed calls all run, the sixty-first inside any trailing minute is the
-  first refused. Out-of-band calls record NULL anchors and sit outside the open
+  first refused. At batch granularity the boundary is coarser, stated honestly:
+  insert-first records a whole parallel batch before any of its admissions run,
+  so a batch that crosses the line refuses ALL its members — the error
+  direction is over-refusal only, and the at-most-sixty invariant holds. Out-of-band calls record NULL anchors and sit outside the open
   turn's consecutive run; they can only shorten it, never fake it — safe by
   direction, and the window still counts them. *Rejected:* a window in the runner's mutex or the actor's state —
   a decision in memory while the ledger says otherwise, the exact shape the tools
@@ -168,10 +171,14 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
   *rejected:* a new bus event vocabulary — the keyed status block IS the native
   signal; *rejected:* a non-rate-limit error breaking the turn — only the
   refusal run means the model is looping on the window.
-- **The values live on the runner, in one lock-guarded field, 2026-08-30.**
+- **The values live on the runner, in one plain field written at
+  construction, 2026-08-30.**
   `WINDOW_CALLS = 60`, `WINDOW_SECS = 60`, `CONSECUTIVE_LIMIT = 5`, the
   operator's numbers, are the defaults of a config held BY THE RUNNER — a
-  lock-guarded field beside its existing in-flight set, since the runner is the
+  plain field beside its existing in-flight set, written only while the
+  context builder still holds the runner's sole reference, so the
+  construction-time write is compiler-enforced and no runtime lock guards a
+  value nothing writes; the runner is the
   admission owner and the check is its own (`execute_ready_call` reads
   `self`; the deliberately blind `AgencyCtx` is untouched — "the restriction is
   the point" stands). The actor's five-check reads the SAME field through the
@@ -183,9 +190,9 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
   decision. Verified against the tree before deciding: the runner is built
   eagerly inside `RuntimeContext::new` (`actor.rs:123`) behind a private field
   with a public getter (`actor.rs:164-165`), `AgencyCtx` carries only the
-  conversation id, store and bus (`agency/mod.rs:105-112`), and the runner
-  already holds a `Mutex` for in-flight state — the config field is the same
-  idiom. *Rejected:* a consumer-facing config surface — no such registry exists
+  conversation id, store and bus (`agency/mod.rs:105-112`), and the builder
+  holds the runner's sole reference at build time, so a plain field takes the
+  write without a lock. *Rejected:* a consumer-facing config surface — no such registry exists
   and the numbers are decided; *rejected:* a `RuntimeContext` field read at the
   check — the admission site never holds the context, only its blind
   derivation, the trap two review rounds circled; *rejected:* widening

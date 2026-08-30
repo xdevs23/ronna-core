@@ -154,14 +154,16 @@ pub trait Agency {
     /// answers instead. Default: opaque — the tail speaks for itself.
     ///
     /// Exactly one shape answers `true`: the status record carrying a
-    /// stored turn-closure key ([`Status`]). That marker is
-    /// appended by a close that ends a turn over an unanswered outcome, and
-    /// an addressed message absorbed into the dead turn's window sits
-    /// BEHIND it in ledger order — an opaque marker buried that message
-    /// forever, because the non-latching closed edge has no re-engagement
-    /// beyond the close's one re-check. The interrupt's status stays opaque
-    /// on purpose: its capping under the latch is that path's recorded
-    /// semantics, and the latch's own release re-checks there.
+    /// stored turn-closure key ([`Status`]). Such a marker is written
+    /// wherever the runtime ends a turn as a stored fact — by a close that
+    /// ends a turn over an unanswered outcome, and (2026-08-30) by the
+    /// forced end a run of tool-call window refusals triggers between
+    /// rounds — and an addressed message absorbed into the dead turn's
+    /// window sits BEHIND it in ledger order: an opaque marker buried that
+    /// message forever, because neither end latches and the closed edge has
+    /// no re-engagement beyond its one re-check. The interrupt's status
+    /// stays opaque on purpose: its capping under the latch is that path's
+    /// recorded semantics, and the latch's own release re-checks there.
     fn frontier_transparent(&self) -> bool {
         false
     }

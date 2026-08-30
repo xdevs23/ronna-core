@@ -135,6 +135,33 @@ impl<K: RuntimeKind, E> RuntimeContext<K, E> {
         self
     }
 
+    /// The same context with a different tool-call window on its runner
+    /// (2026-08-30) — the shape above, for the numbers that live on the
+    /// runner instead of here.
+    ///
+    /// Test-only by decision: the window's values are the operator's,
+    /// recorded once as the window's own defaults, and a consumer-facing knob
+    /// would be a second place they are decided. The library's own tests
+    /// build a small window through here so the window's behavior is
+    /// provable without spending sixty calls per assertion.
+    ///
+    /// The write is construction-time and the type says so: this builder
+    /// still holds the runner's sole reference, so `Arc::get_mut` hands over
+    /// the exclusive borrow the setter needs. A context already shared with a
+    /// runtime fails here loudly rather than writing a window half its
+    /// readers would never see.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_tool_call_window(
+        mut self,
+        window: crate::tools::runner::ToolCallWindow,
+    ) -> Self {
+        Arc::get_mut(&mut self.runner)
+            .expect("the tool-call window is set while the context still owns its runner alone")
+            .set_window(window);
+        self
+    }
+
     /// Whether the metadata worker derives conversation titles.
     #[must_use]
     pub fn title_derivation(&self) -> bool {
@@ -1014,9 +1041,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         // through that same drive rather than signalling here. The ledger can
         // still move between a drive and its delivery; the tail re-check
         // below is what stands a signal that went stale down.
-        let store = &self.ctx.store;
-
-        let blocks = match store.list_blocks(self.id).await {
+        let blocks = match self.ctx.store.list_blocks(self.id).await {
             Ok(b) => b,
             Err(e) => {
                 tracing::error!(conversation_id = self.id, error = %e, "handle_blocks_ready: list_blocks failed");
@@ -1075,7 +1100,15 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             .open_turn
             .unwrap_or_else(|| ratchet::fresh_turn_anchor(&blocks, tail));
 
-        let conv = match store.find_conversation(self.id).await {
+        // The forced end (2026-08-30), decided BEFORE the dispatch spends: a
+        // turn whose trailing tool outcomes are all tool-call window
+        // refusals is a turn looping on a spent window, and every further
+        // round buys a paid request to be refused again.
+        if self.end_turn_if_tool_calls_exhausted(&blocks, anchor).await {
+            return;
+        }
+
+        let conv = match self.ctx.store.find_conversation(self.id).await {
             Ok(Some(c)) => c,
             Ok(None) => {
                 tracing::warn!(
@@ -1151,6 +1184,91 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         self.open_turn = Some(anchor);
 
         tracing::info!(conversation_id = self.id, "sent stream request to provider");
+    }
+
+    /// End the turn that is looping on a spent tool-call window, if this one
+    /// is (2026-08-30) — a WRITE, not a question: the end it decides on is
+    /// performed here, in the same call, and `true` is the caller's
+    /// instruction to stand its dispatch down.
+    ///
+    /// Both edges answer `true`, because both mean "do not spend this
+    /// dispatch": the marker landed and the turn is over, or the append
+    /// FAILED and the turn stays open for the next drive to retry off the
+    /// durable fold. Only a run shorter than the limit answers `false`, and
+    /// that path writes nothing.
+    ///
+    /// The rule reads the LEDGER, on the dispatch's own snapshot: when the
+    /// turn's trailing tool outcomes are all the window's refusals, as many
+    /// of them as the window's consecutive limit
+    /// ([`ToolCall::trailing_refusal_run`]), the model has stopped making
+    /// progress — a history that deep in refusals has gone bad — and every
+    /// further round costs a paid request for another refusal. The turn the
+    /// rule scopes to is the RESOLVED anchor the caller just decided, held
+    /// identity or ledger-derived alike, so a restart that cleared the held
+    /// field while the ledger still owes the dead turn's continuation reaches
+    /// the same verdict.
+    ///
+    /// The end, in order: the status block anchored on the turn joins the
+    /// ledger, and ONLY after that append succeeds is the held identity
+    /// released — a named release edge beside
+    /// [`Self::settle_turn_identity`]'s. If the append fails nothing is
+    /// released and nothing is dispatched; the next drive re-enters this
+    /// check off the durable fold and retries, so there is no retry queue and
+    /// no latch. In a quiet system that next drive is the next store change
+    /// or member message, and that wait is the stated residual — no dispatch
+    /// is spent meanwhile.
+    ///
+    /// The conversation is NOT latched: this is a decision, not an error, and
+    /// the error edge's latch would take the whole conversation down for it.
+    /// The marker's key joins the turn-closure family
+    /// ([`Status::records_turn_end`](crate::agency::Status)), so the frontier
+    /// reads THROUGH it: a member's message landing in the gap between this
+    /// check and its append still owes behind the marker and summons its own
+    /// turn, which is exactly the burial the tree's own recorded defect
+    /// produced from an opaque end marker. With nothing owed behind it the
+    /// loop still rests, because the summons bound disowns the ended turn.
+    ///
+    /// One residual is inherited from the marker's semantics, the same one
+    /// the close records for itself: an outcome that commits between this
+    /// snapshot and the append reads as answered by the marker and never gets
+    /// its continuation. The sibling edge is no cleaner than its predecessor,
+    /// said openly.
+    async fn end_turn_if_tool_calls_exhausted(&mut self, blocks: &[Block], anchor: i64) -> bool {
+        let limit = self.ctx.runner().window().consecutive_limit;
+        if ToolCall::trailing_refusal_run(blocks, anchor) < limit {
+            return false;
+        }
+        match self
+            .ctx
+            .store
+            .insert_status_block(
+                crate::store::BlockDestination::anchored(self.id, Some(anchor)),
+                crate::agency::Status::TOOL_CALLS_EXHAUSTED.into(),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                self.open_turn = None;
+                tracing::info!(
+                    conversation_id = self.id,
+                    anchor,
+                    refusals = limit,
+                    "the tool-call window's refusals ended this turn — standing the \
+                     dispatch down"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    conversation_id = self.id,
+                    anchor,
+                    error = %e,
+                    "the forced end's status append failed — the turn stays open and \
+                     the next drive retries"
+                );
+            }
+        }
+        true
     }
 
     /// Ensure we have a bound provider channel. Returns the sender, or `None`
@@ -3194,6 +3312,14 @@ mod tests {
         /// frontier is the first round's RESULT, a turn product, so its call
         /// must inherit the original summoning message's identity.
         TwoToolRounds,
+        /// [`Script::TwoToolRounds`], parameterized: `rounds` sequential tool
+        /// rounds before the closing prose, each answering with a call of its
+        /// own. A model that never stops asking for tools is what the
+        /// tool-call window exists for, and this is that model on the wire —
+        /// the only way to drive a RUN of the window's refusals through the
+        /// real loop instead of writing the refusals into the ledger by
+        /// hand.
+        ManyToolRounds { rounds: usize },
         /// [`Script::TwoToolRounds`] with round ONE's trailing done HELD:
         /// the message end and the whole tool lifecycle go out at once — so
         /// the call records and its result lands while the stream is still
@@ -3924,6 +4050,17 @@ mod tests {
             (Script::TwoToolRounds, 0 | 1) | (Script::HoldFirstRoundsDone, 1) => {
                 Scripted::Turn(tool_round_events(turn, "echo", None))
             }
+            // Keyed on the REQUEST count, not on what the request carried: a
+            // refused round answers the model with a tool error, which reads
+            // as an answered call, so an `answered`-keyed arm would run out
+            // of rounds exactly where the run of refusals begins.
+            (Script::ManyToolRounds { rounds }, _) => {
+                if turn <= rounds {
+                    Scripted::Turn(tool_round_events(turn, "echo", None))
+                } else {
+                    Scripted::Turn(prose_turn_events("done"))
+                }
+            }
             (Script::HoldFirstRoundsDone, 0) => {
                 held_done_events(tool_round_events(turn, "echo", None), resp_tx, release)
             }
@@ -4051,7 +4188,18 @@ mod tests {
     async fn scripted_context(
         script: Script,
     ) -> (RuntimeContext<BlockKind, CoreEvent>, i64, ComposedProbe) {
-        let store = Store::in_memory().unwrap();
+        scripted_context_over(Store::in_memory().unwrap(), script).await
+    }
+
+    /// The same, over a store the caller opened — the path-backed harness the
+    /// restart pins need, since the in-memory store every other test uses
+    /// cannot be reopened. Each call creates a conversation of its own, so a
+    /// reopen names the conversation it kept from before rather than the one
+    /// this returns.
+    async fn scripted_context_over(
+        store: Store,
+        script: Script,
+    ) -> (RuntimeContext<BlockKind, CoreEvent>, i64, ComposedProbe) {
         store
             .save_provider_instance(ProviderInstance {
                 id: "scripted-1".into(),
@@ -6455,5 +6603,343 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    // ─── The tool-call window's forced end (2026-08-30) ──────────────────
+
+    /// A small window for the pins below: the SHIPPED window with only the
+    /// spend shrunk, so a test need not buy sixty calls. The consecutive
+    /// limit and the span come from the defaults themselves rather than from
+    /// a copy of their numbers — change the operator's limit and these pins
+    /// exercise the new one.
+    fn small_window() -> crate::tools::runner::ToolCallWindow {
+        crate::tools::runner::ToolCallWindow {
+            calls: 1,
+            ..crate::tools::runner::ToolCallWindow::default()
+        }
+    }
+
+    /// `count` refused rounds on one turn, written the way the runner writes
+    /// them: a call anchored on the turn, resolved through the public store
+    /// surface with the window's own refusal — rendered from
+    /// [`small_window`]'s own numbers through the one template, so the text
+    /// here is the text the runner would have written under that window. The
+    /// call block between two errors is the reason the run is read as an
+    /// outcome SUBSEQUENCE — two tool errors are never neighbours in a
+    /// ledger.
+    async fn refused_rounds(
+        ctx: &RuntimeContext<BlockKind, CoreEvent>,
+        conv: i64,
+        anchor: i64,
+        tag: &str,
+        count: usize,
+    ) {
+        let window = small_window();
+        for round in 0..count {
+            let id = format!("{tag}-{round}");
+            let call = ctx
+                .store
+                .insert_tool_call_block(
+                    crate::store::BlockDestination::anchored(conv, Some(anchor)),
+                    crate::block::Role::Assistant,
+                    ToolCallInsert {
+                        tool_call_id: id.clone(),
+                        name: "echo".into(),
+                        input: "{}".into(),
+                        interactive: false,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            ctx.store
+                .fail_tool_call_block(
+                    conv,
+                    id,
+                    crate::agency::ToolError::rate_limit_refusal(window.calls, window.seconds),
+                    call,
+                )
+                .await
+                .unwrap()
+                .expect("the refusal resolves its call");
+        }
+    }
+
+    /// AC3, through the real loop: a model that keeps calling into a spent
+    /// window. Round one runs, every round after it is refused, and after the
+    /// fifth refusal the would-be continuation stands down — no provider
+    /// request — with the turn's end written down, anchored on the turn and
+    /// walk-transparent. Then a fresh summons opens a fresh turn with a fresh
+    /// anchor, which on the still-hot window refuses its way to a forced end
+    /// of its own: the conversation was never latched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_of_window_refusals_ends_the_turn_and_a_fresh_summons_opens_a_new_one() {
+        let window = small_window();
+        // More rounds than the two forced ends below can ever consume, so the
+        // script never runs out before the rule fires.
+        let rounds = 4 * window.consecutive_limit;
+        let (ctx, conv, probe) = scripted_context(Script::ManyToolRounds { rounds }).await;
+        let ctx = ctx.with_tool_call_window(window);
+        spawn_reactor(ctx.clone());
+
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "hi".into(),
+            }],
+        });
+        let blocks = await_ledger(&ctx, conv, "the forced end", |blocks| {
+            blocks.iter().any(|b| b.block_type == "status")
+        })
+        .await;
+
+        let summons = blocks
+            .iter()
+            .find(|b| b.block_type == "text")
+            .expect("the summoning message")
+            .id;
+        let errors: Vec<&str> = blocks
+            .iter()
+            .filter(|b| b.block_type == "tool_error")
+            .map(|b| b.fields["error"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            errors.len(),
+            window.consecutive_limit,
+            "one refusal per round after the window was spent, up to the limit — got {:?}",
+            blocks
+                .iter()
+                .map(|b| b.block_type.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.starts_with(crate::agency::ToolError::RATE_LIMIT_PREFIX))
+        );
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|b| b.block_type == "tool_result")
+                .count(),
+            window.calls,
+            "the window's allowed calls ran for real"
+        );
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("tool_calls_exhausted".to_owned(), Some(summons))],
+            "the forced end wrote the turn's end down, anchored on the turn"
+        );
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            window.calls + window.consecutive_limit,
+            "one request per round — the allowed calls, then the refusals — and \
+             nothing after the last one — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+
+        // The conversation lives on: a fresh summons dispatches a turn of its
+        // own, anchored on itself, and — the window still being hot — refuses
+        // its way to a second forced end.
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "again".into(),
+            }],
+        });
+        let blocks = await_ledger(&ctx, conv, "the second forced end", |blocks| {
+            blocks.iter().filter(|b| b.block_type == "status").count() == 2
+        })
+        .await;
+        let fresh = blocks
+            .iter()
+            .filter(|b| b.block_type == "text")
+            .nth(1)
+            .expect("the second summoning message")
+            .id;
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![
+                ("tool_calls_exhausted".to_owned(), Some(summons)),
+                ("tool_calls_exhausted".to_owned(), Some(fresh)),
+            ],
+            "the fresh turn carries a fresh anchor, never the ended turn's"
+        );
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            window.calls + 2 * window.consecutive_limit,
+            "a refused round each until the limit again — the window never \
+             recovered, so nothing ran — then the second stand-down — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+    }
+
+    /// The same forced end at the seam, deterministically: the dispatch
+    /// stands down, the marker lands anchored on the turn, the held identity
+    /// is released only after that append, and NOTHING latches — then the
+    /// next summons dispatches on a fresh anchor.
+    #[tokio::test]
+    async fn the_forced_end_releases_the_turn_without_latching() {
+        let (ctx, conv, probe) = scripted_context(Script::CountOnly).await;
+        let ctx = ctx.with_tool_call_window(small_window());
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        refused_rounds(
+            &ctx,
+            conv,
+            summons,
+            "spent",
+            small_window().consecutive_limit,
+        )
+        .await;
+
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.open_turn = Some(summons);
+        actor.handle_blocks_ready().await;
+
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            0,
+            "the dispatch stood down before it spent"
+        );
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("tool_calls_exhausted".to_owned(), Some(summons))]
+        );
+        assert_eq!(actor.open_turn, None, "the append released the identity");
+        assert!(!actor.read_latched.get(), "a decision is not an error");
+        assert!(!actor.streaming, "nothing was dispatched");
+
+        // A fresh summons behind the marker: read through it, dispatched, and
+        // anchored on itself.
+        let fresh = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "again".into())
+            .await
+            .unwrap();
+        actor.handle_blocks_ready().await;
+        assert!(
+            actor.streaming,
+            "the ended turn never stopped the conversation"
+        );
+        assert_eq!(actor.open_turn, Some(fresh), "a fresh turn, a fresh anchor");
+        assert_eq!(actor.turn_anchor.get(), Some(fresh));
+    }
+
+    /// AC4 — an ordinary tool error resets the run. Four refusals, one
+    /// ordinary failure resolved out of band on a call of the turn, one more
+    /// refusal: the trailing run is ONE, the turn does not end, and the
+    /// dispatch goes out as usual. The run is read as the id-ordered outcome
+    /// subsequence, so it reads the same however the window moved meanwhile.
+    ///
+    /// Written at the seam rather than through a script on purpose: an
+    /// out-of-band resolution landing between two refused rounds is not
+    /// something a provider script can say, and the check reads the ledger
+    /// either way.
+    #[tokio::test]
+    async fn an_ordinary_error_between_refusals_resets_the_run() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let ctx = ctx.with_tool_call_window(small_window());
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        // One short of the limit: the run below must be the ordinary error's
+        // reset, never a run that was already too short to end the turn.
+        refused_rounds(
+            &ctx,
+            conv,
+            summons,
+            "spent",
+            small_window().consecutive_limit - 1,
+        )
+        .await;
+
+        let pending = ctx
+            .store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                ToolCallInsert {
+                    tool_call_id: "ordinary".into(),
+                    name: "boom".into(),
+                    input: "{}".into(),
+                    interactive: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        ctx.store
+            .fail_tool_call_block(conv, "ordinary".into(), "scripted failure".into(), pending)
+            .await
+            .unwrap()
+            .expect("the out-of-band failure resolves the call");
+        refused_rounds(&ctx, conv, summons, "after", 1).await;
+
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.open_turn = Some(summons);
+        actor.handle_blocks_ready().await;
+
+        assert!(
+            status_markers(&ctx, conv).await.is_empty(),
+            "one refusal behind an ordinary failure is not a run"
+        );
+        assert_eq!(actor.open_turn, Some(summons), "the turn lives on");
+        assert!(actor.streaming, "and its continuation dispatched");
+    }
+
+    /// AC5's five-rule half — restart safety. The refusals landed before the
+    /// stop, and a rebooted actor holds no turn identity at all; the check
+    /// reads the RESOLVED anchor — here derived from the ledger the reopened
+    /// store serves — so the forced end still fires. Path-backed, because the
+    /// in-memory store cannot be reopened; the first handle is dropped to
+    /// release it, and the rebooted runtime is driven by an append.
+    #[tokio::test]
+    async fn the_forced_end_survives_a_restart_that_cleared_the_held_identity() {
+        let dir = crate::store::temp_dir("forced-end-restart");
+        let db = dir.join("ledger.db");
+
+        let (conv, summons) = {
+            let (ctx, conv, _probe) =
+                scripted_context_over(Store::open(&db).unwrap(), Script::CountOnly).await;
+            let summons = ctx
+                .store
+                .insert_text_block(conv, crate::block::Role::User, "summons".into())
+                .await
+                .unwrap();
+            refused_rounds(
+                &ctx,
+                conv,
+                summons,
+                "spent",
+                small_window().consecutive_limit,
+            )
+            .await;
+            (conv, summons)
+        };
+
+        let (ctx, _fresh_conv, probe) =
+            scripted_context_over(Store::open(&db).unwrap(), Script::CountOnly).await;
+        let ctx = ctx.with_tool_call_window(small_window());
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        assert_eq!(actor.open_turn, None, "a rebooted actor holds no identity");
+        actor.handle_blocks_ready().await;
+
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            0,
+            "the reboot spent nothing"
+        );
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("tool_calls_exhausted".to_owned(), Some(summons))],
+            "the end is anchored on the turn the LEDGER still owed"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

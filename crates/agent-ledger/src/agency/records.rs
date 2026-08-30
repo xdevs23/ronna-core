@@ -17,12 +17,14 @@ use super::{Agency, LeafKind, Projection};
 ///
 /// One family of status rows is the exception (2026-08-23, the verified
 /// burial defect): a stored turn-closure marker is TRANSPARENT to the
-/// frontier decision instead of capping it. The marker is appended by a
-/// close that ends a turn over an unanswered outcome, so an addressed
-/// message absorbed into that turn's window sits behind it — and an opaque
-/// marker buried the message forever, because the non-latching closed edge
-/// re-checks exactly once. The interrupt's status keeps the cap: the latch
-/// it rides re-checks at its own release.
+/// frontier decision instead of capping it. A marker is written wherever the
+/// runtime ENDS a turn as a stored fact — by a close that ends a turn over an
+/// unanswered outcome, and (2026-08-30) by the forced end a run of tool-call
+/// window refusals triggers between rounds — so an addressed message absorbed
+/// into that turn's window sits behind it, and an opaque marker buried the
+/// message forever, because the non-latching closed edge re-checks exactly
+/// once. The interrupt's status keeps the cap: the latch it rides re-checks
+/// at its own release.
 #[derive(Debug, Clone)]
 pub struct Status {
     /// The role the row carries, under which the record groups.
@@ -38,14 +40,22 @@ impl Status {
     pub const TURN_ENDED_CLOSED: &'static str = "turn_ended:closed";
     /// The error edge's counterpart of [`Self::TURN_ENDED_CLOSED`].
     pub const TURN_ENDED_ERRORED: &'static str = "turn_ended:errored";
+    /// The machine key the forced end records when a run of tool-call window
+    /// refusals ends a turn between rounds (2026-08-30): the model kept
+    /// calling into a spent window, so the dispatch stood down instead of
+    /// buying another round. A turn end like the two above — anchored on the
+    /// turn it ended, walk-transparent, and not a latch: the conversation
+    /// lives on and the next summons opens a fresh turn.
+    pub const TOOL_CALLS_EXHAUSTED: &'static str = "tool_calls_exhausted";
 
-    /// Whether this row is a stored turn-closure marker — the exact two
-    /// machine keys the close writes, nothing broader: the interrupt's
-    /// `interrupted` status and every consumer status stay opaque.
+    /// Whether this row is a stored turn-closure marker — the exact three
+    /// machine keys the runtime writes when it ends a turn, nothing broader:
+    /// the interrupt's `interrupted` status and every consumer status stay
+    /// opaque.
     fn records_turn_end(&self) -> bool {
         matches!(
             self.status.as_str(),
-            Self::TURN_ENDED_CLOSED | Self::TURN_ENDED_ERRORED
+            Self::TURN_ENDED_CLOSED | Self::TURN_ENDED_ERRORED | Self::TOOL_CALLS_EXHAUSTED
         )
     }
 }
