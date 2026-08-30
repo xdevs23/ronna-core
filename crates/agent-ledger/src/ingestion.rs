@@ -969,9 +969,11 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
         // completion whose only move was elided (a skipped empty-input tool
         // call) — still completed, and the ledger records that completion. The
         // empty block is a frontier-settling record: it closes the frontier's
-        // owed turn (an assistant text awaits nobody) and carries the turn's
-        // usage, and on replay the model reads its own empty message back
-        // instead of a hole. Recorded here as OWED, committed at the turn's
+        // owed turn (an assistant text awaits nobody), and on replay the model
+        // reads its own empty message back instead of a hole. It carries no
+        // usage and never did — the framework persists usage nowhere; every
+        // request's final numbers ride the stream-done event emitted just
+        // below, for every stop reason. Recorded here as OWED, committed at the turn's
         // real boundary (`Done`): one real wire ends a tool-call turn with an `EndTurn`
         // stop and trails the buffered lifecycles AFTER this event, and an
         // empty block written now would sit orphaned beside those calls.

@@ -132,25 +132,30 @@ impl ToolCall {
         })
     }
 
-    /// How many tool outcomes — results and errors — the ledger holds
-    /// anchored on `anchor`.
+    /// How many tool outcomes anchored on `anchor` ASK FOR A CONTINUATION —
+    /// every tool error, and every tool result but one stamped as ending the
+    /// turn (2026-08-30).
     ///
-    /// The other arm's measure (2026-08-23): every outcome a turn's calls
-    /// produce summons one continuation, so an outcome count above what the
-    /// turn's dispatches have already answered is a continuation still due.
-    /// The kinds are read through [`BlockKind`], like every other outcome
+    /// The other arm's measure (2026-08-23): an outcome that asks for a
+    /// continuation summons exactly one, so a count above what the turn's
+    /// dispatches have already answered is a continuation still due. The
+    /// kinds are read through [`BlockKind`], like every other outcome
     /// decision, and the anchor keying keeps another turn's outcomes out of
     /// this turn's count.
+    ///
+    /// The ends-turn exclusion lives HERE, in the fold, and nowhere else
+    /// (2026-08-30). Both consumers mean the same thing by this number — the
+    /// actor's release rule counts what is still due, and its dispatch mark
+    /// records what a request answered — so a filter in one of them would put
+    /// two different counts on the two sides of one comparison, and a
+    /// sibling's later outcome would be silently dropped in the round after a
+    /// turn that ended on a stamp beside a sibling. One fold, one reading, both readers.
     #[must_use]
     pub(crate) fn outcomes_anchored_in(ledger: &[Block], anchor: i64) -> usize {
         ledger
             .iter()
             .filter(|block| {
-                block.dispatch_anchor == Some(anchor)
-                    && matches!(
-                        BlockKind::from_block(block),
-                        BlockKind::ToolResult(_) | BlockKind::ToolError(_)
-                    )
+                block.dispatch_anchor == Some(anchor) && outcome_asks_for_a_continuation(block)
             })
             .count()
     }
@@ -295,8 +300,9 @@ impl ToolCall {
             .count()
     }
 
-    /// The newest tool outcome in the ledger — a result or an error — whose
-    /// turn is still UNANSWERED, answered as that turn's anchor.
+    /// The newest tool outcome in the ledger that ASKS FOR A CONTINUATION —
+    /// any error, any result but an ends-turn-stamped one — whose turn is
+    /// still UNANSWERED, answered as that turn's anchor.
     ///
     /// The fresh-dispatch inheritance's measure (2026-08-23, the verified
     /// seventh break — the resolution is ledger-first): a released turn
@@ -334,14 +340,26 @@ impl ToolCall {
     /// consumer's authority fold, and it self-heals at that turn's close —
     /// the attached turn's own text or status carries the anchor, and the
     /// outcome reads answered from then on.
+    ///
+    /// An ends-turn-stamped result is SKIPPED, and the walk looks PAST it
+    /// (2026-08-30): the stamp says the turn is over, so no later summons may
+    /// have its identity attached to that dead turn — and a sibling's own
+    /// unanswered outcome sitting BEHIND an ends-turn tail still anchors the
+    /// summons that inherits it. The widened residual is accepted with the
+    /// rule: a stamped result no longer shields an OLDER stranded outcome —
+    /// the store-failure shape the residual above documents — the way the
+    /// newest-outcome cap did, so a summons can attach to an older dead turn
+    /// than it could before. It is rarer than the defect the skip prevents,
+    /// and the alternative — stopping at the first stamped result — would drop
+    /// a sibling's inheritance across a restart, which is the shape the
+    /// ledger-first resolution exists for.
     #[must_use]
     pub(crate) fn unanswered_outcome_anchor(ledger: &[Block]) -> Option<i64> {
-        let (position, outcome) = ledger.iter().enumerate().rev().find(|(_, block)| {
-            matches!(
-                BlockKind::from_block(block),
-                BlockKind::ToolResult(_) | BlockKind::ToolError(_)
-            )
-        })?;
+        let (position, outcome) = ledger
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, block)| outcome_asks_for_a_continuation(block))?;
         let anchor = outcome.dispatch_anchor?;
         ledger[position + 1..]
             .iter()
@@ -353,6 +371,27 @@ impl ToolCall {
                     )
             })
             .then_some(anchor)
+    }
+}
+
+/// Is this block a tool outcome that asks the model for a continuation
+/// (2026-08-30)?
+///
+/// The ONE reading of the turn-ending stamp for the turn folds above: a tool
+/// error always asks — the model reads why and re-plans — and a tool result
+/// asks unless its own row says the turn ended there. Read through
+/// [`BlockKind`], like every other outcome decision, and off the stored stamp,
+/// never off a tool's name.
+///
+/// Written once because both folds must agree by construction: the release
+/// rule counts what is due, the fresh dispatch inherits what is unanswered,
+/// and an ends-turn result that counted in one but not the other would strand a
+/// sibling's continuation.
+fn outcome_asks_for_a_continuation(block: &Block) -> bool {
+    match BlockKind::from_block(block) {
+        BlockKind::ToolResult(result) => !result.ends_turn,
+        BlockKind::ToolError(_) => true,
+        _ => false,
     }
 }
 

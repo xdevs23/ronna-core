@@ -684,6 +684,14 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
     /// The body half, identical for every admitted call: claim it against a
     /// duplicate wakeup, re-read under the claim, run it, and record whatever
     /// it produced.
+    ///
+    /// This is also the one seam that holds the HANDLER at resolution time,
+    /// which is why the turn-ending stamp is read here and written onto the
+    /// resolution (2026-08-30): from then on the block answers whether it asks
+    /// the model for anything out of its own data, and a tool that later
+    /// leaves the registry cannot change the answer for turns already ended.
+    /// The insert seam reads [`ToolHandler::interactive`] for the same reason
+    /// at the other end of a call's life.
     async fn run_body(&self, ctx: &AgencyCtx<E>, handler: &dyn ToolHandler<E>, call: &ToolCall) {
         let Some(claim) = self.claim(ctx.conversation_id, call.id) else {
             tracing::debug!(
@@ -737,15 +745,17 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
                 },
             )
             .await;
+        let ends_turn = handler.ends_turn();
         match outcome {
             ToolOutcome::Done(result) => {
                 match ctx
                     .store
-                    .complete_tool_call_block(
+                    .complete_tool_call_block_stamped(
                         ctx.conversation_id,
                         call.tool_call_id.clone(),
                         result,
                         call.id,
+                        ends_turn,
                     )
                     .await
                 {
@@ -771,6 +781,26 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
             ToolOutcome::Error(error) => {
                 self.resolve_with_error(ctx, &call.tool_call_id, error, call.id)
                     .await;
+            }
+            // An ends-turn tool that defers is refused, loudly (2026-08-30):
+            // the backing system would resolve through the public door, which
+            // holds no handler and writes no stamp, so the end of the turn
+            // would be lost and the model summoned after it. The contract is
+            // closed here rather than widened there, and the error — which
+            // never carries the stamp — hands the model its ordinary round.
+            ToolOutcome::Pending if ends_turn => {
+                warn!(
+                    name = call.name,
+                    conversation_id = ctx.conversation_id,
+                    "tool runner: an ends-turn tool deferred its own resolution — refusing"
+                );
+                self.resolve_with_error(
+                    ctx,
+                    &call.tool_call_id,
+                    ToolError::ENDS_TURN_DEFERRAL_REFUSAL.to_owned(),
+                    call.id,
+                )
+                .await;
             }
             // The backing system resolves it; the claim stays until it does.
             ToolOutcome::Pending => claim.keep(),

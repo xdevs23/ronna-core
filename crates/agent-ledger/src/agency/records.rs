@@ -17,14 +17,22 @@ use super::{Agency, LeafKind, Projection};
 ///
 /// One family of status rows is the exception (2026-08-23, the verified
 /// burial defect): a stored turn-closure marker is TRANSPARENT to the
-/// frontier decision instead of capping it. A marker is written wherever the
-/// runtime ENDS a turn as a stored fact — by a close that ends a turn over an
-/// unanswered outcome, and (2026-08-30) by the forced end a run of tool-call
-/// window refusals triggers between rounds — so an addressed message absorbed
-/// into that turn's window sits behind it, and an opaque marker buried the
-/// message forever, because the non-latching closed edge re-checks exactly
-/// once. The interrupt's status keeps the cap: the latch it rides re-checks
-/// at its own release.
+/// frontier decision instead of capping it. A marker is written where a turn
+/// ends with no row of its own to record it — by a close that ends a turn over
+/// an unanswered outcome, and (2026-08-30) by the forced end a run of
+/// tool-call window refusals triggers between rounds — so an addressed message
+/// absorbed into that turn's window sits behind it, and an opaque marker
+/// buried the message forever, because the non-latching closed edge re-checks
+/// exactly once. The interrupt's status keeps the cap: the latch it rides
+/// re-checks at its own release.
+///
+/// A marker is NOT the only way a turn's end is stored (2026-08-30): a turn
+/// ended by an ends-turn tool is recorded by the stamp on its own resolution
+/// row, and writing a marker beside it would record one decision twice.
+/// Closure is always a stored fact; which row stores it depends on how the
+/// turn ended — and each such row answers the transparency rule for itself,
+/// so a message absorbed into the ended turn's window is surfaced the same
+/// way whichever row recorded the end.
 #[derive(Debug, Clone)]
 pub struct Status {
     /// The role the row carries, under which the record groups.
@@ -48,10 +56,14 @@ impl Status {
     /// lives on and the next summons opens a fresh turn.
     pub const TOOL_CALLS_EXHAUSTED: &'static str = "tool_calls_exhausted";
 
-    /// Whether this row is a stored turn-closure marker — the exact three
-    /// machine keys the runtime writes when it ends a turn, nothing broader:
-    /// the interrupt's `interrupted` status and every consumer status stay
-    /// opaque.
+    /// Whether this row is a stored turn-closure MARKER — exactly the three
+    /// machine keys above and nothing broader: the interrupt's `interrupted`
+    /// status and every consumer status stay opaque.
+    ///
+    /// Not every turn end is one of these (2026-08-30): the end an ends-turn
+    /// tool writes lives on its own resolution row, which is a `tool_result`
+    /// and never a status. This predicate answers what a STATUS records, which
+    /// is what the transparency decision above needs.
     fn records_turn_end(&self) -> bool {
         matches!(
             self.status.as_str(),

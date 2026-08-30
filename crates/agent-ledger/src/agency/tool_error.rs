@@ -94,6 +94,24 @@ impl ToolError {
         )
     }
 
+    /// The refusal a deferring ends-turn tool gets (2026-08-30), pinned byte
+    /// for byte like every other sentence the model reads back.
+    ///
+    /// A tool that ENDS the turn is stamped at the resolution write, where the
+    /// runner holds the handler. A deferred outcome resolves later, through
+    /// the public out-of-band door, which holds no handler and carries no
+    /// stamp — so the end of the turn would be lost and the model summoned
+    /// after it. The contract is closed rather than widened: an ends-turn tool
+    /// resolves at once or its call is refused, and the model reads why.
+    ///
+    /// A constant, not a template: there is nothing to interpolate, and one
+    /// sentence is the whole decision. Errors never carry the stamp, so this
+    /// refusal cannot end a turn either.
+    pub(crate) const ENDS_TURN_DEFERRAL_REFUSAL: &'static str = concat!(
+        "an ends-turn tool must resolve at once: deferring the end of a turn ",
+        "is a contract defect, and this call is refused."
+    );
+
     /// Whether this error is a tool-call rate-limit refusal — either window's,
     /// since both are written with the one prefix. The read half of
     /// [`RATE_LIMIT_PREFIX`](Self::RATE_LIMIT_PREFIX), and the only place the

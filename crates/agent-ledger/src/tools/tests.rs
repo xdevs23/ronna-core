@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use serde_json::Value;
 
 use crate::agency::ratchet::oracle::Oracle;
-use crate::agency::{AgencyCtx, Awaiting, BlockKind, GateDecision, ratchet, redispatch};
+use crate::agency::{
+    Agency, AgencyCtx, Awaiting, BlockKind, FromBlock, GateDecision, ratchet, redispatch,
+};
 use crate::block::Block;
 use crate::event::CoreEvent;
 use crate::providers::types::ToolDefinition;
@@ -2244,4 +2246,366 @@ async fn a_reopened_ledger_keeps_a_tool_window_spent() {
         "the unbound tool is unbounded across the restart too"
     );
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ─── The tool that ends the turn ─────────────────────────────────────────────
+
+/// A tool whose successful call ENDS the turn: the model said it has nothing
+/// left to do. Counts its runs, because half of what the pins below claim is
+/// that a body did or did not reach one.
+struct ParkProbe {
+    executions: Arc<AtomicUsize>,
+}
+
+impl ToolHandler<CoreEvent> for ParkProbe {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "park".into(),
+            description: "a test-only tool that ends the turn".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn ends_turn(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _input: &'a str,
+        _ctx: ToolContext<'a, CoreEvent>,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            ToolOutcome::Done("nothing to do".into())
+        })
+    }
+}
+
+/// An ends-turn tool that hands its work to a backing system — the contract
+/// defect the runner refuses, since a deferred resolution takes the door that
+/// carries no stamp.
+struct DeferringParkProbe;
+
+impl ToolHandler<CoreEvent> for DeferringParkProbe {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "deferring_park".into(),
+            description: "a test-only ends-turn tool that defers".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn ends_turn(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _input: &'a str,
+        _ctx: ToolContext<'a, CoreEvent>,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async { ToolOutcome::Pending })
+    }
+}
+
+/// A handler declaring both `interactive()` and `ends_turn()`: the human
+/// answers an interactive call through the door that holds no handler, so the
+/// stamp could never be written.
+struct InteractiveParkProbe;
+
+impl ToolHandler<CoreEvent> for InteractiveParkProbe {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "ask_and_park".into(),
+            description: "a contradiction".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn interactive(&self) -> bool {
+        true
+    }
+
+    fn ends_turn(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _input: &'a str,
+        _ctx: ToolContext<'a, CoreEvent>,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async { ToolOutcome::Done("never".into()) })
+    }
+}
+
+/// A runner over the park tool, an ordinary counting tool and the deferring
+/// one, with the window the test chose. Both counters come back: the pins read
+/// which body ran.
+fn park_runner(
+    window: ToolCallWindow,
+) -> (
+    ToolRunner<BlockKind, CoreEvent>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+) {
+    let mut registry = ToolRegistry::new();
+    let counter = register_counter(&mut registry, "counter");
+    let park = Arc::new(AtomicUsize::new(0));
+    registry.register(
+        "park",
+        ParkProbe {
+            executions: Arc::clone(&park),
+        },
+    );
+    registry.register("deferring_park", DeferringParkProbe);
+    let mut runner = ToolRunner::<BlockKind, _>::new(Arc::new(registry));
+    runner.set_window(window);
+    (runner, park, counter)
+}
+
+/// [`drive_named_call`] with the call recorded as a TURN's product, the way a
+/// streamed round records one — which is what the turn folds read.
+async fn drive_anchored_call(
+    runner: &ToolRunner<BlockKind, CoreEvent>,
+    ctx: &AgencyCtx<CoreEvent>,
+    tool_call_id: &str,
+    name: &str,
+    anchor: i64,
+) -> i64 {
+    let call = runner
+        .insert_call(
+            ctx,
+            false,
+            tool_call_id.into(),
+            name.into(),
+            "{}".into(),
+            CallOrigin::streamed(None, Some(anchor)),
+        )
+        .await
+        .unwrap();
+    runner.run_wakeup(ctx, false, call).await;
+    call
+}
+
+/// This conversation's tool results as `(content, stamped)` — the loaded
+/// ledger handed to the shared read
+/// ([`crate::agency::results_with_stamps`]), which parses the stamp through
+/// the kind that owns it.
+async fn conversation_results(ctx: &AgencyCtx<CoreEvent>) -> Vec<(String, bool)> {
+    let ledger = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+    crate::agency::results_with_stamps(&ledger)
+}
+
+/// The parsed ask of the ledger's last block — who the frontier says owes the
+/// next move, answered off the stored row alone.
+async fn tail_ask(ctx: &AgencyCtx<CoreEvent>) -> Option<Awaiting> {
+    let ledger = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+    BlockKind::from_block(ledger.last().expect("a ledger with blocks")).awaiting()
+}
+
+/// The capability, end to end at the chokepoint: an ordinary tool's result
+/// asks the model for its continuation, and a park tool's resolution — the
+/// same door, the same round — is STAMPED and asks for nothing, so the drive
+/// finds no turn owed. The stamp rides the handler, never the name: both
+/// results are written by one code path that differs only in what the handler
+/// answered.
+#[tokio::test]
+async fn a_park_tools_resolution_is_stamped_and_rests_the_frontier() {
+    let (runner, park_runs, counter_runs) = park_runner(ToolCallWindow::default());
+    let o = Oracle::new().await;
+    o.user_text("go").await;
+
+    drive_named_call(&runner, &o.ctx, "ordinary", "counter").await;
+    assert_eq!(counter_runs.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        conversation_results(&o.ctx).await,
+        vec![("ran".to_owned(), false)],
+        "an ordinary tool's result carries no stamp"
+    );
+    assert_eq!(
+        tail_ask(&o.ctx).await,
+        Some(Awaiting::Model),
+        "and it asks the model for its continuation"
+    );
+    assert!(
+        o.drive().await.owes_turn,
+        "the drained frontier owes a turn against an ordinary result"
+    );
+
+    drive_named_call(&runner, &o.ctx, "parked", "park").await;
+    assert_eq!(park_runs.load(Ordering::SeqCst), 1, "the park body ran");
+    assert_eq!(
+        conversation_results(&o.ctx).await,
+        vec![
+            ("ran".to_owned(), false),
+            ("nothing to do".to_owned(), true)
+        ],
+        "the park resolution carries the stamp"
+    );
+    assert_eq!(
+        tail_ask(&o.ctx).await,
+        None,
+        "and asks nobody — the stored row is the turn's end"
+    );
+    assert!(
+        !o.drive().await.owes_turn,
+        "so no continuation is owed and none is dispatched"
+    );
+}
+
+/// The stamp is decided at exactly ONE door. The public resolution write — the
+/// out-of-band door a backing system takes — holds no handler and writes an
+/// unstamped result even for a call recorded under the park tool's own name:
+/// nothing anywhere infers the capability from a name.
+#[tokio::test]
+async fn the_public_resolution_door_writes_an_unstamped_result() {
+    let (runner, park_runs, _counter) = park_runner(ToolCallWindow::default());
+    let o = Oracle::new().await;
+    o.user_text("go").await;
+
+    // Recorded while latched: the call lands in the ledger and no body runs,
+    // so the only writer of its outcome is the door below.
+    let call = runner
+        .insert_call(
+            &o.ctx,
+            true,
+            "out-of-band".into(),
+            "park".into(),
+            "{}".into(),
+            CallOrigin::default(),
+        )
+        .await
+        .unwrap();
+    o.ctx
+        .store
+        .complete_tool_call_block(
+            o.ctx.conversation_id,
+            "out-of-band".into(),
+            "answered elsewhere".into(),
+            call,
+        )
+        .await
+        .unwrap()
+        .expect("the out-of-band door resolves the call");
+
+    assert_eq!(park_runs.load(Ordering::SeqCst), 0, "no body ever ran");
+    assert_eq!(
+        conversation_results(&o.ctx).await,
+        vec![("answered elsewhere".to_owned(), false)],
+        "the door that holds no handler writes no stamp"
+    );
+    assert_eq!(
+        tail_ask(&o.ctx).await,
+        Some(Awaiting::Model),
+        "so the result asks for its continuation like any other"
+    );
+}
+
+/// A park tool cannot defer: a `Pending` outcome from an ends-turn handler
+/// would resolve later through the unstamped door and silently summon the
+/// model after the end of a turn. The runner refuses it instead, with the
+/// sentence the model reads — pinned byte for byte — and the refusal is an
+/// ERROR, which carries no stamp and hands the model its ordinary round.
+#[tokio::test]
+async fn a_deferring_ends_turn_tool_is_refused_with_the_pinned_text() {
+    let (runner, _park_runs, _counter) = park_runner(ToolCallWindow::default());
+    let o = Oracle::new().await;
+    o.user_text("go").await;
+
+    drive_named_call(&runner, &o.ctx, "deferred", "deferring_park").await;
+
+    assert_eq!(
+        error_texts(&o.ctx).await,
+        vec![
+            "an ends-turn tool must resolve at once: deferring the end of a turn is a \
+             contract defect, and this call is refused."
+                .to_owned()
+        ],
+        "the deferral is refused, in the words the model re-plans against"
+    );
+    assert!(
+        conversation_results(&o.ctx).await.is_empty(),
+        "and no result — stamped or not — was written"
+    );
+    assert_eq!(
+        tail_ask(&o.ctx).await,
+        Some(Awaiting::Model),
+        "an error never ends a turn: the model gets one more round"
+    );
+}
+
+/// The pairing an interactive ends-turn tool would be is refused at
+/// registration, in debug builds, on the gated-plus-interactive precedent: the
+/// human resolves an interactive call through the handler-less door, so the
+/// stamp could never be written and the capability would ship mute.
+///
+/// Gated on `debug_assertions` like that precedent's own pin: the check is a
+/// debug assertion, so a release build compiles it out and a test demanding
+/// its panic there would fail for the reason it exists.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "declares both interactive() and ends_turn()")]
+fn an_interactive_ends_turn_handler_is_refused_at_registration() {
+    let mut registry = ToolRegistry::<CoreEvent>::new();
+    registry.register("ask_and_park", InteractiveParkProbe);
+}
+
+/// AC3 — a park call the window refuses does NOT end the turn. The window
+/// check runs before the registry lookup, so a park call at a hot window is
+/// refused like any call: the body never runs, the outcome is a rate-limit
+/// ERROR, the frontier owes the model one more round — in which it ends the
+/// turn the ordinary way — and the run the forced end counts sees the refusal
+/// exactly as it sees any other. No name-keyed bypass exists to test, and that
+/// is the point.
+#[tokio::test]
+async fn a_park_call_the_window_refuses_does_not_end_the_turn() {
+    let (runner, park_runs, _counter) = park_runner(ToolCallWindow {
+        calls: 1,
+        seconds: 60,
+        consecutive_limit: 5,
+    });
+    let o = Oracle::new().await;
+    let summons = o.user_text("go").await;
+
+    drive_anchored_call(&runner, &o.ctx, "p-1", "park", summons).await;
+    drive_anchored_call(&runner, &o.ctx, "p-2", "park", summons).await;
+
+    assert_eq!(
+        park_runs.load(Ordering::SeqCst),
+        1,
+        "the call past the window never reached the body"
+    );
+    assert_eq!(
+        error_texts(&o.ctx).await,
+        vec![crate::agency::ToolError::rate_limit_refusal(1, 60)],
+        "a park call is refused in the window's own words, like any call"
+    );
+    assert_eq!(
+        tail_ask(&o.ctx).await,
+        Some(Awaiting::Model),
+        "the refusal summons one more round"
+    );
+    assert!(
+        o.drive().await.owes_turn,
+        "and the drained frontier owes that turn"
+    );
+
+    let ledger = o
+        .ctx
+        .store
+        .list_blocks(o.ctx.conversation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::agency::ToolCall::trailing_refusal_run(&ledger, summons),
+        1,
+        "the five-rule counts the refused park call like any refusal"
+    );
+    assert_eq!(
+        crate::agency::ToolCall::outcomes_anchored_in(&ledger, summons),
+        1,
+        "the error asks for a continuation; the stamped result before it does not"
+    );
 }

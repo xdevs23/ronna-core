@@ -540,18 +540,17 @@ async fn user_message_after_a_status_cap_fires_again() {
     assert_eq!(outcome.cursor, user);
 }
 
-/// One anchored, resolved tool round under `summons`: the call carries the
-/// turn's identity and the resolution write copies it onto the result — the
-/// floor the turn-closure marker shapes below stand on.
-async fn anchored_round(o: &Oracle, summons: i64) {
-    let call = o
-        .ctx
+/// One tool call recorded as `summons`'s turn product — the identity every
+/// shape below is built on, written once here so no two of them can disagree
+/// about what an anchored call looks like.
+async fn anchored_call(o: &Oracle, summons: i64, tool_call_id: &str) -> i64 {
+    o.ctx
         .store
         .insert_tool_call_block(
             crate::store::BlockDestination::anchored(o.ctx.conversation_id, Some(summons)),
             Role::Assistant,
             crate::store::ToolCallInsert {
-                tool_call_id: "c1".into(),
+                tool_call_id: tool_call_id.into(),
                 name: "read_file".into(),
                 input: "{}".into(),
                 interactive: false,
@@ -559,7 +558,14 @@ async fn anchored_round(o: &Oracle, summons: i64) {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// One anchored, resolved tool round under `summons`: the call carries the
+/// turn's identity and the resolution write copies it onto the result — the
+/// floor the turn-closure marker shapes below stand on.
+async fn anchored_round(o: &Oracle, summons: i64) {
+    let call = anchored_call(o, summons, "c1").await;
     o.ctx
         .store
         .complete_tool_call_block(o.ctx.conversation_id, "c1".into(), "ok".into(), call)
@@ -655,22 +661,7 @@ async fn a_dead_turns_outcome_behind_its_marker_rests() {
 async fn tool_window_burial(marker_key: &str) -> (Oracle, i64) {
     let o = Oracle::new().await;
     let summons = o.user_text("go").await;
-    let call = o
-        .ctx
-        .store
-        .insert_tool_call_block(
-            crate::store::BlockDestination::anchored(o.ctx.conversation_id, Some(summons)),
-            Role::Assistant,
-            crate::store::ToolCallInsert {
-                tool_call_id: "c1".into(),
-                name: "read_file".into(),
-                input: "{}".into(),
-                interactive: false,
-            },
-            None,
-        )
-        .await
-        .unwrap();
+    let call = anchored_call(&o, summons, "c1").await;
     o.user_text("absorbed").await;
     o.ctx
         .store
@@ -726,7 +717,159 @@ async fn a_message_absorbed_in_the_tool_window_owes_behind_an_errored_marker() {
     assert_eq!(outcome.cursor, marker);
 }
 
-/// The transparency's scope: exactly the turn-closure machine keys. The
+/// One anchored round whose tool ENDED the turn (2026-08-30): the call, then
+/// — when `absorbing` — a member's message landing in the tool-execution
+/// window, then the resolution the runner stamps when the handler declared
+/// that its success ends the turn. That row is the turn's stored end and no
+/// marker is written beside it, so this is the marker shapes above wearing
+/// the other record. Answers the oracle and the resolution's id.
+async fn ends_turn_window(absorbing: bool) -> (Oracle, i64) {
+    let o = Oracle::new().await;
+    let summons = o.user_text("go").await;
+    let call = anchored_call(&o, summons, "c1").await;
+    if absorbing {
+        o.user_text("absorbed").await;
+    }
+    let resolution = o
+        .ctx
+        .store
+        .complete_tool_call_block_stamped(
+            o.ctx.conversation_id,
+            "c1".into(),
+            "nothing to do".into(),
+            call,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("the call is unresolved");
+    (o, resolution)
+}
+
+/// The burial shape wearing the ends-turn stamp (2026-08-30): a message
+/// absorbed into the round's window sits under the stamped resolution, which
+/// ends the turn while asking for nothing. Opaque, it buried the message
+/// exactly as an opaque marker did — the close that ends a turn here never
+/// latches and re-checks once. The row that stores a turn's end is read
+/// THROUGH, whichever row it is, so the absorbed message still owes.
+#[tokio::test]
+async fn a_message_absorbed_in_the_window_owes_behind_an_ends_turn_resolution() {
+    let (o, resolution) = ends_turn_window(true).await;
+
+    let outcome = o.drive().await;
+    assert!(
+        outcome.owes_turn,
+        "the stamped resolution is the turn's stored end and is transparent — \
+         the absorbed message still owes"
+    );
+    assert_eq!(
+        outcome.awaiting,
+        Some(crate::types::Awaiting::Model),
+        "the published ask is the absorbed message's own"
+    );
+    assert!(!outcome.parked, "the resolved round parks nothing");
+    assert_eq!(
+        outcome.cursor, resolution,
+        "the cursor still drains through the resolution"
+    );
+}
+
+/// Its bound, the same one the marker has: with nothing absorbed, the dead
+/// turn's own products behind the stamped tail never owe — reading past them
+/// would redispatch the very turn the stamp recorded as ended, which is the
+/// no-continuation claim the capability exists for.
+#[tokio::test]
+async fn an_ends_turn_resolution_with_nothing_behind_it_rests() {
+    let (o, resolution) = ends_turn_window(false).await;
+
+    let outcome = o.drive().await;
+    assert!(
+        !outcome.owes_turn,
+        "the ended turn's own products never summon through their stamp"
+    );
+    assert_eq!(
+        outcome.awaiting, None,
+        "the frontier rests on the stored end"
+    );
+    assert!(!outcome.parked);
+    assert_eq!(outcome.cursor, resolution);
+}
+
+/// The widened residual, recorded on
+/// [`ToolCall::unanswered_outcome_anchor`](super::ToolCall) and pinned here
+/// (2026-08-30): the walk SKIPS an ends-turn-stamped result and looks past
+/// it, which is what lets a sibling's own outcome behind an ends-turn tail
+/// inherit its turn — and, in the same motion, stops shielding an OLDER stranded
+/// outcome the way the newest-outcome cap did. The shape is the documented
+/// store-failure one: a turn whose outcome was never answered and whose close
+/// could not write its marker. A later summons attaches to that older dead
+/// turn. Accepted with the rule, because the alternative — stopping at the
+/// first stamped result — drops a sibling's inheritance across a restart, and
+/// the direction here is over-decline, which self-heals at the attached
+/// turn's own close.
+#[tokio::test]
+async fn an_older_stranded_outcome_behind_an_ends_turn_tail_is_inheritable() {
+    let o = Oracle::new().await;
+
+    // The stranded turn: its outcome landed, nothing ever answered it, and no
+    // marker was written — the store-failure residual.
+    let stranded = o.user_text("first").await;
+    let call = anchored_call(&o, stranded, "c1").await;
+    o.ctx
+        .store
+        .complete_tool_call_block(o.ctx.conversation_id, "c1".into(), "ok".into(), call)
+        .await
+        .unwrap()
+        .expect("the call is unresolved");
+
+    // And an ends-turn round on top of it, whose stamped tail the walk reads
+    // past.
+    let ended = o.user_text("second").await;
+    let ends_turn_call = anchored_call(&o, ended, "c2").await;
+    o.ctx
+        .store
+        .complete_tool_call_block_stamped(
+            o.ctx.conversation_id,
+            "c2".into(),
+            "nothing to do".into(),
+            ends_turn_call,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("the call is unresolved");
+
+    let ledger = o
+        .ctx
+        .store
+        .list_blocks(o.ctx.conversation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::ToolCall::unanswered_outcome_anchor(&ledger),
+        Some(stranded),
+        "the walk reads past the stamped tail to the older unanswered outcome"
+    );
+
+    // So the summons that follows inherits the OLDER dead turn, not the
+    // stamped one and not itself.
+    let next = o.user_text("third").await;
+    let ledger = o
+        .ctx
+        .store
+        .list_blocks(o.ctx.conversation_id)
+        .await
+        .unwrap();
+    let tail = ledger.last().expect("the fresh summons is the tail");
+    assert_eq!(tail.id, next);
+    assert_eq!(
+        ratchet::fresh_turn_anchor(&ledger, tail),
+        stranded,
+        "the accepted residual, stated as the ledger answers it"
+    );
+}
+
+/// The transparency's scope: exactly the rows that store a turn's end. The
 /// interrupt's status stays opaque even in the burial shape — its capping
 /// under the latch is that path's recorded semantics, and the latch's own
 /// release re-checks there.

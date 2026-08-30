@@ -49,8 +49,14 @@ turn, which is why they are one slice.
   open turn's anchor from its first dispatch until a close that ends the turn
   (an end-turn stop, the error edge, the interrupt teardown — a tool-use stop
   closes the stream but leaves the turn open), and every continuation dispatch
-  reuses the held anchor regardless of what the tail is. A fresh turn resolves
+  reuses the held anchor whatever the tail is. A fresh turn resolves
   from the tail as before.
+  Amended 2026-08-30, with the ends-turn stamp: the reuse re-asks the release
+  rule against the dispatch's own snapshot before it resolves an anchor from
+  the hold, because a turn ended by a stamped resolution owes nothing and so
+  reaches no release site. A hold the rule still supports survives; one it no
+  longer supports is dropped, and the summons takes a fresh anchor — the same
+  answer a restarted actor derives from the same rows.
   Refined 2026-08-22, after the consumer's fifth adversarial break proved the
   unconditional hold leaks: the close is the identity's only release site, so
   a tool-use close whose continuation never comes — a truncated tool

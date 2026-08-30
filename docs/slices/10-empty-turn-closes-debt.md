@@ -50,9 +50,11 @@ stop writing nothing, not to add a re-drive.)
 discard throws away.** An empty completed response is a real event: the model chose to say
 nothing and *spent tokens doing so* (a real request on 2026-08-24 showed the provider
 returning empty text after ~150 reasoning tokens). The empty text block is (a) the model's
-move, which settles the frontier the same way any assistant text does; (b) the request-final
-**usage carrier**, so those spent tokens are still accounted; and (c) a faithful history
-entry, so on replay the model gets its own empty message back rather than a hole. Recording an
+move, which settles the frontier the same way any assistant text does; and (b) a faithful
+history entry, so on replay the model gets its own empty message back rather than a hole.
+Those spent tokens are accounted for where usage actually travels — the stream-done event the
+message end emits for every stop reason; no block carries usage and none ever did (verified
+2026-08-30). Recording an
 *error* instead would forge an event that never happened; a genuinely failed response never
 reaches finalize (the stream raises and the death is recorded elsewhere).
 
@@ -99,10 +101,10 @@ a cue only while user-visible text streams has nothing reliable to key on.
   no special case: an assistant `text` block awaits nobody, so `frontier_owes_turn` is false on
   it and the debt closes exactly once. The block carries the turn's `dispatch_anchor` like every
   block a turn writes.
-- **The empty block is the request-final usage carrier, 2026-08-24.** The turn's spent tokens
-  (reasoning included) are recorded against it exactly as they would be for a non-empty final
-  block — the implementer settles where usage attaches in this codebase so an empty turn's
-  usage is not lost.
+- **Where the empty turn's usage attaches, 2026-08-24, settled 2026-08-30.** The turn's spent
+  tokens (reasoning included) ride the stream-done event the message end emits for every stop
+  reason, exactly as a non-empty turn's do; nothing in the framework persists usage on a block
+  or in a column, so an empty turn's usage is not lost and no block is its carrier.
 - **The empty block replays to the model per each wire's rules, 2026-08-24.** It appears in the
   model-facing projection as the assistant's (empty) message; it is not omitted, not made
   transparent. Each provider wire renders it per its rules; the deployed provider accepts empty
@@ -129,13 +131,16 @@ a cue only while user-visible text streams has nothing reliable to key on.
 A non-tool turn that COMPLETES normally (the `message_end`/`EndTurn` finalize) commits its
 text channel's final state to the ledger as an assistant text block, **empty included** —
 never discarded. That block settles the frontier the same way any assistant text does (so the
-debt closes exactly once and the session never wedges), carries the turn's usage, carries its
-`dispatch_anchor`, and replays to the model as the assistant's (empty) message. A turn that
+debt closes exactly once and the session never wedges), carries its
+`dispatch_anchor`, and replays to the model as the assistant's (empty) message. It carries no
+usage: nothing in the framework persists usage anywhere, and every request's final numbers ride
+the stream-done event, which fires at message end for every stop reason (verified against the
+tree, 2026-08-30). A turn that
 ends in tool use leaves no orphaned empty block (the lazy placeholder is unchanged); a turn
 that ERRORS or is TORN DOWN commits no empty block and keeps its existing latch-and-retry. A
 non-tool turn that produced only thinking still lands the empty text block — the thinking block
 incidentally already rests the frontier, but the empty text block is the canonical assistant
-move and the usage carrier, so it is committed regardless. Separately, the framework emits a
+move, so it is committed regardless. Separately, the framework emits a
 signal when user-visible text actually starts flowing (the first text delta), distinct from and
 never raised by thinking or by a text block that opens and finalizes empty. No new dependency;
 no other change to the dispatch-identity rules or the provider wire beyond rendering the empty
@@ -154,11 +159,11 @@ message.
   message — pinned, mutation-proven (this is the wedge the discard caused).
 - **AC4** The placeholder asymmetry holds: a turn that ends in tool use leaves NO orphaned
   empty text block — pinned; and a non-tool turn that produced only thinking and no text still
-  lands an empty final block (unconditional finalize; the empty block is the usage carrier and
-  the canonical move even though the thinking block already rests the frontier) — pinned.
-- **AC5** The empty block carries the turn's usage — the spent tokens of an empty response are
-  recorded against it, not lost — pinned (or, if usage attaches elsewhere in this codebase, the
-  empty turn's usage is shown recorded and the pin names where).
+  lands an empty final block (unconditional finalize; the empty block is the canonical move
+  even though the thinking block already rests the frontier) — pinned.
+- **AC5** The empty turn's usage is shown recorded where it actually attaches, and the pin
+  names that place: the stream-done event the message end emits for every stop reason. No
+  block carries usage — the framework persists none (settled 2026-08-30, against the tree).
 - **AC6** The empty block replays into the model-facing projection as the assistant's empty
   message — present, not omitted, not transparent — pinned against the projection.
 - **AC7** The user-visible-text signal fires on the first text DELTA (real content), and is

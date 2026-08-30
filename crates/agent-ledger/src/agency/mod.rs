@@ -63,6 +63,8 @@ pub use thinking::Thinking;
 pub use tool_call::ToolCall;
 pub use tool_error::ToolError;
 pub use tool_result::ToolResult;
+#[cfg(test)]
+pub(crate) use tool_result::results_with_stamps;
 
 // Who owes a block's next move. Defined in `crate::types`, because it also
 // rides conversation state out to a consumer and the vocabulary a consumer
@@ -153,15 +155,20 @@ pub trait Agency {
     /// skipped when the frontier's tail is read, and the block behind it
     /// answers instead. Default: opaque — the tail speaks for itself.
     ///
-    /// Exactly one shape answers `true`: the status record carrying a
-    /// stored turn-closure key ([`Status`]). Such a marker is written
-    /// wherever the runtime ends a turn as a stored fact — by a close that
-    /// ends a turn over an unanswered outcome, and (2026-08-30) by the
-    /// forced end a run of tool-call window refusals triggers between
-    /// rounds — and an addressed message absorbed into the dead turn's
-    /// window sits BEHIND it in ledger order: an opaque marker buried that
-    /// message forever, because neither end latches and the closed edge has
-    /// no re-engagement beyond its one re-check. The interrupt's status
+    /// One property answers `true`, and two shapes carry it: the row that
+    /// STORES A TURN'S END. Either the status record carrying a stored
+    /// turn-closure key ([`Status`]) — written where a turn ends with no row
+    /// of its own to record it, by a close that ends a turn over an
+    /// unanswered outcome, and (2026-08-30) by the forced end a run of
+    /// tool-call window refusals triggers between rounds — or (2026-08-30)
+    /// the resolution stamped by an ends-turn tool, which is that turn's
+    /// stored end and needs no marker beside it. An addressed message
+    /// absorbed into the dead turn's window sits BEHIND that row in ledger
+    /// order: an opaque one buried the message forever, because neither end
+    /// latches and the closed edge has no re-engagement beyond its one
+    /// re-check. Which row records the end differs; what the frontier owes
+    /// the message behind it does not, so the rule is written once, here, and
+    /// each kind answers it from its own data. The interrupt's status
     /// stays opaque on purpose: its capping under the latch is that path's
     /// recorded semantics, and the latch's own release re-checks there.
     fn frontier_transparent(&self) -> bool {

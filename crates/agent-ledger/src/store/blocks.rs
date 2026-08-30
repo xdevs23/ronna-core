@@ -28,6 +28,10 @@ use super::{DomainGate, StoreError};
 /// 2026-08-27, in the same lockstep: the date marker's join gained the three
 /// nullable zone-and-minute columns. A column written and never selected here
 /// is a column the projection can never speak.
+///
+/// 2026-08-30, the same lockstep again: the tool result's join gained the
+/// turn-ending stamp, which decides whether the resolution asks the model for
+/// anything at all.
 pub(super) const BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
@@ -35,7 +39,7 @@ pub(super) const BLOCKS_QUERY: &str = "SELECT
             bc.role AS bc_role, bc.language AS bc_language, bc.content AS bc_content,
             btc.role AS btc_role, btc.tool_call_id AS btc_tool_call_id, btc.name AS btc_name, btc.input AS btc_input, btc.interactive AS btc_interactive,
             bstc.role AS bstc_role, bstc.tool_call_id AS bstc_tool_call_id, bstc.name AS bstc_name, bstc.input AS bstc_input,
-            btr.tool_call_id AS btr_tool_call_id, btr.content AS btr_content,
+            btr.tool_call_id AS btr_tool_call_id, btr.content AS btr_content, btr.ends_turn AS btr_ends_turn,
             bte.tool_call_id AS bte_tool_call_id, bte.error AS bte_error,
             bth.role AS bth_role, bth.content AS bth_content, bth.title AS bth_title, bth.summary AS bth_summary,
             bth.opaque_kind AS bth_opaque_kind, bth.opaque_data AS bth_opaque_data, bth.opaque_item_id AS bth_opaque_item_id,
@@ -346,6 +350,18 @@ fn tool_payload(
             fields.insert(
                 "content".into(),
                 Value::String(required_str(row, "btr_content", block_id, block_type)?),
+            );
+            // The turn-ending stamp, so the resolution answers whether it asks
+            // the model for anything from its own data on replay — never from
+            // a tool-name match. Read optionally, the interactive stamp's
+            // shape one arm above: the column is NOT NULL with a default, so
+            // every row the widening step backfilled reads unstamped and
+            // summons its continuation exactly as it always did. A missing
+            // JOIN row cannot hide here either — the required reads above fail
+            // that row loudly before this line runs.
+            fields.insert(
+                "ends_turn".into(),
+                Value::Bool(col_opt::<i64>(row, "btr_ends_turn")?.unwrap_or(0) != 0),
             );
         }
         "tool_error" => {

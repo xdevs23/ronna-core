@@ -51,9 +51,17 @@ impl Store {
     /// `source_block_id` is the block id of the `tool_call` block this answers,
     /// and it is the identity the condition is keyed on: a model's
     /// `tool_call_id` can repeat, the block id cannot, so two calls sharing one
-    /// provider id resolve independently. This is the ONLY door a result takes
-    /// into the ledger — a backing system resolving deferred work calls it with
-    /// the call block id it kept.
+    /// provider id resolve independently. This is the only PUBLIC door a result
+    /// takes into the ledger — a backing system resolving deferred work calls
+    /// it with the call block id it kept.
+    ///
+    /// The result it writes is UNSTAMPED: it asks the model for its
+    /// continuation, which is what every out-of-band resolution means. The
+    /// turn-ending stamp ([`ToolHandler::ends_turn`](crate::ToolHandler::ends_turn))
+    /// is decided where the handler is in hand — the runner's body pass — and
+    /// reaches the ledger through the crate-private stamped variant this
+    /// method delegates to, the one write implementation underneath both
+    /// doors.
     ///
     /// # Errors
     ///
@@ -64,6 +72,42 @@ impl Store {
         tool_call_id: String,
         result: String,
         source_block_id: i64,
+    ) -> Result<Option<i64>, StoreError> {
+        self.complete_tool_call_block_stamped(
+            conversation_id,
+            tool_call_id,
+            result,
+            source_block_id,
+            false,
+        )
+        .await
+    }
+
+    /// The resolution write itself, with the turn-ending stamp the caller
+    /// decided (2026-08-30) — ONE implementation, two doors.
+    ///
+    /// `ends_turn` is [`ToolHandler::ends_turn`](crate::ToolHandler::ends_turn)
+    /// as the handler answered it at execution time. A stamped resolution asks
+    /// the model for nothing: it IS the stored record of the turn's end, read
+    /// back off this row by every fold that walks the ledger, so a restart
+    /// derives the same closure from the same block. Recorded at the one
+    /// moment it is known, on the row that must answer for it — the
+    /// `dispatch_anchor` precedent class.
+    ///
+    /// Crate-private on purpose: the public door above holds no handler and
+    /// must never invent the stamp, and a public parameter would offer every
+    /// caller a second place to decide what only the registry knows.
+    ///
+    /// # Errors
+    ///
+    /// If the insert fails or the store's actor has stopped.
+    pub(crate) async fn complete_tool_call_block_stamped(
+        &self,
+        conversation_id: i64,
+        tool_call_id: String,
+        result: String,
+        source_block_id: i64,
+        ends_turn: bool,
     ) -> Result<Option<i64>, StoreError> {
         self.run(move |conn| {
             transact(conn, |tx| {
@@ -76,8 +120,8 @@ impl Store {
                 let anchor = anchor_of(tx, source_block_id)?;
                 let block_id = insert_block(tx, BlockDestination::anchored(conversation_id, anchor), "tool_result")?;
                 tx.execute(
-                    "INSERT INTO block_tool_result (block_id, tool_call_id, content, source_block_id) VALUES (?1, ?2, ?3, ?4)",
-                    params![block_id, tool_call_id, result, source_block_id],
+                    "INSERT INTO block_tool_result (block_id, tool_call_id, content, source_block_id, ends_turn) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![block_id, tool_call_id, result, source_block_id, i64::from(ends_turn)],
                 )?;
                 Ok(Some(block_id))
             })
@@ -351,6 +395,63 @@ mod tests {
             None,
             "an unanchored call's outcome stays null"
         );
+    }
+
+    /// AC2 — the turn-ending stamp survives the walk and a RESTART: it is
+    /// written once at the resolution, read back off the loaded block, and
+    /// derived from that stored row alone by a process that never saw the
+    /// handler. Path-backed, because the in-memory store cannot be reopened;
+    /// the unstamped resolution beside it is what proves the read is the row's
+    /// and not a constant.
+    #[tokio::test]
+    async fn the_ends_turn_stamp_is_stored_and_survives_a_reopen() {
+        let dir = crate::store::temp_dir("ends-turn-stamp-restart");
+        let db = dir.join("ledger.db");
+
+        let conv = {
+            let store = Store::open(&db).unwrap();
+            let conv = store
+                .create_conversation("p".into(), "m".into(), "m".into(), String::new())
+                .await
+                .unwrap();
+            let ordinary = call_block(&store, conv, "ordinary").await;
+            let parked = call_block(&store, conv, "parked").await;
+            store
+                .complete_tool_call_block_stamped(
+                    conv,
+                    "ordinary".into(),
+                    "the output".into(),
+                    ordinary,
+                    false,
+                )
+                .await
+                .unwrap()
+                .expect("the ordinary resolution writes");
+            store
+                .complete_tool_call_block_stamped(
+                    conv,
+                    "parked".into(),
+                    "nothing to do".into(),
+                    parked,
+                    true,
+                )
+                .await
+                .unwrap()
+                .expect("the stamped resolution writes");
+            conv
+        };
+
+        let store = Store::open(&db).unwrap();
+        let reopened = store.list_blocks(conv).await.unwrap();
+        assert_eq!(
+            crate::agency::results_with_stamps(&reopened),
+            vec![
+                ("the output".to_owned(), false),
+                ("nothing to do".to_owned(), true)
+            ],
+            "each resolution answers for its own turn out of its own row"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The schema's identity invariant, exercised: a model's `tool_call_id` can

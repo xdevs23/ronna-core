@@ -193,42 +193,50 @@ pub(crate) fn frontier_owes_turn<K: RuntimeKind>(tail: &Block) -> bool {
 }
 
 /// The block the frontier decision reads over one snapshot: the tail, read
-/// THROUGH a dead turn's trailing closure run — its stored turn-closure
-/// markers and the trailing blocks those markers answer
-/// (2026-08-23, the verified burial defect). An opaque marker at the
+/// THROUGH a dead turn's trailing closure run — the rows that STORE a turn's
+/// end and the trailing blocks those rows answer
+/// (2026-08-23, the verified burial defect). An opaque closure row at the
 /// tail buried an addressed message absorbed into the dead turn's window:
-/// the close's re-check read the marker, decided nothing owed, and rested —
+/// the close's re-check read the row, decided nothing owed, and rested —
 /// and the non-latching closed edge re-checks exactly once, so no turn ever
 /// fired for the message. The latching error edge never had the hole: the
 /// latch's release re-engages there.
 ///
+/// Two shapes store an end and both are read through (2026-08-30): the
+/// close's turn-end marker, and the resolution an ends-turn tool stamped —
+/// which ends its turn while asking nothing, the exact shape the burial
+/// lives in. The walk names neither: it asks
+/// [`Agency::frontier_transparent`](super::Agency::frontier_transparent),
+/// and each kind answers from its own stored row.
+///
 /// The walk reads through the dead turn's WHOLE trailing run, not through
-/// the markers alone (amended 2026-08-23, the verified regression on the
+/// the closure rows alone (amended 2026-08-23, the verified regression on the
 /// transparency's first cut): a message absorbed between the turn's call
 /// and its RESULT — the tool-execution window — sits under the
-/// outcome-plus-marker pair, and a read that skipped only the markers
+/// outcome-plus-marker pair, and a read that skipped only the closure rows
 /// stopped on the outcome, found it answered, and rested — the same burial
-/// wearing one more block. Three rules, all scoped to the markers the walk
-/// has skipped:
+/// wearing one more block. Three rules, all scoped to the closure rows the
+/// walk has skipped:
 ///
-/// - A trailing turn-closure marker is skipped, and the turn it is anchored
+/// - A trailing turn-closure row is skipped, and the turn it is anchored
 ///   on is disowned from here back.
 /// - A trailing block anchored on a disowned turn — the dead turn's own
 ///   product, wherever it sits in the trailing run — is skipped too: the
-///   marker recorded that turn's end, and stopping on its outcome would
-///   either bury what the outcome hides or redispatch the turn the marker
-///   exists to close. A block anchored on a turn no skipped marker disowns
-///   stays opaque, which is what lets an outcome landing AFTER the marker —
+///   closure row recorded that turn's end, and stopping on its outcome would
+///   either bury what the outcome hides or redispatch the turn that row
+///   exists to close. A block anchored on a turn no skipped row disowns
+///   stays opaque, which is what lets an outcome landing AFTER the closure —
 ///   an approval resolving late — summon its resumption as before.
 /// - The first block outside the run is the frontier — a model-owed message
 ///   absorbed anywhere in the dead turn's window owes, and dispatches
 ///   anchored on itself. One bound: a stop on a disowned turn's own SUMMONS
 ///   rests on the tail instead — that block's turn is the very one the
-///   marker recorded as ended, and owing it again would redispatch it.
+///   closure row recorded as ended, and owing it again would redispatch it.
 ///
 /// Transparency is a kind-level answer
 /// ([`Agency::frontier_transparent`](super::Agency::frontier_transparent)),
-/// scoped to exactly the turn-closure machine keys; the interrupt's status
+/// scoped to exactly the rows that store a turn's end — the turn-closure
+/// machine keys and the ends-turn-stamped resolution; the interrupt's status
 /// stays opaque, and its capping under the latch is that path's recorded
 /// semantics.
 pub(crate) fn frontier_block<K: RuntimeKind>(snapshot: &[Block]) -> Option<&Block> {
@@ -385,10 +393,11 @@ pub async fn drive_ledger<K: RuntimeKind, E: RuntimeEvent>(
     // loop above walked. `parked` stays the drive's own answer: it is a fact
     // about what this drive reached, not about the current tail. The owed
     // turn itself is the shared frontier rule, so this site and the actor's
-    // delivery-time re-check cannot drift. A transparent tail — a stored
-    // turn-closure marker — costs one extra full read here: the one-row tail
-    // cannot see behind itself, and [`frontier_block`] needs the snapshot to
-    // decide what the marker buried. The common shapes keep the one-row read.
+    // delivery-time re-check cannot drift. A transparent tail — a row that
+    // stores a turn's end, a marker or an ends-turn-stamped resolution —
+    // costs one extra full read here: the one-row tail cannot see behind
+    // itself, and [`frontier_block`] needs the snapshot to decide what the
+    // closure row buried. The common shapes keep the one-row read.
     let tail = source.tail(ctx).await?;
     let frontier = match tail {
         Some(tail) if K::from_block(&tail).frontier_transparent() => {

@@ -56,11 +56,14 @@ the repository's own law, and the tools layer's war story forbids admission
 decisions that travel in memory while the ledger says otherwise
 (`tools/mod.rs:21-36`).
 
-**Ending a turn early has two precedents and both are wrong here.** The abnormal
-stop (`ingestion.rs:1093-1104`) and the interrupt (`actor.rs:613-674`) both end
-turns from inside a stream and both LATCH the conversation; the forced end this
-slice needs fires BETWEEN rounds, when no stream is open, and must not latch — the
-conversation lives on. Only `settle_turn_identity` releases a held `open_turn`
+**A turn ends early four ways, and the two that predate this slice are both
+wrong here.** The abnormal stop (`ingestion.rs:1093-1104`) and the interrupt
+(`actor.rs:613-674`) both end turns from inside a stream and both LATCH the
+conversation; the forced end this slice needs fires BETWEEN rounds, when no
+stream is open, and must not latch — the conversation lives on. The fourth is
+slice 18's park end (2026-08-30), between rounds and non-latching like this
+one, and recorded on its own resolution row rather than as a status. The
+ordinary end of a turn is text. Only `settle_turn_identity` releases a held `open_turn`
 today; leaving it held inherits the dead turn's anchor onto the next summons
 (`actor.rs:743-760`). A status block projects no model content (`records.rs:70-74`); the turn-end
 status family is walk-TRANSPARENT (`records.rs:45-50`), and the loop rests

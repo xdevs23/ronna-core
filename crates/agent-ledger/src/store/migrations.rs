@@ -347,6 +347,18 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE block_date_marker ADD COLUMN tz_name    TEXT;
     ALTER TABLE block_date_marker ADD COLUMN written_at TEXT;
     ",
+    // v4 (2026-08-30): the turn-ending stamp on a resolution — whether the
+    // tool that produced this result declared that a successful call of it
+    // ENDS the turn. Read from the handler at the resolution write, the one
+    // moment it is known, and stored on the row that must answer for it: the
+    // block then asks for nothing on replay, and the stamp IS the stored
+    // record of the turn's closure. Defaulting to 0 like the interactive
+    // stamp it follows, so every resolution written before the column reads
+    // back as an ordinary result that still summons its continuation. A step,
+    // not an edit to v1's CREATE TABLE, for the reason v3 records.
+    "
+    ALTER TABLE block_tool_result ADD COLUMN ends_turn INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 /// Apply every unapplied step, advancing `user_version` as each lands.
@@ -608,6 +620,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(name.as_deref(), Some("Europe/Berlin"));
+    }
+
+    /// v4: the turn-ending stamp rides the resolution row, defaulting to
+    /// unstamped — a resolution written without naming it asks for its
+    /// continuation exactly as every resolution did before the column.
+    #[test]
+    fn the_ends_turn_stamp_is_present_and_defaults_to_unstamped() {
+        let conn = migrated();
+        assert!(table_columns(&conn, "block_tool_result").contains(&"ends_turn".to_string()));
+
+        conn.execute_batch(
+            "INSERT INTO blocks (block_type) VALUES ('tool_call');
+             INSERT INTO blocks (block_type) VALUES ('tool_result');
+             INSERT INTO block_tool_result (block_id, tool_call_id, content, source_block_id)
+                 VALUES (2, 'c1', 'answered', 1);",
+        )
+        .unwrap();
+        let stamp: i64 = conn
+            .query_row(
+                "SELECT ends_turn FROM block_tool_result WHERE block_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamp, 0, "a resolution that names no stamp ends no turn");
+    }
+
+    /// AC5 — a populated store carrying resolutions from before v4 upgrades in
+    /// place: the rows survive, every one of them reads back UNSTAMPED — the
+    /// shape whose continuation still fires — and a stamped resolution writes
+    /// through the same table afterwards. Same precedent as the v1-to-v2 and
+    /// v2-to-v3 upgrades above, against the data this step widens.
+    #[test]
+    fn a_populated_store_with_resolutions_gains_the_ends_turn_stamp_in_place() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for sql in &MIGRATIONS[..3] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO blocks (block_type) VALUES ('tool_call');
+             INSERT INTO blocks (block_type) VALUES ('tool_result');
+             INSERT INTO block_tool_result (block_id, tool_call_id, content, source_block_id)
+                 VALUES (2, 'before', 'the old answer', 1);",
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+        assert_eq!(version(&conn), u32::try_from(MIGRATIONS.len()).unwrap());
+
+        let row: (String, String, i64) = conn
+            .query_row(
+                "SELECT tool_call_id, content, ends_turn FROM block_tool_result
+                 WHERE block_id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("before".to_owned(), "the old answer".to_owned(), 0),
+            "the existing resolution survives, ending no turn it was never told to end"
+        );
+
+        // And the widened row writes through the same table afterwards.
+        conn.execute_batch(
+            "INSERT INTO blocks (block_type) VALUES ('tool_call');
+             INSERT INTO blocks (block_type) VALUES ('tool_result');
+             INSERT INTO block_tool_result (block_id, tool_call_id, content, source_block_id, ends_turn)
+                 VALUES (4, 'after', 'nothing to do', 3, 1);",
+        )
+        .unwrap();
+        let stamp: i64 = conn
+            .query_row(
+                "SELECT ends_turn FROM block_tool_result WHERE block_id = 4",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamp, 1, "a new resolution records the end of its turn");
     }
 
     /// The display-only summary channel sits beside content and the opaque

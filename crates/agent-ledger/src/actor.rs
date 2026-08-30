@@ -387,11 +387,16 @@ struct ConversationActor<K: RuntimeKind, E> {
     /// stop closes the STREAM but leaves this held while a continuation is
     /// genuinely due ([`Self::turn_continuation_due`], refined 2026-08-22,
     /// amended 2026-08-23),
-    /// and every continuation dispatch reuses it regardless of what the tail
-    /// is — which is what
+    /// and every continuation dispatch reuses it whatever the tail is — which
+    /// is what
     /// keeps a message absorbed between a round's result and the
     /// continuation dispatch from re-anchoring the turn onto itself, the
-    /// consumer's proven escalation. A fresh turn (nothing held) resolves
+    /// consumer's proven escalation. The reuse REVALIDATES the hold against
+    /// the dispatch's own snapshot first (2026-08-30, the ends-turn stamp): a
+    /// turn ended by a stamped resolution owes nothing and therefore signals
+    /// nobody, so the one site that reads this cache asks the release rule
+    /// there. A fresh turn — nothing held, or a hold the rule no longer
+    /// supports — resolves
     /// its anchor from the dispatch snapshot through
     /// [`ratchet::fresh_turn_anchor`] — ledger-first since 2026-08-23, the
     /// verified seventh break, which DEMOTES this field to a consistency
@@ -408,12 +413,17 @@ struct ConversationActor<K: RuntimeKind, E> {
     /// ledger (2026-08-23, [`Self::settle_turn_identity`]): turn closure is
     /// a stored fact, never re-derived from side effects.
     open_turn: Option<i64>,
-    /// How many tool outcomes — results and errors — anchored on the open
-    /// turn its dispatches have already answered (2026-08-23, the verified
-    /// sixth break's counting arm): recorded at EVERY dispatch that sets or
-    /// reuses the identity, from the dispatch's own snapshot — the same one
-    /// the request is built from, so the count is exactly the outcomes that
-    /// request carries. The release rule compares the close's outcome count
+    /// How many tool outcomes anchored on the open turn ASK FOR a
+    /// continuation its dispatches have already answered (2026-08-23, the
+    /// verified sixth break's counting arm): recorded at EVERY dispatch that
+    /// sets or reuses the identity, from the dispatch's own snapshot — the
+    /// same one the request is built from, and through the same fold
+    /// ([`ToolCall::outcomes_anchored_in`]) the release rule measures
+    /// against. An ends-turn-stamped result is outside that fold on both
+    /// sides (2026-08-30): it still rides the request, because the model's
+    /// call and its result must stay paired, while nothing is owed for it and
+    /// nothing is marked as answering it. The release rule compares the
+    /// close's outcome count
     /// against it: an outcome above this mark has not had its continuation
     /// yet, and that continuation is the one thing a tool-use close still
     /// owes. Kept in outcome units, not as a dispatch tally, by decision:
@@ -897,11 +907,13 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     /// break, replacing the fifth break's two arms): a tool-use close KEEPS
     /// the identity iff
     ///
-    /// - **an outcome is unanswered** — the count of tool results and tool
-    ///   errors anchored on this turn exceeds the count its dispatches have
-    ///   already answered ([`Self::answered_outcomes`]): every outcome
+    /// - **an outcome is unanswered** — the count of anchored tool outcomes
+    ///   that ask for a continuation exceeds the count its dispatches have
+    ///   already answered ([`Self::answered_outcomes`]): such an outcome
     ///   summons exactly one continuation, and one above the mark has not
-    ///   had its dispatch yet; or
+    ///   had its dispatch yet. An ends-turn-stamped result asks for none and
+    ///   is excluded by the fold itself (2026-08-30), so an ends-turn round
+    ///   leaves the two sides equal and the turn ends; or
     /// - **the system owes an outcome** — an unresolved, NON-interactive
     ///   tool call with a non-empty call id, anchored on this turn, exists
     ///   in the snapshot ([`ToolCall::system_owed_call_anchored_in`]): the
@@ -937,6 +949,22 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     ///   yet answered — and each continuation dispatch re-marks the
     ///   answered count from its own snapshot, so the final prose round,
     ///   with every outcome answered and no call owed, ends the turn.
+    /// - **The ends-turn round** (2026-08-30): the resolution carries the
+    ///   ends-turn stamp, so it never enters the count and no call stays
+    ///   owed — both arms empty, and the turn ends on its own stored
+    ///   resolution with no marker written beside it. That row is the
+    ///   turn's stored end, so the frontier reads THROUGH it exactly as it
+    ///   reads through a marker: a message absorbed into the round's window
+    ///   still owes behind it and summons its own turn at this close's
+    ///   re-check.
+    ///
+    /// TWO sites ask this rule, and they are the same rule on different
+    /// snapshots (2026-08-30): the close asks it to decide whether the
+    /// identity survives the stream, and the summons-time reuse in
+    /// [`Self::handle_blocks_ready`] asks it to decide whether a hold still
+    /// stands before an anchor is resolved from it. One rule, because an
+    /// ends-turn tail sends no signal the close can act on, and a second rule
+    /// for that case would be a second answer to one question.
     fn turn_continuation_due(&self, blocks: &[Block], anchor: i64) -> bool {
         ToolCall::outcomes_anchored_in(blocks, anchor) > self.answered_outcomes
             || ToolCall::system_owed_call_anchored_in(blocks, anchor)
@@ -1126,12 +1154,13 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         // ledger and dies here instead of dispatching.
         // The tail is read through a dead turn's trailing closure run
         // ([`ratchet::frontier_block`], 2026-08-23, the verified burial
-        // defect): the turn-end marker and the trailing blocks it answers
-        // are transparent here, so an addressed message absorbed anywhere in
-        // the dead turn's window — the tool-execution stretch between a call
-        // and its result included — still owes behind them and the close's
-        // re-check dispatches its turn instead of resting on the marker
-        // forever.
+        // defect): the row that stored the turn's end — a turn-end marker,
+        // or (2026-08-30) an ends-turn-stamped resolution — and the trailing
+        // blocks it answers are transparent here, so an addressed message
+        // absorbed anywhere in the dead turn's window — the tool-execution
+        // stretch between a call and its result included — still owes behind
+        // them and the close's re-check dispatches its turn instead of
+        // resting on the closure row forever.
         let Some(tail) = ratchet::frontier_block::<K>(&blocks) else {
             tracing::warn!(
                 conversation_id = self.id,
@@ -1149,8 +1178,8 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         }
         // The turn's identity (amended 2026-08-22; ledger-first 2026-08-23,
         // the verified seventh break): a dispatch while a turn is open is
-        // that turn's continuation and reuses the held anchor REGARDLESS of
-        // the tail — a message absorbed between a round's result and this
+        // that turn's continuation and reuses the held anchor whatever the
+        // tail is — a message absorbed between a round's result and this
         // dispatch is the tail, and resolving from it re-anchored the turn
         // onto the absorbed message, the consumer's proven escalation. The
         // held identity is a CONSISTENCY CACHE over a ledger-derivable fact
@@ -1161,8 +1190,25 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         // otherwise — which is what keeps a released turn (a parked
         // approval resuming, a restart recovering) anchored on its original
         // summons even when a message was absorbed behind its outcome.
+        //
+        // The reuse is REVALIDATED against the ledger first (2026-08-30, the
+        // ends-turn stamp): a turn ended by a stamped resolution owes no
+        // signal — its tail asks for nothing, so the close's release site is
+        // never reached and no delivery ever stands down for it. Rather than
+        // add a signal whose only job is to refresh this cache, the one site
+        // that resolves an anchor FROM the cache asks the release rule again,
+        // here, on the snapshot the request is built from: a hold the rule
+        // still supports (an unanswered outcome, a call the system owes)
+        // survives exactly as before, and a hold it no longer supports is
+        // dropped so this summons takes a fresh anchor. Restart-equivalent by
+        // construction — a rebooted actor holds nothing and answers from the
+        // same rows. The known residual: a summons arriving while the call is
+        // still UNRESOLVED attaches to the held turn, as any outstanding
+        // system-owed call makes it, and heals the moment the resolution
+        // lands.
         let anchor = self
             .open_turn
+            .filter(|held| self.turn_continuation_due(&blocks, *held))
             .unwrap_or_else(|| ratchet::fresh_turn_anchor(&blocks, tail));
 
         // The forced end (2026-08-30), decided BEFORE the dispatch spends: a
@@ -1239,10 +1285,13 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         // before dispatching. The dispatched stream opens with no recorded
         // stop, and the turn's identity is held from its first dispatch —
         // a continuation re-holds the same anchor. Every dispatch also
-        // answers the outcomes its own snapshot carries (2026-08-23): the
-        // mark is what the release rule measures new outcomes against, and
-        // recording it from the request's snapshot is what makes a resumed
-        // turn's already-carried outcome count as answered.
+        // answers the outcomes its own snapshot carries that ASK for a
+        // continuation (2026-08-23): the mark is what the release rule
+        // measures new outcomes against, and recording it from the request's
+        // snapshot is what makes a resumed turn's already-carried outcome
+        // count as answered. Mark and rule read the ONE fold, so an
+        // ends-turn-stamped result — which rides the request but asks for
+        // nothing — falls out of both sides at once (2026-08-30).
         self.streaming = true;
         self.stream_stop = None;
         self.answered_outcomes = ToolCall::outcomes_anchored_in(&blocks, anchor);
@@ -1913,6 +1962,7 @@ mod tests {
 
     use crate::agency::BlockKind;
     use crate::agency::ratchet::oracle::Oracle;
+    use crate::agency::results_with_stamps;
     use crate::block::Block;
     use crate::providers::types::ToolDefinition;
     use crate::providers::{
@@ -3352,7 +3402,7 @@ mod tests {
     // ─── The scripted provider and the composed runtime ─────────────────
 
     /// What the scripted provider streams when a turn request arrives.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum Script {
         /// First request answers with one tool call, second with prose. The
         /// composed-runtime shape.
@@ -3420,6 +3470,32 @@ mod tests {
         /// yet the tail — the absorbed message — owes the model. Later
         /// turns answer with plain prose.
         TruncatedHeld,
+        /// One tool round whose tool ENDS the turn (2026-08-30), in the real
+        /// wire order — message end with the tool-use stop, the named tool's
+        /// lifecycle, the trailing done — and closing prose for any later
+        /// request. The park pin's shape: a turn that ends on a tool round
+        /// with nothing after it, which no script said before this slice.
+        ///
+        /// Parameterized by tool, like [`Script::ToolRound`]: `park` resolves
+        /// at once, and `held_park` holds its result past the round's CLOSE,
+        /// so the close keeps the identity on its unresolved-call arm and the
+        /// stamped resolution lands behind it — the interleaving the
+        /// summons-time revalidation exists for.
+        ParkRound { tool: &'static str },
+        /// One turn emitting the park call AND an ordinary sibling whose
+        /// result is held, so the sibling's outcome lands LAST: the park stamp
+        /// silences only its own outcome, and the sibling's continuation is
+        /// summoned as usual. Later requests answer with the closing prose.
+        ParkBesideSibling,
+        /// One park round holding BOTH ends of its window open: the message
+        /// end and the lifecycle go out at once, the tool (`held_park`) waits
+        /// for the probe's `finish`, and the trailing done waits for its
+        /// `release`. So a message absorbed into the still-open window lands
+        /// BEFORE the stamped resolution, and the close runs after both —
+        /// AC8's shape, the one ordering that leaves an addressed message
+        /// sitting behind a turn-ending tail with no inbound left to surface
+        /// it. Later requests answer with the closing prose.
+        ParkRoundOverAnAbsorbedMessage,
         /// Every request answers with an empty turn — a message end and the
         /// trailing done, no content. The close-rest probe: the frontier is
         /// unchanged at the close, so the close must not keep redispatching
@@ -4024,6 +4100,28 @@ mod tests {
         events
     }
 
+    /// One turn emitting the park call and an ordinary sibling, in the real
+    /// wire order: the message end with the tool-use stop, then both drained
+    /// lifecycles. The sibling's tool holds its result, so the sibling's
+    /// outcome is the one that lands last.
+    fn park_and_sibling_round_events() -> Vec<StreamEvent> {
+        let mut events = vec![StreamEvent::MessageEnd {
+            usage: crate::providers::Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        }];
+        for (id, tool) in [("call-park", "park"), ("call-sibling", "held_echo")] {
+            events.extend([
+                StreamEvent::ToolUseStart {
+                    id: id.into(),
+                    name: tool.into(),
+                },
+                StreamEvent::ToolUseInputDelta { json: "{}".into() },
+                StreamEvent::ToolUseEnd,
+            ]);
+        }
+        events
+    }
+
     /// One turn cut off by the token cap, in the real wire order: partial
     /// prose, the message end with the max-tokens stop, then the tool
     /// lifecycle the shared translator still releases.
@@ -4162,6 +4260,40 @@ mod tests {
             (Script::HoldToolRound { tool }, 0) => {
                 held_lifecycle_round(turn, tool, resp_tx, release)
             }
+            (
+                Script::ParkRound { .. }
+                | Script::ParkBesideSibling
+                | Script::ParkRoundOverAnAbsorbedMessage,
+                _,
+            ) => park_turn(script, turn, answered, resp_tx, release),
+        }
+    }
+
+    /// Every park shape's whole script (2026-08-30). The opening round calls
+    /// the tool that ends the turn, and each shape decides only how much of
+    /// that round it holds open. A LATER request answers with the closing
+    /// prose — and only a fresh summons or a sibling's outcome can produce
+    /// one, so a request keyed on the park round alone is the defect these
+    /// pins exist to catch: nothing here answers it.
+    fn park_turn(
+        script: Script,
+        turn: usize,
+        answered: usize,
+        resp_tx: &tokio::sync::mpsc::UnboundedSender<ProviderResponse>,
+        release: &Arc<tokio::sync::Notify>,
+    ) -> Scripted {
+        if answered > 0 {
+            return Scripted::Turn(prose_turn_events("done"));
+        }
+        match script {
+            Script::ParkRound { tool } => Scripted::Turn(tool_round_events(turn, tool, None)),
+            Script::ParkBesideSibling => Scripted::Turn(park_and_sibling_round_events()),
+            // Both ends of the window held: the tool waits for the probe's
+            // finish, the trailing done for its release.
+            Script::ParkRoundOverAnAbsorbedMessage => {
+                held_done_events(tool_round_events(turn, "held_park", None), resp_tx, release)
+            }
+            other => unreachable!("park_turn reached from {other:?}"),
         }
     }
 
@@ -4208,6 +4340,61 @@ mod tests {
             Box::pin(async {
                 self.finish.notified().await;
                 ToolOutcome::Done("echoed".into())
+            })
+        }
+    }
+
+    /// A tool whose successful call ENDS the turn — the capability slice 18
+    /// gave the machinery, played here by a tool that says the model has
+    /// nothing left to do.
+    struct ParkTool;
+
+    impl ToolHandler<CoreEvent> for ParkTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "park".into(),
+                description: "ends the turn".into(),
+                parameters: json!({ "type": "object" }),
+            }
+        }
+        fn ends_turn(&self) -> bool {
+            true
+        }
+        fn execute<'a>(
+            &'a self,
+            _input: &'a str,
+            _ctx: ToolContext<'a, CoreEvent>,
+        ) -> BoxFuture<'a, ToolOutcome> {
+            Box::pin(async { ToolOutcome::Done("nothing to do".into()) })
+        }
+    }
+
+    /// [`ParkTool`] that answers only at the probe's `finish` — how the
+    /// interleaving pin puts the stream's CLOSE before the park result
+    /// commits, the exact window the summons-time revalidation exists for.
+    struct HeldParkTool {
+        finish: Arc<tokio::sync::Notify>,
+    }
+
+    impl ToolHandler<CoreEvent> for HeldParkTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "held_park".into(),
+                description: "ends the turn when released".into(),
+                parameters: json!({ "type": "object" }),
+            }
+        }
+        fn ends_turn(&self) -> bool {
+            true
+        }
+        fn execute<'a>(
+            &'a self,
+            _input: &'a str,
+            _ctx: ToolContext<'a, CoreEvent>,
+        ) -> BoxFuture<'a, ToolOutcome> {
+            Box::pin(async {
+                self.finish.notified().await;
+                ToolOutcome::Done("nothing to do".into())
             })
         }
     }
@@ -4307,6 +4494,13 @@ mod tests {
         tools.register(
             "held_echo",
             HeldEchoTool {
+                finish: Arc::clone(&finish),
+            },
+        );
+        tools.register("park", ParkTool);
+        tools.register(
+            "held_park",
+            HeldParkTool {
                 finish: Arc::clone(&finish),
             },
         );
@@ -7101,6 +7295,326 @@ mod tests {
             "one request per round — the allowed call, then the refusals — and nothing \
              after the last one — got {:?}",
             probe.shapes.lock().unwrap()
+        );
+    }
+
+    // ─── The tool that ends the turn (2026-08-30) ────────────────────────
+
+    /// A second summons after a park round: it dispatches, and its answer
+    /// anchors on ITSELF — the held identity the park turn left behind was
+    /// revalidated against the ledger at the reuse and dropped, so nothing of
+    /// the ended turn rides into this one.
+    async fn assert_the_next_summons_takes_a_fresh_anchor(
+        ctx: &RuntimeContext<BlockKind, CoreEvent>,
+        conv: i64,
+        parked_turn: i64,
+    ) {
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "again".into(),
+            }],
+        });
+        let blocks = await_ledger(ctx, conv, "the second summons' answer", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.block_type == "text" && b.fields["content"] == json!("done"))
+        })
+        .await;
+        let again = blocks
+            .iter()
+            .find(|b| b.fields.get("content") == Some(&json!("again")))
+            .expect("the second summons");
+        let answer = blocks
+            .iter()
+            .rfind(|b| b.block_type == "text" && b.fields["content"] == json!("done"))
+            .expect("its answer");
+        assert_ne!(
+            answer.dispatch_anchor,
+            Some(parked_turn),
+            "LEAK: the summons after a park round inherited the ended turn's identity"
+        );
+        assert_eq!(
+            answer.dispatch_anchor,
+            Some(again.id),
+            "the fresh summons anchors its turn on itself"
+        );
+    }
+
+    /// AC1 — a registered ends-turn tool, called and resolved, ENDS the turn:
+    /// the round's resolution is stamped, no continuation is dispatched (the
+    /// request counter stays where the opening turn left it), nothing else is
+    /// appended — no marker, because the stamped row IS the stored closure —
+    /// and the NEXT summons takes a fresh anchor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_park_round_ends_the_turn_and_the_next_summons_starts_fresh() {
+        let (ctx, conv, probe) = composed_runtime(Script::ParkRound { tool: "park" }).await;
+        let mut closed_rx = ctx.bus.subscribe();
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "summons".into(),
+            }],
+        });
+
+        await_ledger(&ctx, conv, "the park round's resolution", |blocks| {
+            blocks.iter().any(|b| b.block_type == "tool_result")
+        })
+        .await;
+        // The window a wrongly-summoned continuation fires in is bounded by
+        // the round's own close, not by a timer: the resolution has landed
+        // and the stream has ended, so the release rule has answered.
+        await_stream_closed(&mut closed_rx, conv).await;
+        let blocks = ctx.store.list_blocks(conv).await.unwrap();
+
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            1,
+            "the park resolution dispatched no continuation — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+        let shape: Vec<&str> = blocks.iter().map(|b| b.block_type.as_str()).collect();
+        assert_eq!(
+            shape,
+            vec!["date_marker", "text", "tool_call", "tool_result"],
+            "the turn ends on its resolution, with no marker beside it"
+        );
+        assert_eq!(
+            results_with_stamps(&blocks),
+            vec![("nothing to do".to_owned(), true)],
+            "and that resolution carries the stamp"
+        );
+        let summons = user_block(&blocks).id;
+        assert_anchors(&blocks, summons);
+
+        assert_the_next_summons_takes_a_fresh_anchor(&ctx, conv, summons).await;
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            2,
+            "one request for the park round, one for the fresh summons — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+    }
+
+    /// AC1's interleaving — the close ran BEFORE the park result committed.
+    /// The stream closes with the call still owed, so the release rule keeps
+    /// the identity on its unresolved-call arm; the stamped resolution then
+    /// lands behind the close, owing nobody, and no signal ever reaches a
+    /// release site. The stale hold is dropped where it is READ — at the next
+    /// summons' anchor resolution — which is the whole reason the reuse
+    /// revalidates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_park_result_landing_after_the_close_still_ends_the_turn() {
+        let (ctx, conv, probe) = composed_runtime(Script::ParkRound { tool: "held_park" }).await;
+        let mut closed_rx = ctx.bus.subscribe();
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "summons".into(),
+            }],
+        });
+
+        await_ledger(&ctx, conv, "the park call", |blocks| {
+            blocks.iter().any(|b| b.block_type == "tool_call")
+        })
+        .await;
+        // The ordering under probe is OBSERVED, not waited out: the stream's
+        // own close is awaited, and only then is the held result released, so
+        // the identity crossing the close is provably the held one.
+        await_stream_closed(&mut closed_rx, conv).await;
+        assert!(
+            !ctx.store
+                .list_blocks(conv)
+                .await
+                .unwrap()
+                .iter()
+                .any(|b| b.block_type == "tool_result"),
+            "the close really did run first — the result is still held"
+        );
+
+        probe.finish.notify_one();
+        let blocks = await_ledger(&ctx, conv, "the held park resolution", |blocks| {
+            blocks.iter().any(|b| b.block_type == "tool_result")
+        })
+        .await;
+        assert_eq!(
+            results_with_stamps(&blocks),
+            vec![("nothing to do".to_owned(), true)]
+        );
+
+        // Whether the resolution behind the close summoned anything is read
+        // off the counter at the END: a continuation it wrongly dispatched
+        // would sit between these two requests, so the count is the window.
+        let summons = user_block(&blocks).id;
+        assert_the_next_summons_takes_a_fresh_anchor(&ctx, conv, summons).await;
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            2,
+            "the resolution behind the close summoned nothing — one request \
+             for the round, one for the fresh summons — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+    }
+
+    /// AC4 — a park call beside a sibling silences only ITSELF. The script
+    /// controls the ordering: the sibling's tool holds its result, so the
+    /// sibling's outcome lands LAST, its turn is still owed a continuation,
+    /// and that continuation is summoned — anchored on the original summons,
+    /// because the shared fold counts the sibling's outcome while excluding
+    /// the park stamp on both sides of the comparison.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_park_call_beside_a_sibling_silences_only_its_own_outcome() {
+        let (ctx, conv, probe) = composed_runtime(Script::ParkBesideSibling).await;
+        let mut closed_rx = ctx.bus.subscribe();
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "summons".into(),
+            }],
+        });
+
+        await_ledger(&ctx, conv, "the park resolution", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.fields.get("content") == Some(&json!("nothing to do")))
+        })
+        .await;
+        // Bounded by the round's own close rather than by a timer: the park
+        // outcome has landed and the stream has ended, so the release rule
+        // has had its say while the sibling is still owed.
+        await_stream_closed(&mut closed_rx, conv).await;
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            1,
+            "the park outcome alone summons nothing while its sibling is owed — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+
+        // The sibling's outcome lands last, and IT owes the continuation.
+        probe.finish.notify_one();
+        let blocks = await_ledger(&ctx, conv, "the sibling's continuation", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.block_type == "text" && b.fields["content"] == json!("done"))
+        })
+        .await;
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            2,
+            "the sibling's outcome summoned exactly one continuation — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+        assert_eq!(
+            results_with_stamps(&blocks),
+            vec![
+                ("nothing to do".to_owned(), true),
+                ("echoed".to_owned(), false),
+            ],
+            "the park result is stamped, the sibling's is not, and the sibling's is last"
+        );
+        let summons = user_block(&blocks).id;
+        assert_anchors(&blocks, summons);
+        let closing = blocks
+            .iter()
+            .rfind(|b| b.block_type == "text" && b.fields["content"] == json!("done"))
+            .unwrap();
+        assert_eq!(
+            closing.dispatch_anchor,
+            Some(summons),
+            "the continuation is still the original turn's"
+        );
+    }
+
+    /// AC8 — an addressed message absorbed while an ends-turn round's window
+    /// was open is NEVER buried. The script holds both ends of that window
+    /// open, so the ledger takes the one order that strands the message: the
+    /// call, then the absorbed line, then the stamped resolution on top of
+    /// it, then the close. The turn-ending tail asks for nothing, and the
+    /// close's own re-check is the last re-engagement a non-latching close
+    /// has — so unless the frontier reads THROUGH that tail, the member's
+    /// question waits for some unrelated third party to write.
+    ///
+    /// What the pin claims: after the close, with NO further inbound, the
+    /// absorbed line's own turn fires, carries the line, and anchors on
+    /// itself. Every ordering it rests on is awaited on a real event — the
+    /// call's block, the resolution's block, the stream's own close — and
+    /// none of them is slept for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_message_absorbed_into_a_park_round_is_never_buried() {
+        let (ctx, conv, probe) = composed_runtime(Script::ParkRoundOverAnAbsorbedMessage).await;
+        let mut closed_rx = ctx.bus.subscribe();
+        ctx.bus.emit(CoreEvent::BlocksAppended {
+            conversation_id: conv,
+            blocks: vec![InputBlock::Text {
+                content: "summons".into(),
+            }],
+        });
+
+        // The window is open on both ends: the call is recorded, its result
+        // waits on the probe's finish, and the stream's close waits behind
+        // that.
+        await_ledger(&ctx, conv, "the park call", |blocks| {
+            blocks.iter().any(|b| b.block_type == "tool_call")
+        })
+        .await;
+
+        // The member writes INTO that window, so the stamped resolution lands
+        // on top of the message rather than under it.
+        let absorbed = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "absorbed".into())
+            .await
+            .unwrap();
+
+        probe.finish.notify_one();
+        let blocks = await_ledger(&ctx, conv, "the stamped resolution", |blocks| {
+            blocks.iter().any(|b| b.block_type == "tool_result")
+        })
+        .await;
+        let line = blocks.iter().position(|b| b.id == absorbed);
+        let tail = blocks.iter().position(|b| b.block_type == "tool_result");
+        assert!(
+            line < tail && line.is_some(),
+            "the shape under probe: the absorbed line sits BEHIND the turn-ending tail — got {:?}",
+            blocks
+                .iter()
+                .map(|b| b.block_type.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            results_with_stamps(&blocks),
+            vec![("nothing to do".to_owned(), true)],
+            "and the tail really is the turn-ending one"
+        );
+
+        // The round closes over the buried line, and nothing else arrives.
+        probe.release.notify_one();
+        await_stream_closed(&mut closed_rx, conv).await;
+
+        let blocks = await_ledger(&ctx, conv, "the absorbed line's own turn", |blocks| {
+            blocks
+                .iter()
+                .any(|b| b.block_type == "text" && b.fields["content"] == json!("done"))
+        })
+        .await;
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            2,
+            "the buried line summoned its own turn with no further inbound — got {:?}",
+            probe.shapes.lock().unwrap()
+        );
+        assert!(
+            request_carries(&probe.seen.lock().unwrap()[1], "absorbed"),
+            "and that turn carries the line it was summoned for"
+        );
+        let answer = blocks
+            .iter()
+            .rfind(|b| b.block_type == "text" && b.fields["content"] == json!("done"))
+            .expect("the absorbed line's answer");
+        assert_eq!(
+            answer.dispatch_anchor,
+            Some(absorbed),
+            "the line's turn anchors on itself, never on the turn that ended over it"
         );
     }
 }

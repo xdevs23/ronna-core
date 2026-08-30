@@ -93,7 +93,10 @@ pub fn denial_error_text(system_reason: Option<&str>, user_reason: Option<&str>)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Awaiting {
-    /// A model turn is warranted (user text, tool results, harness messages).
+    /// A model turn is warranted (user text, harness messages, and a tool
+    /// outcome that asks for its continuation — which every tool error does
+    /// and every tool result but one stamped as ending the turn, 2026-08-30:
+    /// that resolution warrants nothing and asks for nobody).
     Model,
     /// The runtime owes out-of-band work (an unresolved tool call, a pending
     /// request).

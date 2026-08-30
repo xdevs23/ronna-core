@@ -60,7 +60,7 @@ reserved-name breaks the slice introduces beside the field itself.
    turn onto itself — the proven escalation): the turn's identity is actor
    state, held from the first dispatch until a close that ends the turn, so
    a tool-use close leaves it open and every continuation reuses it
-   regardless of the tail. Refined 2026-08-22 after the fifth break proved
+   whatever the tail is. Refined 2026-08-22 after the fifth break proved
    the unconditional hold leaks onto the next unrelated summons: a tool-use
    close keeps the identity only while a continuation is genuinely due in
    its snapshot, and a lost tool round (a truncated lifecycle that recorded
@@ -110,7 +110,15 @@ reserved-name breaks the slice introduces beside the field itself.
    and its author is folded in. With
    that reading the floor lifts into the intended minimum-authority
    provenance gate: null folds to the floor, a non-message frontier is one
-   more author the interval covers.
+   more author the interval covers. Amended 2026-08-30 by the ends-turn
+   stamp: a turn a tool ended is stored on its own resolution row and asks
+   for nothing, so no close and no delivery ever sees it — the summons-time
+   reuse therefore re-asks the release rule against its own snapshot before
+   resolving an anchor from the hold, and a hold the rule no longer supports
+   is dropped for a fresh one. The outcome folds read the same stamp: an
+   ends-turn resolution is not an outcome that asks for a continuation, in
+   the counting arm and in the unanswered-outcome walk alike, so a sibling's
+   own outcome behind an ends-turn tail still inherits its turn.
 6. **The reserved-name breaks, by name.** Beside the struct field, the slice
    reserves the name `dispatch_anchor` on both consumer-facing surfaces:
    - `RESERVED_FIELD_NAMES` (the block serializer's header-owned keys) now
@@ -138,11 +146,15 @@ reserved-name breaks the slice introduces beside the field itself.
    instead of resting behind the marker forever. A composed kind enum picks the hook up by regenerating
    the derive; a hand-written `Agency` impl that delegates per hook adds
    the one-line delegation. Consumer statuses and the interrupt's
-   `interrupted` stay opaque — transparency is scoped to the turn-closure
-   keys, published as constants on the status kind: the two the close
-   writes, and (2026-08-30, the tool-call window) `tool_calls_exhausted`,
-   which the forced end writes between rounds when a run of the window's
-   refusals ends a turn.
+   `interrupted` stay opaque — transparency is scoped to the rows that STORE
+   a turn's end. On the status kind those are the machine keys published as
+   constants: the two the close writes, and (2026-08-30, the tool-call
+   window) `tool_calls_exhausted`, which the forced end writes between rounds
+   when a run of the window's refusals ends a turn. Beside them, and read
+   through the same hook, is the resolution an ends-turn tool stamped
+   (2026-08-30, the ends-turn stamp): that row is its turn's stored end, so a
+   message absorbed into the round's window is surfaced from behind it the
+   same way.
 
 ## Residuals recorded at the slice's close, 2026-08-23
 

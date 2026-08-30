@@ -1419,6 +1419,9 @@ mod tests {
     /// Updated 2026-08-27 with the statement: the date marker's existing join
     /// gained three selected columns — the zone abbreviation, the IANA name
     /// and the writing minute — with the join list itself untouched.
+    ///
+    /// Updated 2026-08-30 with the statement: the tool result's existing join
+    /// gained the turn-ending stamp, with the join list itself untouched.
     const PINNED_BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
@@ -1426,7 +1429,7 @@ mod tests {
             bc.role AS bc_role, bc.language AS bc_language, bc.content AS bc_content,
             btc.role AS btc_role, btc.tool_call_id AS btc_tool_call_id, btc.name AS btc_name, btc.input AS btc_input, btc.interactive AS btc_interactive,
             bstc.role AS bstc_role, bstc.tool_call_id AS bstc_tool_call_id, bstc.name AS bstc_name, bstc.input AS bstc_input,
-            btr.tool_call_id AS btr_tool_call_id, btr.content AS btr_content,
+            btr.tool_call_id AS btr_tool_call_id, btr.content AS btr_content, btr.ends_turn AS btr_ends_turn,
             bte.tool_call_id AS bte_tool_call_id, bte.error AS bte_error,
             bth.role AS bth_role, bth.content AS bth_content, bth.title AS bth_title, bth.summary AS bth_summary,
             bth.opaque_kind AS bth_opaque_kind, bth.opaque_data AS bth_opaque_data, bth.opaque_item_id AS bth_opaque_item_id,

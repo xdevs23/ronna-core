@@ -87,6 +87,12 @@ pub enum ToolOutcome {
     /// call stays claimed until the resolution lands in the ledger, so a wakeup
     /// arriving in between does not start the work a second time.
     ///
+    /// **Refused for an [`ends_turn`](ToolHandler::ends_turn) handler.** That
+    /// door carries no handler and therefore no stamp, so a deferred end of a
+    /// turn would resolve unstamped and summon the model after it. The runner
+    /// records a tool error instead — a tool that defers its own "nothing to
+    /// do" is not doing nothing.
+    ///
     /// [`Store::complete_tool_call_block`]: crate::store::Store::complete_tool_call_block
     Pending,
 }
@@ -143,6 +149,52 @@ pub trait ToolHandler<E>: Send + Sync {
     /// declaring both is refused at registration in debug builds rather than
     /// silently shipping a gate that nothing consults.
     fn interactive(&self) -> bool {
+        false
+    }
+
+    /// Whether a SUCCESSFUL call of this tool ENDS the turn: the model said it
+    /// has nothing left to do, and the resolution asks for no continuation.
+    /// Default: an ordinary tool, whose result summons the next round.
+    ///
+    /// A model bred for long-horizon work does not rest — with a turn's work
+    /// done it finds SOMETHING, and under this runtime's constraints that
+    /// something is a tool call, which summons a round, which finds something
+    /// again. This is the ear for "nothing to do here": a consumer registers
+    /// whatever concrete tools it wants on the property, and the runtime knows
+    /// only the property. Nothing here ever branches on a tool's NAME.
+    ///
+    /// Read at the ONE seam that holds the handler at RESOLUTION time — the
+    /// runner's body pass — and stamped onto the resolution row, the way
+    /// [`interactive`](Self::interactive) is stamped onto the call row: the
+    /// block answers who owes its next move out of its own data forever, so a
+    /// replay, a restart and a tool that has since left the registry all read
+    /// the same answer. The stored stamp IS the turn's closure; no separate
+    /// marker records it.
+    ///
+    /// Three things it does not do:
+    ///
+    /// - **It cannot defer.** A [`Pending`](ToolOutcome::Pending) outcome from
+    ///   an ends-turn handler is refused by the runner with a tool error: the
+    ///   out-of-band resolution door holds no handler and could not carry the
+    ///   stamp, so a deferred "nothing to do" would resolve unstamped and
+    ///   silently summon the model after the end of a turn.
+    /// - **It cannot be [`interactive`](Self::interactive).** An interactive
+    ///   call is answered by the human through that same handler-less door.
+    ///   The pairing is refused at registration, in debug builds, like
+    ///   gated-plus-interactive.
+    /// - **It cannot survive a refusal.** A call refused by a window or a gate
+    ///   resolves with an ERROR, and an error never carries the stamp — the
+    ///   model gets one more round and ends its turn the ordinary way.
+    ///
+    /// The result text is the model-facing close of the turn, and the
+    /// framework leaves its content entirely to the handler.
+    ///
+    /// **A wrapper that forwards this trait's methods BY HAND answers `false`
+    /// here until it gains the forwarding line.** The capability then compiles
+    /// and never fires, silently. The framework cannot fix a consumer's
+    /// wrapper: a wrapper that forwards this trait method by method carries
+    /// the standing obligation to gain a line for every method added here.
+    fn ends_turn(&self) -> bool {
         false
     }
 
@@ -231,12 +283,24 @@ impl<E> ToolRegistry<E> {
     /// [`gated`](ToolHandler::gated) and [`interactive`](ToolHandler::interactive):
     /// interactive supersedes gated — see [`ToolHandler::interactive`] — so the
     /// gate would never run, and nothing else would ever warn the author.
+    ///
+    /// And, on the same precedent, if it declares both
+    /// [`interactive`](ToolHandler::interactive) and
+    /// [`ends_turn`](ToolHandler::ends_turn): an interactive call is resolved
+    /// by the human through the out-of-band door, which holds no handler, so
+    /// the stamp could never be written and the capability would ship mute.
     pub fn register(&mut self, name: impl Into<String>, handler: impl ToolHandler<E> + 'static) {
         let name = name.into();
         debug_assert!(
             !(handler.gated() && handler.interactive()),
             "tool '{name}' declares both gated() and interactive(): interactive supersedes \
              gated — the human answers an interactive call outright, so its gate never runs"
+        );
+        debug_assert!(
+            !(handler.interactive() && handler.ends_turn()),
+            "tool '{name}' declares both interactive() and ends_turn(): a human answers an \
+             interactive call through the out-of-band door, which holds no handler, so the \
+             ends-turn stamp could never be written and the capability would never fire"
         );
         match self.handlers.entry(name) {
             Entry::Occupied(entry) => panic!(
