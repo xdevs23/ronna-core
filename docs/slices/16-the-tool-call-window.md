@@ -16,7 +16,7 @@ and the embedder will want to compact it.
 
 **The loop and its one dispatcher.** The reactive scheduler wakes on store changes
 and owes a turn from the frontier (`actor.rs:1259-1288`, `ratchet.rs:191-193`);
-`ConversationActor::handle_blocks_ready` (`actor.rs:983`) is the only dispatcher —
+`ConversationActor::handle_blocks_ready` (`actor.rs:983`) is the turn loop's only dispatcher (the title-derivation actor sends one tool-less stream and cannot loop) —
 it stands stale signals down, resolves the anchor (a held `open_turn` else a fresh
 one, `actor.rs:1074-1076`) and sends the paid provider request at `actor.rs:1121`.
 A tool round closes through `close_dispatch` and `settle_turn_identity`
@@ -38,13 +38,20 @@ golden at `providers/render/tests.rs:255-325`). The unknown-tool refusal and the
 gate's `Refuse{reason}` are the teaching-text precedents (`runner.rs:290-346`).
 Interactive calls never reach the runner (`tools/mod.rs:133-147`).
 
-**Counting is a fold, by doctrine.** Every block carries a second-resolution
-`created_at` stamp (`migrations.rs:102-107`) and every call joins its conversation
-(`migrations.rs:110-115`); every outcome copies its call's dispatch anchor
-(`tool_calls.rs:75-76, 112-113`). "Derived, never stored — if a fact can be folded
-from the ledger, it is not a column" is the repository's own law, and the tools
-layer's war story forbids admission decisions that travel in memory while the
-ledger says otherwise (`tools/mod.rs:21-36`).
+**Counting is a fold, by doctrine, over the stamps as they really are.** Every
+block's `created_at` is written by `insert_block` from `now_iso8601`
+(`store/messages.rs:174-177`, `store/mod.rs:758-762`): RFC3339 at millisecond
+resolution in LOCAL time with a fixed numeric offset — the schema's UTC
+`datetime('now')` default (`migrations.rs:105`) is dead for blocks. The window
+fold therefore parses offset-aware instants and never compares lexically (two
+offsets straddling a DST boundary do not sort as strings), and its "now" comes
+from the same clock that writes the stamps — slice 15's one-clock law, honored.
+Every call joins its conversation (`migrations.rs:110-115`) and every outcome
+copies its call's dispatch anchor (`tool_calls.rs:75-76, 112-113`). "Derived,
+never stored — if a fact can be folded from the ledger, it is not a column" is
+the repository's own law, and the tools layer's war story forbids admission
+decisions that travel in memory while the ledger says otherwise
+(`tools/mod.rs:21-36`).
 
 **Ending a turn early has two precedents and both are wrong here.** The abnormal
 stop (`ingestion.rs:1093-1104`) and the interrupt (`actor.rs:613-674`) both end
@@ -52,7 +59,7 @@ turns from inside a stream and both LATCH the conversation; the forced end this
 slice needs fires BETWEEN rounds, when no stream is open, and must not latch — the
 conversation lives on. Only `settle_turn_identity` releases a held `open_turn`
 today; leaving it held inherits the dead turn's anchor onto the next summons
-(`actor.rs:909-912`). A status block projects no model content (`records.rs:70-74`)
+(`actor.rs:743-760`). A status block projects no model content (`records.rs:70-74`)
 and caps the frontier, resting the loop.
 
 ## Decisions taken with this slice
@@ -63,53 +70,74 @@ and caps the frontier, resting the loop.
   errors" is the trailing run of tool-error blocks carrying the refusal text,
   ordered by block id and scoped to the OPEN TURN by dispatch anchor. Both are
   reads at the existing seams, both survive a restart, and no in-memory copy is
-  authoritative. *Rejected:* a window in the runner's mutex or the actor's state —
+  authoritative. The window compare parses the stamps' real form (offset-aware
+  RFC3339 instants, millisecond resolution) and takes "now" from the stamp
+  writer's own clock — never a lexical compare, never a second clock. *Rejected:* a window in the runner's mutex or the actor's state —
   a decision in memory while the ledger says otherwise, the exact shape the tools
   layer's recorded war story forbids, and it forgets on restart while the burn it
   bounds does not.
-- **The refusal composes at the admission door, with this exact text,
-  2026-08-30.** In `execute_ready_call`, before the gate: when the conversation's
-  window is spent, the call resolves with an error and the body never runs. The
-  text, decided here and pinned byte for byte, opening with the stable prefix the
-  consecutive fold matches on:
+- **The refusal composes first at the admission door, with this exact copy,
+  2026-08-30.** In `execute_ready_call`, BEFORE every other check, the
+  unknown-tool refusal included: when the conversation's window is spent, the
+  call resolves with the refusal and nothing else runs — otherwise a hot window
+  with an unknown tool name would loop on the teaching text, a second unbounded
+  shape. The refusal is two constants, one decision each: the stable machine
+  prefix the consecutive fold matches with a starts-with test,
+  `tool-call rate limit:`
+  and the rendered detail, which interpolates the CONFIGURED window values so an
+  overridden deployment never lies about its own numbers; at the defaults the
+  full text reads, pinned byte for byte:
   `tool-call rate limit: this conversation has spent its 60 tool calls for the last minute, and this call was not run. Answer with what you already have, or wait before calling tools again.`
-  One const, written by the refusal and matched by the fold — one decision, one
-  site. Interactive calls are counted by the window (they are recorded calls) and
+  Interactive calls are counted by the window (they are recorded calls) and
   never refused by it: interactive admission belongs to the human, stated as the
-  recorded boundary. *Rejected:* a machine-key column for tool errors — the error
-  string's own fixed prefix is the native form, the same way status blocks carry
-  their documented keys.
+  recorded boundary. With the window cold, the unknown-tool and gate refusals
+  behave exactly as today, and their errors reset the consecutive run as
+  ordinary failures — they are not the model looping on the window.
+  *Rejected:* a machine-key column for tool errors — the error string's own
+  fixed prefix is the native form, the same way status blocks carry their
+  documented keys; *rejected:* baking the numbers into one un-interpolated
+  string — a test or deployment overriding the values would ship a message that
+  lies.
 - **Refused calls count, 2026-08-30.** The operator's design has every over-limit
   call keep failing until the window recovers; a window that ignored refusals
   would drain while the model spams and hand the whole protection to the
   five-rule. Every recorded call block counts, executed or refused.
-- **Five consecutive refusals end the turn between rounds, without latching,
-  2026-08-30.** The check runs in `handle_blocks_ready`, before the dispatch
-  spends: when the open turn's trailing five tool outcomes are all rate-limit
-  refusals, the dispatch stands down instead of sending. The forced end, in
-  order: an anchored status block with the machine key `tool_calls_exhausted`
-  joins the ledger (visible in the record, invisible to the model's replay, and
-  it caps the frontier so the loop rests); the held `open_turn` is released
-  explicitly — a new, named release edge beside `settle_turn_identity`'s, so the
-  next summons opens a fresh turn with a fresh anchor; the conversation is NOT
-  latched. The count is per open turn, never per conversation lifetime — the
-  first refusal after a forced end starts at one. The embedder observes the
-  status block (BlocksChanged and the durable fold); keying a compaction on it is
-  the embedder's own policy. *Rejected:* riding the StreamError edge — the error
-  edge latches, and this end is not an error but a decision; *rejected:* a new
-  bus event vocabulary — the status block with its documented key IS the native
-  signal, and a marker invented beside it would be the sentinel shape this
-  repository already ripped out once; *rejected:* a non-rate-limit tool error
-  breaking the turn — only the refusal run means the model is looping on the
-  window; an ordinary failure resets the run.
-- **The values are named consts, construction-overridable, 2026-08-30.**
+- **Five consecutive refusals end the turn between rounds, without latching and
+  without burying anyone, 2026-08-30.** The check runs in `handle_blocks_ready`,
+  before the dispatch spends: when the open turn's trailing five tool outcomes
+  are all rate-limit refusals (the run ordered by block id, scoped to the open
+  turn by anchor), the dispatch stands down instead of sending. The forced end,
+  in order: an anchored status block with the machine key `tool_calls_exhausted`
+  joins the ledger, and the key JOINS `Status::records_turn_end`
+  (`records.rs:42-50`) so the walk reads through it — the tree's own recorded
+  burial defect is exactly what an opaque non-latching end marker causes
+  (`actor.rs:880-892`), and a member's message landing in the check-to-append
+  gap must not wait for a second message; the loop still rests in the quiet case
+  because the summons bound disowns the ended turn (`ratchet.rs:234-263`). Only
+  after the append succeeds is the held `open_turn` released — a new, named
+  release edge beside `settle_turn_identity`'s — so the next summons opens a
+  fresh turn with a fresh anchor; if the append fails, nothing releases and the
+  next drive re-enters the check off the durable fold and retries — no latch,
+  no retry queue, the ledger-first shape self-heals. The conversation is NOT
+  latched, and the count is per open turn, never per conversation lifetime. The
+  embedder observes the status block (BlocksChanged and the durable fold);
+  keying a compaction on it is the embedder's own policy. *Rejected:* an opaque
+  status key — the recorded burial defect; *rejected:* riding the StreamError
+  edge — the error edge latches, and this end is a decision, not an error;
+  *rejected:* a new bus event vocabulary — the keyed status block IS the native
+  signal; *rejected:* a non-rate-limit error breaking the turn — only the
+  refusal run means the model is looping on the window.
+- **The values are named consts carried by the runtime context, 2026-08-30.**
   `WINDOW_CALLS = 60`, `WINDOW_SECS = 60`, `CONSECUTIVE_LIMIT = 5`, the
-  operator's numbers, defined once beside the runner and overridable at
-  construction the way the drain deadline is, so tests drive small windows
-  without waiting a minute. *Rejected:* a consumer-facing config surface — no
-  such registry exists in this tree, and the numbers are the operator's decision
-  for every deployment of it; a deployment that needs different ones brings the
-  construction parameter.
+  operator's numbers, defined once. The carrier is a builder-style field on
+  `RuntimeContext` (the `without_title_derivation` shape): the runner — built
+  inside `RuntimeContext::new`, deliberately non-injectable — reads it at
+  construction, and the actor reads it through the context, so both sites share
+  ONE config with no second copy; tests build a context with a small window
+  instead of waiting a minute. *Rejected:* a consumer-facing config surface —
+  no such registry exists in this tree, and the numbers are the operator's
+  decision; *rejected:* a runner constructor parameter — the runner is
+  deliberately not constructible by consumers.
 - **The cost arithmetic is stated honestly, 2026-08-30.** The window bounds TOOL
   CALLS, not paid requests: a refused call still buys its continuation round, so
   a runaway burns up to the window plus five refusal rounds before the forced
@@ -125,20 +153,26 @@ and caps the frontier, resting the loop.
   scope, both pinned).
 - **AC2 — refusals keep the window spent.** A run of refused calls holds the
   window at its limit (pin: refusals count as calls).
-- **AC3 — the forced end.** Five consecutive rate-limit refusals on the open
-  turn, then a summons: no provider request is sent, the `tool_calls_exhausted`
-  status lands anchored on the ended turn, `open_turn` is released, the
-  conversation is not latched, and the next summons opens a fresh turn with a
-  fresh anchor (the whole sequence pinned).
+- **AC3 — the forced end, two observations.** Five consecutive rate-limit
+  refusals on the open turn: the would-be continuation dispatch after the fifth
+  stands down — no provider request, the `tool_calls_exhausted` status lands
+  anchored on the ended turn and walk-transparent, `open_turn` is released, the
+  conversation is not latched. Then a fresh summons opens a fresh turn with a
+  fresh anchor — which, on a still-hot window, dispatches and refuses again by
+  design (both pinned).
 - **AC4 — an ordinary error resets the run.** Four refusals, one non-rate-limit
-  tool error, another refusal: the turn does not end (pin).
+  tool error resolved out of band on a pending call (`fail_tool_call_block`, the
+  public store surface), another refusal: the turn does not end — the run is
+  id-ordered, so it reads the same however the window moved meanwhile (pin).
 - **AC5 — restart safety.** The fold derives from the ledger: reopened mid-window,
   the conversation keeps refusing until the window genuinely recovers (pin
   through a store reopen).
 - **AC6 — interactive calls are counted, never runner-refused.** Stated and
   pinned at the counting site.
-- **AC7 — the multi-round pins stand.** The existing Script-driven multi-round
-  and close-edge tests pass unchanged; the replay goldens cover the
+- **AC7 — the multi-round pins stand, on an extended harness.** The existing
+  Script-driven multi-round and close-edge tests pass unchanged; the Script
+  vocabulary gains a parameterized many-round variant to drive AC3/AC4 (named
+  build work, not a pass-only criterion); the replay goldens cover the
   result-plus-error shape the forced end lands.
 - **AC8 — the checks.** fmt, clippy with warnings denied, the full suite, the doc
   build, exit codes read bare.
