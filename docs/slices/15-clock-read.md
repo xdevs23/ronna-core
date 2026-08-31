@@ -1,10 +1,10 @@
 # Slice 15 — one public clock reading, and the marker stops stating a time
 
-Date: 2026-08-29. A consumer wants to state the current date and time — the operator
-asked for it after the date markers went live and answered a time question with the
-marker's written-at stamp, twenty-five minutes stale. The operator's ruling, verbatim
-in effect: the time does not belong in the date block, because it loses its validity
-one minute later, while the date stays right all day. The framework already owns the one
+Date: 2026-08-29. A consumer wants to state the current date and time — the need
+surfaced after the date markers went live and a time question was answered with the
+marker's written-at stamp, twenty-five minutes stale. The decided rule: the time does
+not belong in the date block, because it loses its validity one minute later, while
+the date stays right all day. The framework already owns the one
 clock that answers such questions: `DateStamp::now_local`
 (`store/date_markers.rs:46-56`), which reads a single instant for every part — local
 date via chrono, the IANA zone name via `iana-time-zone`, the wall-clock minute — so a
