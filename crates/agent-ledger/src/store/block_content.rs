@@ -25,6 +25,11 @@ use super::StoreError;
 /// inside the surrounding user turn, which means every deep copy of such a turn
 /// arrives here holding one.
 ///
+/// The ancestor reference is in here for the same reason as the date marker
+/// (2026-08-31): it carries no role either, so a role-less run a fork is
+/// anchored on can hold one, and a deep copy of that run arrives here
+/// holding it.
+///
 /// The date marker is in here for the same reason and its mirror image
 /// (2026-08-27): it carries NO role, so the group walk keeps it inside any
 /// role-less run it lands in, and a fork anchored on a role-less block beside
@@ -62,6 +67,9 @@ pub(super) enum BlockContent {
         tz_name: Option<String>,
         written_at: Option<String>,
     },
+    AncestorReference {
+        ancestor_conversation_id: i64,
+    },
 }
 
 impl BlockContent {
@@ -72,7 +80,7 @@ impl BlockContent {
         block_type: &str,
     ) -> Result<Self, StoreError> {
         match block_type {
-            "text" | "streaming" | "system_prompt" => {
+            "text" | "streaming" | "system_prompt" | "harness_message" => {
                 let (role, content): (Option<String>, String) = conn.query_row(
                     "SELECT role, content FROM block_text WHERE block_id = ?1",
                     [block_id],
@@ -147,6 +155,17 @@ impl BlockContent {
                 })
             }
             "date_marker" => Self::read_date_marker(conn, block_id),
+            "ancestor_reference" => {
+                let ancestor_conversation_id: i64 = conn.query_row(
+                    "SELECT ancestor_conversation_id FROM block_ancestor_reference
+                         WHERE block_id = ?1",
+                    [block_id],
+                    |row| row.get(0),
+                )?;
+                Ok(Self::AncestorReference {
+                    ancestor_conversation_id,
+                })
+            }
             other => {
                 // The kind is genuinely outside what this type models — which
                 // is a fact about this type, not a malformed statement. It used
@@ -263,6 +282,16 @@ impl BlockContent {
                     params![new_block_id, date, tz_abbrev, tz_name, written_at],
                 )?;
             }
+            Self::AncestorReference {
+                ancestor_conversation_id,
+            } => {
+                conn.execute(
+                    "INSERT INTO block_ancestor_reference
+                        (block_id, ancestor_conversation_id)
+                     VALUES (?1, ?2)",
+                    params![new_block_id, ancestor_conversation_id],
+                )?;
+            }
         }
         Ok(())
     }
@@ -282,8 +311,14 @@ impl BlockContent {
             Self::ApprovalRequest { for_block_id }
             | Self::ApprovalDecision { for_block_id, .. } => vec![for_block_id],
             // A marker references nothing: it states a date, and a copy of it
-            // states the same date wherever it lands.
-            Self::Text { .. } | Self::Code { .. } | Self::DateMarker { .. } => Vec::new(),
+            // states the same date wherever it lands. An ancestor reference
+            // names a CONVERSATION, which this map does not describe — the
+            // remap rewrites block ids, and a copy of the reference records
+            // the same ancestry the original did.
+            Self::Text { .. }
+            | Self::Code { .. }
+            | Self::DateMarker { .. }
+            | Self::AncestorReference { .. } => Vec::new(),
         };
         for reference in references {
             if let Some(&copied) = remap.get(reference) {

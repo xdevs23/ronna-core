@@ -227,6 +227,53 @@ fn non_user_authored_blocks_await_nothing() {
     }
 }
 
+/// The harness's own message asks the model for a turn, and asks for it in
+/// words: it awaits the model AND is offered no tools. Both facts on the one
+/// kind, so the dispatch never has to know which kind it just read.
+#[test]
+fn the_harness_message_asks_the_model_for_a_turn_in_words() {
+    for role in [Some(Role::System), None] {
+        let harness = kind(HarnessMessage::KINDS[0], role);
+        assert_eq!(
+            harness.awaiting(),
+            Some(Awaiting::Model),
+            "the ask is the KIND's, not the voice's"
+        );
+        assert!(!harness.offers_tools());
+    }
+
+    for block_type in AUTHORED_TYPES {
+        for role in [
+            Some(Role::User),
+            Some(Role::Assistant),
+            Some(Role::Tool),
+            Some(Role::System),
+        ] {
+            assert!(
+                kind(block_type, role).offers_tools(),
+                "{block_type} in {role:?} is offered the registry"
+            );
+        }
+    }
+}
+
+/// The harness STATING is not the harness asking (2026-08-31, the review of
+/// the compaction slice). A compacted thread's digest is system-voiced prose
+/// sitting in a thread that serves a live channel: were the ask a fact about
+/// that voice, a thread whose frontier walked back onto its digest would
+/// dispatch a turn nobody asked for and speak into the channel. Prose states;
+/// the kind next door asks.
+#[test]
+fn system_voiced_prose_states_and_asks_for_nothing() {
+    for block_type in AUTHORED_TYPES {
+        assert_eq!(
+            kind(block_type, Some(Role::System)).awaiting(),
+            None,
+            "{block_type} in the harness's voice summons nothing"
+        );
+    }
+}
+
 #[test]
 fn inert_kinds_have_no_ask() {
     for block_type in INERT_TYPES {

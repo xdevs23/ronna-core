@@ -359,6 +359,23 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE block_tool_result ADD COLUMN ends_turn INTEGER NOT NULL DEFAULT 0;
     ",
+    // v5 (2026-08-31): the ancestor reference's content table — one column
+    // naming the conversation a thread continues, which is what makes the
+    // ancestry a stored fact of the BLOCK rather than of the conversation
+    // row. A step, not an edit to v1's CREATE TABLE, per the discipline v3
+    // states.
+    //
+    // No foreign key, deliberately: the column records where a thread came
+    // from, and an erasure replaces an ancestor with a scrubbed clone and
+    // deletes the original. A cascade would take the record away with it and
+    // a restrict would refuse the deletion outright; both would make the
+    // history of a thread depend on the survival of what it left behind.
+    "
+    CREATE TABLE IF NOT EXISTS block_ancestor_reference (
+        block_id                 INTEGER PRIMARY KEY REFERENCES blocks(id) ON DELETE CASCADE,
+        ancestor_conversation_id INTEGER NOT NULL
+    );
+    ",
 ];
 
 /// Apply every unapplied step, advancing `user_version` as each lands.
@@ -566,6 +583,41 @@ mod tests {
         assert_eq!(
             table_columns(&conn, "block_date_marker"),
             vec!["block_id", "date", "tz_abbrev", "tz_name", "written_at"]
+        );
+    }
+
+    /// v5: the ancestor reference's content table, and the deliberate
+    /// ABSENCE of a foreign key on the conversation it names — a record of
+    /// where a thread came from outlives the conversation it points at, so
+    /// deleting that conversation leaves the row standing and readable.
+    #[test]
+    fn the_ancestor_reference_table_records_a_conversation_it_does_not_depend_on() {
+        let conn = migrated();
+        assert_eq!(
+            table_columns(&conn, "block_ancestor_reference"),
+            vec!["block_id", "ancestor_conversation_id"]
+        );
+
+        conn.execute_batch(
+            "INSERT INTO models (external_id, display_name, provider_id)
+                 VALUES ('m', 'M', 'p');
+             INSERT INTO conversations (model_id) VALUES (1);
+             INSERT INTO blocks (block_type) VALUES ('ancestor_reference');
+             INSERT INTO block_ancestor_reference (block_id, ancestor_conversation_id)
+                 VALUES (1, 1);
+             DELETE FROM conversations WHERE id = 1;",
+        )
+        .unwrap();
+        let named: i64 = conn
+            .query_row(
+                "SELECT ancestor_conversation_id FROM block_ancestor_reference WHERE block_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            named, 1,
+            "the record survives the conversation it names being deleted"
         );
     }
 

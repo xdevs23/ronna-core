@@ -278,6 +278,7 @@ pub(super) const CORE_CONTENT_TABLES: &[&str] = &[
     "block_approval_request",
     "block_approval_decision",
     "block_date_marker",
+    "block_ancestor_reference",
 ];
 
 /// Ledger tables the change hook announces whose rowid is NOT a block id: the
@@ -320,6 +321,8 @@ const CORE_KINDS: &[&str] = &[
     "date_marker",
     "title_request",
     "title_response",
+    "ancestor_reference",
+    "harness_message",
 ];
 
 /// The effective content-table list: the library's own content tables followed
@@ -1422,6 +1425,11 @@ mod tests {
     ///
     /// Updated 2026-08-30 with the statement: the tool result's existing join
     /// gained the turn-ending stamp, with the join list itself untouched.
+    ///
+    /// Updated 2026-08-31 with the statement: the ancestor reference added one
+    /// join and one selected column, and the harness message was added to the
+    /// prose table's kind list — the first change to the join list since it
+    /// was pinned.
     const PINNED_BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
@@ -1436,9 +1444,10 @@ mod tests {
             bs.status AS bs_status, bs.subtitle AS bs_subtitle,
             bar.for_block_id AS bar_for_block_id,
             bad.for_block_id AS bad_for_block_id, bad.decision AS bad_decision, bad.system_reason AS bad_system_reason, bad.user_reason AS bad_user_reason,
-            bdm.date AS bdm_date, bdm.tz_abbrev AS bdm_tz_abbrev, bdm.tz_name AS bdm_tz_name, bdm.written_at AS bdm_written_at
+            bdm.date AS bdm_date, bdm.tz_abbrev AS bdm_tz_abbrev, bdm.tz_name AS bdm_tz_name, bdm.written_at AS bdm_written_at,
+            banc.ancestor_conversation_id AS banc_ancestor
      FROM blocks b
-     LEFT JOIN block_text bt ON bt.block_id = b.id AND b.block_type IN ('text', 'streaming', 'system_prompt')
+     LEFT JOIN block_text bt ON bt.block_id = b.id AND b.block_type IN ('text', 'streaming', 'system_prompt', 'harness_message')
      LEFT JOIN block_quote bq ON bq.block_id = b.id AND b.block_type = 'quote'
      LEFT JOIN block_code bc ON bc.block_id = b.id AND b.block_type = 'code'
      LEFT JOIN block_tool_call btc ON btc.block_id = b.id AND b.block_type = 'tool_call'
@@ -1449,7 +1458,8 @@ mod tests {
      LEFT JOIN block_status bs ON bs.block_id = b.id AND b.block_type = 'status'
      LEFT JOIN block_approval_request bar ON bar.block_id = b.id AND b.block_type = 'approval_request'
      LEFT JOIN block_approval_decision bad ON bad.block_id = b.id AND b.block_type = 'approval_decision'
-     LEFT JOIN block_date_marker bdm ON bdm.block_id = b.id AND b.block_type = 'date_marker'";
+     LEFT JOIN block_date_marker bdm ON bdm.block_id = b.id AND b.block_type = 'date_marker'
+     LEFT JOIN block_ancestor_reference banc ON banc.block_id = b.id AND b.block_type = 'ancestor_reference'";
 
     /// The collector's reference union for a core-only store, spelled out.
     ///
@@ -1478,6 +1488,7 @@ mod tests {
         "block_approval_request",
         "block_approval_decision",
         "block_date_marker",
+        "block_ancestor_reference",
         "metadata",
     ];
 
@@ -1524,7 +1535,7 @@ mod tests {
     /// fallback), the claimed kinds the query does not serve are exactly
     /// the metadata ledger's, which surface through the metadata read path —
     /// and the parse chain's own claim (`BlockKind::CLAIMED_KINDS`, the const
-    /// the derive checks consumer leaves against) is the same seventeen
+    /// the derive checks consumer leaves against) is the same nineteen
     /// strings. Any drift between the claims and what the code serves goes
     /// red here.
     #[test]
@@ -1541,7 +1552,7 @@ mod tests {
         );
         assert_eq!(
             BlockKind::CLAIMED_KINDS.len(),
-            17,
+            19,
             "one claim per core kind, no duplicates"
         );
         for kind in &served {
@@ -1599,6 +1610,8 @@ mod tests {
         "date_marker",
         "title_request",
         "title_response",
+        "ancestor_reference",
+        "harness_message",
     ];
 
     static CORE_SET_AS_DESCRIPTORS: &[ContentDescriptor] = &[

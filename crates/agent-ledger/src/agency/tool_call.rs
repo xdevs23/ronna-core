@@ -78,18 +78,39 @@ impl ToolCall {
     /// moment there is no id to key on.
     #[must_use]
     pub fn resolved_in(&self, ledger: &[Block]) -> bool {
+        self.outcome_position_in(ledger).is_some()
+    }
+
+    /// WHERE this call's outcome sits — the index in `ledger` of the first
+    /// result or error carrying this call's id after this call's own row, or
+    /// `None` when nothing answers it.
+    ///
+    /// This IS [`resolved_in`](Self::resolved_in), which asks the same
+    /// question and keeps only the yes-or-no: one rule, one implementation,
+    /// two readings of it. The position half exists because a cut through a
+    /// ledger has to know how far forward an answer lies, not merely that it
+    /// lies somewhere (2026-08-31, the compaction slice) — and a second walk
+    /// deciding what answers a call would be a second answer to the question
+    /// the runner and the approval chain already ask here.
+    ///
+    /// Every condition the resolution predicate carries holds unchanged: the
+    /// match is keyed on this call's own id, an absent id matches nothing,
+    /// and the outcome kinds are read through [`BlockKind`] rather than off
+    /// the stored type string.
+    #[must_use]
+    pub(crate) fn outcome_position_in(&self, ledger: &[Block]) -> Option<usize> {
         if self.tool_call_id.is_empty() {
-            return false;
+            return None;
         }
-        ledger
+        let own = ledger.iter().position(|block| block.id == self.id)?;
+        ledger[own + 1..]
             .iter()
-            .skip_while(|block| block.id != self.id)
-            .skip(1)
-            .any(|block| match BlockKind::from_block(block) {
+            .position(|block| match BlockKind::from_block(block) {
                 BlockKind::ToolResult(result) => result.tool_call_id == self.tool_call_id,
                 BlockKind::ToolError(error) => error.tool_call_id == self.tool_call_id,
                 _ => false,
             })
+            .map(|offset| own + 1 + offset)
     }
 
     /// Does the ledger hold a call anchored on `anchor` whose outcome the

@@ -170,6 +170,54 @@ pub struct Outcome {
     pub awaiting: Option<Awaiting>,
 }
 
+/// Where a drive resumes: the position in ledger order the persisted cursor
+/// anchors to.
+///
+/// The cursor's OWN block first (2026-08-31): a cursor names a block, and
+/// where that block sits is a fact the ledger answers directly.
+///
+/// The id scan behind it was the whole rule while ids ascended along
+/// junction order in every conversation, and it stopped being the whole rule
+/// the moment one could not — a conversation opened with FRESH blocks in
+/// front of junction rows inherited from an older one holds a descent at
+/// that seam, and the id scan then lands on the fresh front block and
+/// re-derives the entire history on every single drive. Nothing about that
+/// is unsound, because the inclusive re-drive is idempotent; it is simply
+/// the whole ledger walked forever, per tick, for nothing.
+///
+/// The id scan stays as the fallback for the case it was written for: a
+/// cursor whose own block is GONE — detached — lands on the first block at
+/// or after it. Its contract is that it never lands PAST work the drive has
+/// not confirmed; what it costs depends on the ledger it lands in, and the
+/// difference is worth stating because the seam above is where it bites:
+///
+/// - Ids ascending along ledger order — every conversation but a compacted
+///   thread: the scan lands right after the vanished row, and the re-drive
+///   costs the tail behind it.
+/// - Ids descending at a seam — a compacted thread, whose own front appends
+///   outrank everything it inherited: a cursor that named an inherited block
+///   compares below those front appends, so the scan lands on the FRONT and
+///   the drive re-walks the whole ledger. Reachable only through the erasure
+///   scrub, which detaches blocks from a clone; a cursor naming one of them
+///   pays a full re-derive on its next drive and nothing more, because the
+///   inclusive re-drive is idempotent.
+///
+/// Cheaper is available and unsound, which is why it is not here: scanning
+/// from the END for the last block below the cursor answers the seam case
+/// exactly, and lands past unconfirmed blocks in the ordinary one — a
+/// detached FRONT-append's cursor would skip the whole inherited tail behind
+/// it. Costly and never wrong beats exact-and-sometimes-wrong.
+///
+/// Only a cursor past every block left has nowhere to land; that re-derives
+/// from the start, which the inclusive re-drive makes always safe.
+fn resume_at(ledger: &[Block], cursor: i64) -> usize {
+    ledger
+        .iter()
+        .position(|block| block.id == cursor)
+        .or_else(|| ledger.iter().position(|block| block.id >= cursor))
+        .unwrap_or(0)
+}
+
 /// The owed-turn decision over one tail block, written once: does the tail
 /// await the model? (Amended 2026-08-23: the anchor half this function used
 /// to carry moved to [`fresh_turn_anchor`], because the seventh break
@@ -347,16 +395,7 @@ pub async fn drive_ledger<K: RuntimeKind, E: RuntimeEvent>(
     let ledger = source.list(ctx).await?;
     let mut cursor = source.cursor(ctx).await?;
 
-    // Anchor the persisted cursor to a POSITION in the ledger order: the first
-    // block at or after it. Ids ascend along ledger order, so an anchor whose
-    // own block is gone lands on the block that followed it, and the re-drive
-    // costs the tail after the vanished row rather than the whole history.
-    // Only a cursor past every block left has nowhere to land; that re-derives
-    // from the start, which the inclusive re-drive makes always safe.
-    let start = ledger
-        .iter()
-        .position(|block| block.id >= cursor)
-        .unwrap_or(0);
+    let start = resume_at(&ledger, cursor);
 
     let mut parked = false;
     for block in &ledger[start..] {
@@ -417,6 +456,86 @@ pub async fn drive_ledger<K: RuntimeKind, E: RuntimeEvent>(
         parked,
         awaiting,
     })
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::resume_at;
+    use crate::block::Block;
+
+    fn ledger(ids: &[i64]) -> Vec<Block> {
+        ids.iter()
+            .map(|id| Block {
+                id: *id,
+                role: None,
+                block_type: "text".into(),
+                created_at: String::new(),
+                dispatch_anchor: None,
+                fields: serde_json::Map::new(),
+            })
+            .collect()
+    }
+
+    /// The ordinary shape: ids ascending along ledger order, and the drive
+    /// resumes AT the cursor's own block — inclusively, which is the crash
+    /// contract.
+    #[test]
+    fn an_ascending_ledger_resumes_at_the_cursors_own_block() {
+        let ledger = ledger(&[1, 2, 3, 4]);
+        assert_eq!(resume_at(&ledger, 0), 0, "nothing confirmed re-derives");
+        assert_eq!(resume_at(&ledger, 3), 2);
+        assert_eq!(resume_at(&ledger, 4), 3);
+    }
+
+    /// A conversation opened with fresh blocks in front of inherited ones —
+    /// the compacted thread's shape — resumes at the cursor's own POSITION,
+    /// not at the first higher id it meets. Anchoring by id there lands on
+    /// the fresh front block and re-derives the whole ledger every tick.
+    #[test]
+    fn a_ledger_whose_ids_descend_at_a_seam_still_resumes_at_the_cursor() {
+        // Three fresh blocks, then the junction rows of an older
+        // conversation.
+        let ledger = ledger(&[100, 101, 102, 7, 8, 9]);
+        assert_eq!(
+            resume_at(&ledger, 9),
+            5,
+            "the cursor's own block is where the drive resumes"
+        );
+        assert_eq!(resume_at(&ledger, 8), 4);
+    }
+
+    /// A cursor whose block is gone — detached — falls back to the first
+    /// block at or after it, and one past every block left re-derives from
+    /// the start.
+    #[test]
+    fn a_vanished_cursor_lands_on_what_followed_it() {
+        let ledger = ledger(&[1, 2, 5, 6]);
+        assert_eq!(resume_at(&ledger, 3), 2, "the block that followed it");
+        assert_eq!(resume_at(&ledger, 99), 0, "past everything re-derives");
+    }
+
+    /// The fallback's COST across the seam, pinned so the doc above cannot
+    /// promise a bound the scan does not keep: a detached cursor that named
+    /// an inherited block compares below the thread's own front appends, so
+    /// the scan lands on the front and the whole ledger is re-walked. Never
+    /// wrong — the re-drive is inclusive and idempotent — and never a skip,
+    /// which is the property the fallback actually owes.
+    #[test]
+    fn a_vanished_inherited_cursor_re_derives_the_whole_compacted_thread() {
+        // Three fresh front appends, then inherited rows; the cursor named
+        // an inherited block that an erasure scrub has since detached.
+        let ledger = ledger(&[100, 101, 102, 7, 9]);
+        let at = resume_at(&ledger, 8);
+        assert_eq!(
+            at, 0,
+            "the id scan cannot see the seam, so the re-drive starts at the front"
+        );
+        assert!(
+            ledger[at..].iter().any(|block| block.id == 9),
+            "the block that followed the vanished row is inside the re-driven span, \
+             which is the property the fallback owes"
+        );
+    }
 }
 
 /// The frontier oracle: drive a real stored ledger through the ratchet and

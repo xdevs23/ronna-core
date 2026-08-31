@@ -45,6 +45,10 @@ impl Agency for Probe {
         true
     }
 
+    fn offers_tools(&self) -> bool {
+        false
+    }
+
     async fn gate<E: RuntimeEvent>(&self, _ctx: &AgencyCtx<E>) -> GateDecision {
         GateDecision::Refuse {
             reason: "probe-gate".into(),
@@ -106,12 +110,16 @@ async fn the_derived_enum_returns_the_leaf_answer_for_every_hook() {
         bus: Arc::new(EventBus::new()),
     };
 
-    // Agency, all seven hooks.
+    // Agency, all eight hooks.
     assert_eq!(composed.awaiting(), Some(Awaiting::OutOfBand));
     assert!(!composed.durable(), "durable() is the leaf's own answer");
     assert!(
         composed.frontier_transparent(),
         "frontier_transparent() is the leaf's own answer"
+    );
+    assert!(
+        !composed.offers_tools(),
+        "offers_tools() is the leaf's own answer"
     );
     assert_eq!(
         composed.gate(&ctx).await,

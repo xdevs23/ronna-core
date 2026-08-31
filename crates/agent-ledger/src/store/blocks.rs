@@ -32,6 +32,12 @@ use super::{DomainGate, StoreError};
 /// 2026-08-30, the same lockstep again: the tool result's join gained the
 /// turn-ending stamp, which decides whether the resolution asks the model for
 /// anything at all.
+///
+/// 2026-08-31, the same lockstep once more: the ancestor reference arrived as
+/// a join of its own, and the harness message joined the prose table the three
+/// other text-shaped kinds already share — a kind absent from that IN list
+/// loads its content empty, which is the same silence as a column never
+/// selected.
 pub(super) const BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
@@ -46,9 +52,10 @@ pub(super) const BLOCKS_QUERY: &str = "SELECT
             bs.status AS bs_status, bs.subtitle AS bs_subtitle,
             bar.for_block_id AS bar_for_block_id,
             bad.for_block_id AS bad_for_block_id, bad.decision AS bad_decision, bad.system_reason AS bad_system_reason, bad.user_reason AS bad_user_reason,
-            bdm.date AS bdm_date, bdm.tz_abbrev AS bdm_tz_abbrev, bdm.tz_name AS bdm_tz_name, bdm.written_at AS bdm_written_at
+            bdm.date AS bdm_date, bdm.tz_abbrev AS bdm_tz_abbrev, bdm.tz_name AS bdm_tz_name, bdm.written_at AS bdm_written_at,
+            banc.ancestor_conversation_id AS banc_ancestor
      FROM blocks b
-     LEFT JOIN block_text bt ON bt.block_id = b.id AND b.block_type IN ('text', 'streaming', 'system_prompt')
+     LEFT JOIN block_text bt ON bt.block_id = b.id AND b.block_type IN ('text', 'streaming', 'system_prompt', 'harness_message')
      LEFT JOIN block_quote bq ON bq.block_id = b.id AND b.block_type = 'quote'
      LEFT JOIN block_code bc ON bc.block_id = b.id AND b.block_type = 'code'
      LEFT JOIN block_tool_call btc ON btc.block_id = b.id AND b.block_type = 'tool_call'
@@ -59,7 +66,8 @@ pub(super) const BLOCKS_QUERY: &str = "SELECT
      LEFT JOIN block_status bs ON bs.block_id = b.id AND b.block_type = 'status'
      LEFT JOIN block_approval_request bar ON bar.block_id = b.id AND b.block_type = 'approval_request'
      LEFT JOIN block_approval_decision bad ON bad.block_id = b.id AND b.block_type = 'approval_decision'
-     LEFT JOIN block_date_marker bdm ON bdm.block_id = b.id AND b.block_type = 'date_marker'";
+     LEFT JOIN block_date_marker bdm ON bdm.block_id = b.id AND b.block_type = 'date_marker'
+     LEFT JOIN block_ancestor_reference banc ON banc.block_id = b.id AND b.block_type = 'ancestor_reference'";
 
 /// The conversation's last block by junction order, or None when empty.
 ///
@@ -225,7 +233,11 @@ fn content_payload(
     let mut role: Option<Role> = None;
 
     match block_type {
-        "text" | "streaming" | "system_prompt" => {
+        // Four kinds, one prose table: what they SAY is stored identically
+        // and what they MEAN is each kind's own answer. A row of columns per
+        // kind saying the same two things would be four places to keep in
+        // step.
+        "text" | "streaming" | "system_prompt" | "harness_message" => {
             role = parse_role(col_opt::<String>(row, "bt_role")?.as_deref());
             fields.insert(
                 "content".into(),
@@ -393,6 +405,16 @@ fn structural_payload(
     let mut role: Option<Role> = None;
 
     match block_type {
+        // Roleless in the row, and named by its own column: the
+        // conversation this thread continues. NOT NULL in the schema, so a
+        // present row always answers.
+        "ancestor_reference" => {
+            let ancestor: i64 = required(row, "banc_ancestor", block_id, block_type)?;
+            fields.insert(
+                "ancestor_conversation_id".into(),
+                Value::Number(ancestor.into()),
+            );
+        }
         // Roleless in the row — its grouping under the harness's voice is the
         // KIND's projection fact, not a stored column.
         "date_marker" => {

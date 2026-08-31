@@ -3,6 +3,7 @@
 use rusqlite::{OptionalExtension, params};
 use tracing::warn;
 
+use crate::block::Block;
 use crate::types::InputBlock;
 
 use super::block_cloner::BlockCloner;
@@ -578,7 +579,7 @@ struct GroupBounds {
     block_ids: Vec<i64>,
 }
 
-fn resolve_model_for_fork(
+pub(super) fn resolve_model_for_fork(
     conn: &rusqlite::Connection,
     source_id: i64,
     model: &ModelOverride,
@@ -616,7 +617,7 @@ fn resolve_override_for_fork(
     }
 }
 
-fn resolve_reasoning_for_fork(
+pub(super) fn resolve_reasoning_for_fork(
     conn: &rusqlite::Connection,
     source_id: i64,
     model: &ModelOverride,
@@ -639,16 +640,8 @@ fn find_group_bounds(
         .iter()
         .position(|b| b.id == anchor_block_id)
         .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-    let target_role = blocks[idx].role;
-
-    let mut start = idx;
-    while start > 0 && blocks[start - 1].role == target_role {
-        start -= 1;
-    }
-    let mut end = idx;
-    while end + 1 < blocks.len() && blocks[end + 1].role == target_role {
-        end += 1;
-    }
+    let run = role_run(&blocks, idx);
+    let (start, end) = (*run.start(), *run.end());
 
     let block_ids: Vec<i64> = blocks[start..=end].iter().map(|b| b.id).collect();
     Ok(GroupBounds {
@@ -658,7 +651,38 @@ fn find_group_bounds(
     })
 }
 
-fn insert_conversation(
+/// The role-contiguous run containing `index`, as an inclusive index range —
+/// THE reading of what a message group is, over a snapshot the caller has
+/// already loaded.
+///
+/// It is role-blind: it takes the block's own role, whatever that is
+/// (`None` included, which is how a run of role-less rows — markers,
+/// outcomes, a consumer's own records — forms one group), and extends while
+/// the neighbours carry the same one.
+///
+/// Two callers read it and they read the same rule
+/// (2026-08-31): [`find_group_bounds`], which resolves the group a fork's
+/// anchor sits in, and the compaction cut, which never splits a group. A
+/// second walk would be a second answer to "what is one group here", and
+/// the two would disagree the first time either moved.
+///
+/// # Panics
+///
+/// If `index` is out of bounds for `blocks`.
+pub(super) fn role_run(blocks: &[Block], index: usize) -> std::ops::RangeInclusive<usize> {
+    let target_role = blocks[index].role;
+    let mut start = index;
+    while start > 0 && blocks[start - 1].role == target_role {
+        start -= 1;
+    }
+    let mut end = index;
+    while end + 1 < blocks.len() && blocks[end + 1].role == target_role {
+        end += 1;
+    }
+    start..=end
+}
+
+pub(super) fn insert_conversation(
     conn: &rusqlite::Connection,
     parent_id: Option<i64>,
     model_id: i64,
@@ -687,7 +711,7 @@ fn insert_conversation(
 /// re-deriving from the start. Comparing raw block ids is sound because every
 /// junction append points at a just-created block (and copies preserve order),
 /// so ids ascend along junction order in every conversation.
-fn confirm_inherited_history(
+pub(super) fn confirm_inherited_history(
     conn: &rusqlite::Connection,
     source_id: i64,
     conversation_id: i64,
@@ -734,6 +758,33 @@ fn copy_junction_up_to(
         "INSERT INTO conversation_blocks (conversation_id, block_id)
          SELECT ?1, block_id FROM conversation_blocks
          WHERE conversation_id = ?2 AND id <= ?3
+         ORDER BY id",
+        (dst_id, source_id, cutoff),
+    )?;
+    Ok(())
+}
+
+/// Copy source junction rows strictly AFTER `first_block_id` — the second
+/// half of a cut, in the source's own junction order.
+///
+/// The mirror of [`copy_junction_up_to`], and its complement: the two
+/// together copy every row exactly once, which is what lets a compaction
+/// summarize one side and carry the other verbatim.
+pub(super) fn copy_junction_after(
+    conn: &rusqlite::Connection,
+    source_id: i64,
+    dst_id: i64,
+    last_block_id: i64,
+) -> Result<(), StoreError> {
+    let cutoff: i64 = conn.query_row(
+        "SELECT id FROM conversation_blocks WHERE conversation_id = ?1 AND block_id = ?2",
+        (source_id, last_block_id),
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO conversation_blocks (conversation_id, block_id)
+         SELECT ?1, block_id FROM conversation_blocks
+         WHERE conversation_id = ?2 AND id > ?3
          ORDER BY id",
         (dst_id, source_id, cutoff),
     )?;
@@ -799,7 +850,7 @@ pub(super) fn insert_input_block(
 
 /// Append a new thread's system prompt. Called from inside the fork
 /// transaction, so its header, junction and content rows are already atomic.
-fn insert_system_prompt_block(
+pub(super) fn insert_system_prompt_block(
     conn: &rusqlite::Connection,
     conversation_id: i64,
     prompt: &str,

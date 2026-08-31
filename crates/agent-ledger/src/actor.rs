@@ -1242,7 +1242,18 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             return;
         };
 
-        let tool_defs = self.ctx.runner.registry().definitions();
+        // What the turn is offered is the ASKING BLOCK's own answer
+        // (2026-08-31, the compaction slice): the registry's definitions for
+        // every ordinary ask, and nothing at all for a kind whose ask is
+        // answered in words alone. Read off the frontier block the owed-turn
+        // decision above just read, through the kind — this site names no
+        // kind and branches on no type string, exactly as it does for the
+        // frontier rule itself.
+        let tool_defs = if K::from_block(tail).offers_tools() {
+            self.ctx.runner.registry().definitions()
+        } else {
+            Vec::new()
+        };
         // The stored form is the level's canonical key; a key this build does
         // not know defers to the provider's own default rather than failing
         // the turn.

@@ -22,10 +22,12 @@ use crate::block::Block;
 use crate::bus::{EventBus, RuntimeEvent};
 use crate::store::{Store, StoreError};
 
+mod ancestor_reference;
 mod approval_decision;
 mod approval_request;
 mod code;
 mod date_marker;
+mod harness_message;
 mod metadata_title_request;
 mod metadata_title_response;
 mod projection;
@@ -45,10 +47,12 @@ mod tool_result;
 // brings both, exactly as a consumer expects of a derivable trait.
 pub use agent_ledger_derive::Agency;
 
+pub use ancestor_reference::AncestorReference;
 pub use approval_decision::ApprovalDecision;
 pub use approval_request::ApprovalRequest;
 pub use code::Code;
 pub use date_marker::DateMarker;
+pub use harness_message::HarnessMessage;
 pub use metadata_title_request::MetadataTitleRequest;
 pub use metadata_title_response::MetadataTitleResponse;
 pub use projection::{
@@ -175,6 +179,27 @@ pub trait Agency {
         false
     }
 
+    /// Whether a turn THIS block summons is offered the tool registry's
+    /// definitions. Default: yes — a turn is offered what the consumer
+    /// registered.
+    ///
+    /// Read at the dispatch, off the very block whose
+    /// [`awaiting`](Self::awaiting) summoned the turn, so a kind that asks
+    /// for an answer in words alone gets a turn that has nothing else to
+    /// answer with. It is a fact about the ASK, which is why it lives beside
+    /// `awaiting` on the kind instead of as a branch at the dispatch: the
+    /// actor reads one hook and never learns which kind it just read.
+    ///
+    /// Exactly one KIND answers `false` (2026-08-31, the compaction slice):
+    /// [`HarnessMessage`], the harness's own instruction to the model. Its
+    /// whole purpose is a turn that reads the conversation in front of it and
+    /// writes prose about it, and a tool offered there is a round the harness
+    /// has no use for. Every other kind, in every voice, is offered the
+    /// registry as before.
+    fn offers_tools(&self) -> bool {
+        true
+    }
+
     /// Vet this block before [`run`](Self::run).
     ///
     /// [`Refuse`](GateDecision::Refuse) records an error block, skips `run()`
@@ -259,7 +284,7 @@ pub trait FromBlock {
 
     /// Every stored type string this implementor resolves to a typed kind —
     /// its claim on the stored-string namespace. [`BlockKind`]'s lists the
-    /// library's seventeen; a composing enum's is the union of its leaves'
+    /// library's nineteen; a composing enum's is the union of its leaves'
     /// [`LeafKind::KINDS`] and its delegate's claim, which is what lets the
     /// derive refuse a collision at compile time at every nesting depth: a
     /// leaf whose string is already claimed would silently shadow the earlier
@@ -543,6 +568,10 @@ pub enum BlockKind {
     MetadataTitleRequest(MetadataTitleRequest),
     /// A settled title derivation.
     MetadataTitleResponse(MetadataTitleResponse),
+    /// Where a thread came from — the conversation it continues.
+    AncestorReference(AncestorReference),
+    /// The harness's own message to the model, and the ask it carries.
+    HarnessMessage(HarnessMessage),
     /// A block type this build does not know — fully inert, so an old build
     /// reading a newer ledger fails safe instead of misinterpreting it.
     Unknown(Unknown),
@@ -551,7 +580,7 @@ pub enum BlockKind {
 /// One arm of the core parse chain: does the leaf's [`LeafKind::KINDS`] claim
 /// this stored string, and if so, which variant does its parse feed?
 ///
-/// A macro instead of seventeen hand-written if-returns so the shape cannot
+/// A macro instead of nineteen hand-written if-returns so the shape cannot
 /// drift per kind — the same reason the dispatch below is one macro. The type
 /// strings themselves live on the leaf kinds as consts; nothing here names
 /// one.
@@ -564,7 +593,7 @@ macro_rules! try_leaf {
 }
 
 impl FromBlock for BlockKind {
-    /// The library's seventeen stored type strings, concatenated at compile
+    /// The library's nineteen stored type strings, concatenated at compile
     /// time from the leaf kinds' own `KINDS` consts — the same "one place per
     /// kind" rule the parse chain below reads by, so the claim cannot drift
     /// from what the chain resolves. [`Unknown`] claims nothing: it is the
@@ -588,6 +617,8 @@ impl FromBlock for BlockKind {
             DateMarker::KINDS,
             MetadataTitleRequest::KINDS,
             MetadataTitleResponse::KINDS,
+            AncestorReference::KINDS,
+            HarnessMessage::KINDS,
         ];
         const CONCATENATED: [&str; kind_count(SETS)] = concat_kinds(SETS);
         &CONCATENATED
@@ -619,6 +650,8 @@ impl FromBlock for BlockKind {
         try_leaf!(block, stored, DateMarker => DateMarker);
         try_leaf!(block, stored, MetadataTitleRequest => MetadataTitleRequest);
         try_leaf!(block, stored, MetadataTitleResponse => MetadataTitleResponse);
+        try_leaf!(block, stored, AncestorReference => AncestorReference);
+        try_leaf!(block, stored, HarnessMessage => HarnessMessage);
         // A kind this library does not know is the NORMAL case here, not a
         // fault: every consumer-defined kind lands in this arm whenever a
         // library scan reads a mixed ledger through the library's own view
@@ -656,6 +689,8 @@ macro_rules! dispatch {
             BlockKind::DateMarker($kind) => $call,
             BlockKind::MetadataTitleRequest($kind) => $call,
             BlockKind::MetadataTitleResponse($kind) => $call,
+            BlockKind::AncestorReference($kind) => $call,
+            BlockKind::HarnessMessage($kind) => $call,
             BlockKind::Unknown($kind) => $call,
         }
     };
@@ -672,6 +707,10 @@ impl Agency for BlockKind {
 
     fn frontier_transparent(&self) -> bool {
         dispatch!(self, kind => kind.frontier_transparent())
+    }
+
+    fn offers_tools(&self) -> bool {
+        dispatch!(self, kind => kind.offers_tools())
     }
 
     async fn gate<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> GateDecision {

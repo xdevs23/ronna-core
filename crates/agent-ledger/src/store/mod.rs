@@ -29,6 +29,7 @@ mod attachments;
 mod block_cloner;
 mod block_content;
 mod blocks;
+mod compaction;
 mod conversations;
 mod date_markers;
 mod descriptors;
@@ -49,6 +50,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::reactivity::ChangeLog;
 
 pub use attachments::{Attachment, ByteRange};
+pub use compaction::{
+    CompactedThread, ConsumerRecord, LedgerCut, TemporaryConversation, TemporaryFork,
+};
 pub use conversations::{
     BranchPoint, Continuation, Conversation, ConversationModel, ModelOverride,
 };
