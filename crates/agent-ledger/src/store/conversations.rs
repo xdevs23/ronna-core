@@ -707,9 +707,9 @@ fn find_group_bounds(
 ) -> Result<GroupBounds, StoreError> {
     let blocks = super::blocks::load_blocks_for_conversation(conn, descriptors, gate, source_id)?;
     // An anchor from another conversation is a caller's mistake, answered as
-    // this library's own refusal (2026-09-01). Reported as a missing row it
-    // would read as a query the design guarantees, and the integrity check
-    // would end the process over a bad argument.
+    // this library's own refusal (2026-09-01), naming both ids. Passed through
+    // as a bare missing row it would say only that a query found nothing,
+    // which tells the caller nothing about the argument it got wrong.
     let idx = blocks
         .iter()
         .position(|b| b.id == anchor_block_id)

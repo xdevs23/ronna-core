@@ -2262,20 +2262,14 @@ mod tests {
         )
     }
 
-    /// Inject (or lift) a transient store failure: a trigger on the `blocks`
-    /// header insert that reaches for a table which does not exist, so every
-    /// block-committing write fails and its transaction rolls back — the
-    /// finalization-insert failure the guards must survive.
-    ///
-    /// The failure is an OPERATIONAL one on purpose (2026-09-01): a
-    /// `RAISE(ABORT)` is a constraint violation, which the store now reads as
-    /// a database in a state the design forbids and ends the process over.
-    /// What these tests need is the other class — a write that simply did not
-    /// happen — and a missing table is exactly that.
+    /// Inject (or lift) a transient store failure: a trigger that refuses every
+    /// `blocks` header insert, so each block-committing write fails and its
+    /// transaction rolls back — the finalization-insert failure the guards must
+    /// survive.
     async fn set_insert_failure(ctx: &AgencyCtx<CoreEvent>, failing: bool) {
         let sql = if failing {
             "CREATE TRIGGER injected_insert_failure BEFORE INSERT ON blocks \
-             BEGIN INSERT INTO no_such_table_for_the_injected_failure VALUES (1); END"
+             BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END"
         } else {
             "DROP TRIGGER injected_insert_failure"
         };

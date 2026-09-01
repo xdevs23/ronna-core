@@ -353,9 +353,9 @@ impl Store {
     /// A conversation takes ONE system prompt, and a second is refused in this
     /// library's own words (2026-09-01). The schema's trigger still stands
     /// behind the rule for whatever writes around this door, but the rule is
-    /// answered here: a refusal a caller is meant to receive must not reach it
-    /// as a constraint violation, which the store reads as a database in a
-    /// state the design forbids and ends the process over.
+    /// answered here, where the refusal can say which conversation already has
+    /// one — a caller meant to receive a refusal should not have to read the
+    /// database's constraint message to learn what it did.
     ///
     /// # Errors
     ///
