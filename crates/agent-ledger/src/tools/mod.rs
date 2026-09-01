@@ -57,11 +57,13 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
 use crate::agency::{AgencyCtx, GateDecision};
+use crate::block::Block;
 use crate::providers::BoxFuture;
 use crate::providers::types::ToolDefinition;
 use crate::reactivity::ReadSignal;
 
 pub mod admission;
+pub(crate) mod choice;
 pub mod runner;
 
 pub use admission::submit_approval;
@@ -126,6 +128,27 @@ pub struct ToolContext<'a, E> {
     /// a [`Pending`](ToolOutcome::Pending) body's backing system must keep to
     /// resolve the call.
     pub block_id: i64,
+}
+
+/// The consumer's own answer on one call, given the ledger (2026-09-01).
+///
+/// Distinct from [`GateDecision`], which answers a different question at a
+/// different moment: that one is the HUMAN's clearance, consulted only for a
+/// handler that declares itself checked and only while no request stands, and
+/// it can park a call out of band. This one is the consumer's own admission,
+/// consulted for every call over the snapshot the runner already loaded, and
+/// it has no parking arm — a consumer that cannot answer yet has nothing to
+/// park behind, because there is no out-of-band verdict coming.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// Let the call through to the rest of admission.
+    Admit,
+    /// Decline it. The runner resolves the call with this sentence and records
+    /// it a refusal, so a run of these ends the turn.
+    Refuse {
+        /// What the model is told. The words are the consumer's.
+        reason: String,
+    },
 }
 
 /// One kind of tool: what the model is told about it, whether it needs
@@ -208,6 +231,41 @@ pub trait ToolHandler<E>: Send + Sync {
     /// the standing obligation to gain a line for every method added here.
     fn ends_turn(&self) -> bool {
         false
+    }
+
+    /// The consumer's OWN admission for one call, consulted on every call
+    /// (2026-09-01). Default: admit.
+    ///
+    /// It receives the call's context and the ledger snapshot the runner's
+    /// admission pass already loaded, and answers admit or refuse with a
+    /// sentence the model reads. A refusal resolves the call with that
+    /// sentence, records it a refusal
+    /// ([`Refusal::Refused`](crate::agency::Refusal)) so a run of them ends the
+    /// turn, and the body never runs.
+    ///
+    /// **The snapshot is handed in, never fetched.** Everything a consumer's
+    /// admission needs to know about the conversation is in the ledger the
+    /// pass is already holding, and a hook that loaded its own would read the
+    /// ledger a second time per call and could read a DIFFERENT one — the
+    /// admission would then be decided against a history the pass around it
+    /// never saw.
+    ///
+    /// **Side-effect-free by contract**, for the reason
+    /// [`gate`](Self::gate) states: an answer that also wrote itself into the
+    /// ledger would be the same decision on two channels.
+    ///
+    /// This is not the human's clearance. `gate` still answers that, keeps its
+    /// meaning and keeps its own classification; the two are consulted at
+    /// different moments for different questions, and this one runs first
+    /// because a call the consumer declines must never park a human behind an
+    /// approval request.
+    fn admit<'a>(
+        &'a self,
+        ctx: &'a ToolContext<'a, E>,
+        ledger: &'a [Block],
+    ) -> BoxFuture<'a, Admission> {
+        let _ = (ctx, ledger);
+        Box::pin(async { Admission::Admit })
     }
 
     /// Vet one invocation, consulted only for a gated call that has no approval

@@ -30,7 +30,8 @@ use crate::bus::RuntimeEvent;
 use crate::store::{BlockDestination, StoreError, ToolCallInsert};
 
 use super::admission::{ApprovalState, approval_state};
-use super::{ToolContext, ToolHandler, ToolOutcome, ToolRegistry};
+use super::choice::ResolvedTools;
+use super::{Admission, ToolContext, ToolHandler, ToolOutcome, ToolRegistry};
 
 /// Where a recorded call came from — the second half of the runner's insert
 /// seam beside the call's own facts.
@@ -444,11 +445,18 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
     ///    at the conditional write. The window governs FRESH admissions
     ///    alone. The interactive skip is defensive only: an interactive call
     ///    is answered by the human and never reaches this pass at all.
-    /// 4. **Resolve the tool.** Unknown resolves the call with an error rather
-    ///    than leaving it dangling: a call nobody can run is still a call the
-    ///    model is waiting on.
-    /// 5. **Ungated?** Straight to the body. No evaluation, no record of one.
-    /// 6. **Read the recorded standing** and, only where nothing is recorded
+    /// 4. **Resolve the tool against the tools THIS CONVERSATION HAS** — its
+    ///    newest recorded choice intersected with the registry
+    ///    ([`ResolvedTools`]), which is the very same resolution the dispatch
+    ///    offered the turn from. A name the set does not carry resolves the
+    ///    call with an error instead of leaving it dangling: a call nobody
+    ///    can run is still a call the model is waiting on.
+    /// 5. **Ask the consumer's own admission** ([`ToolHandler::admit`]) over
+    ///    the snapshot this pass loaded — before any clearance is parked, so
+    ///    a call the consumer declines never puts a request in front of a
+    ///    human.
+    /// 6. **Ungated?** Straight to the body. No evaluation, no record of one.
+    /// 7. **Read the recorded standing** and, only where nothing is recorded
     ///    yet, ask the tool's own gate — which records its answer before
     ///    anything acts on it.
     async fn execute_ready_call(&self, ctx: &AgencyCtx<E>, call_block_id: i64) {
@@ -492,38 +500,84 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
             return;
         }
 
-        let Some(handler) = self.registry.get(&call.name) else {
-            warn!(name = call.name, "tool runner: no handler registered");
-            // The refusal carries the fix: the names that WOULD resolve, in
-            // the registry's sorted order. If visibility tiers ever land, a
-            // HIDDEN tool must produce this exact unknown-tool wording — any
-            // difference between the two answers discloses the hidden tool's
-            // existence — and the listing must then be built from the EXPOSED
-            // set, not the whole registry, or the list itself names every
-            // hidden tool.
-            let known: Vec<&str> = self.registry.names().collect();
-            let unknown = if known.is_empty() {
-                format!("unknown tool: {} (no tools are registered)", call.name)
+        // What this conversation has, resolved exactly once and from the very
+        // rule the dispatch offered its definitions by — so a name the model
+        // was shown resolves here, and a name it was not shown cannot.
+        let resolved = ResolvedTools::of(&ledger, &self.registry);
+        let Some(handler) = self
+            .registry
+            .get(&call.name)
+            .filter(|_| resolved.holds(&call.name))
+        else {
+            warn!(
+                name = call.name,
+                "tool runner: the conversation has no such tool"
+            );
+            // The two sentences differ in what a next round can do, and the
+            // classification follows that and nothing else. With names to
+            // offer, the model can correct itself, so this is an ordinary
+            // outcome. With none, nothing it calls can resolve, so it is a
+            // standing no and a run of them ends the turn. See [`Refusal`].
+            let (unresolved, refusal) = if resolved.names().is_empty() {
+                (ToolError::NO_TOOLS_REFUSAL.to_owned(), Refusal::Refused)
             } else {
-                format!(
-                    "unknown tool: {}. The registered tools are: {}",
-                    call.name,
-                    known.join(", ")
+                (
+                    ToolError::unresolved_tool(&call.name, resolved.names()),
+                    Refusal::Failed,
                 )
             };
-            // An ordinary outcome, not a refusal (2026-09-01): the sentence
-            // above hands the model the names that WOULD resolve, so the next
-            // round can succeed and the model is not looping against a
-            // standing no. See [`Refusal`].
-            self.resolve_with_error(ctx, &call.tool_call_id, unknown, call.id, Refusal::Failed)
+            self.resolve_with_error(ctx, &call.tool_call_id, unresolved, call.id, refusal)
                 .await;
             return;
         };
 
-        if handler.gated() && !self.admit(ctx, handler, &call, approval).await {
+        if !self.consumer_admits(ctx, handler, &call, &ledger).await {
+            return;
+        }
+        if handler.gated() && !self.cleared(ctx, handler, &call, approval).await {
             return;
         }
         self.run_body(ctx, handler, &call).await;
+    }
+
+    /// The consumer's own admission for this call, over the snapshot this pass
+    /// already loaded (2026-09-01).
+    ///
+    /// Answers whether the call may go on. `false` means the refusal is
+    /// already recorded and the caller must stop, the shape every refusal
+    /// path in this file takes. A refusal is recorded
+    /// [`Refusal::Refused`]: the consumer said no to the call, and nothing the
+    /// model does inside this turn changes that answer, so a run of them ends
+    /// the turn.
+    ///
+    /// The snapshot travels IN. That is the whole reason this hook exists at
+    /// this seam instead of around a handler: a wrapper reads the ledger a
+    /// second time per call, and the two reads can disagree.
+    async fn consumer_admits(
+        &self,
+        ctx: &AgencyCtx<E>,
+        handler: &dyn ToolHandler<E>,
+        call: &ToolCall,
+        ledger: &[Block],
+    ) -> bool {
+        let tool_ctx = ToolContext {
+            agency: ctx,
+            tool_call_id: &call.tool_call_id,
+            block_id: call.id,
+        };
+        match handler.admit(&tool_ctx, ledger).await {
+            Admission::Admit => true,
+            Admission::Refuse { reason } => {
+                info!(
+                    name = call.name,
+                    conversation_id = ctx.conversation_id,
+                    "tool runner: the consumer declined this call"
+                );
+                self.resolve_with_error(ctx, &call.tool_call_id, reason, call.id, Refusal::Refused)
+                    .await;
+                false
+            }
+        }
     }
 
     /// The tool-call windows' admission answer (2026-08-30): is this
@@ -626,7 +680,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
         true
     }
 
-    /// The admission half: act on the human's standing with this call —
+    /// The human's half: act on the standing this call has with the human —
     /// handed down folded once on the admission snapshot both halves read —
     /// and consult the tool's own gate only where nothing is recorded yet.
     ///
@@ -634,7 +688,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
     /// before it returns — that is the whole point of the split: the caller
     /// learns a boolean, but the ledger learns the decision, and the ledger is
     /// what the next wakeup reads.
-    async fn admit(
+    async fn cleared(
         &self,
         ctx: &AgencyCtx<E>,
         handler: &dyn ToolHandler<E>,

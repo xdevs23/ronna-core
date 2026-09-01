@@ -97,6 +97,7 @@ pub use store::{
     StoreError,
 };
 pub use tools::{
-    CallOrigin, ToolContext, ToolHandler, ToolOutcome, ToolRegistry, ToolRunner, submit_approval,
+    Admission, CallOrigin, ToolContext, ToolHandler, ToolOutcome, ToolRegistry, ToolRunner,
+    submit_approval,
 };
 pub use types::{ApprovalChoice, Awaiting, InputBlock, StopReason, StreamUsage, denial_error_text};

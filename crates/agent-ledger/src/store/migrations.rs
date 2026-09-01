@@ -391,6 +391,26 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE block_tool_error ADD COLUMN refusal INTEGER NOT NULL DEFAULT 0;
     ",
+    // v7 (2026-09-01): the tool choice's content table — the list of tool
+    // names a conversation has, recorded as a block so it is dated, superseded
+    // by appending a later one, and carried by a fork the way every other
+    // block is. A step, not an edit to v1's CREATE TABLE, per the discipline
+    // v3 states.
+    //
+    // The names ride ONE column as a JSON array, which is the one place this
+    // schema holds a list instead of a column per datum. The choice is one
+    // decision and its names are that decision's content, and the alternative
+    // — a row per name — would make the block query return a row per name for
+    // one block, where every other kind returns exactly one. The serialized
+    // form is the same one the store already sanctions for a consumer's own
+    // content column (`ColumnType::Json`). An empty choice is the empty array,
+    // and it is a decision like any other: this conversation has no tools.
+    "
+    CREATE TABLE IF NOT EXISTS block_tool_choice (
+        block_id INTEGER PRIMARY KEY REFERENCES blocks(id) ON DELETE CASCADE,
+        names    TEXT NOT NULL
+    );
+    ",
 ];
 
 /// Apply every unapplied step, advancing `user_version` as each lands.
@@ -768,6 +788,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stamp, 1, "a new resolution records the end of its turn");
+    }
+
+    /// v7: the tool choice's content table, and the round trip its one column
+    /// carries — an empty choice reads back as the empty array, which is the
+    /// decision "this conversation has no tools" and not the absence of a
+    /// decision.
+    #[test]
+    fn the_tool_choice_table_holds_a_list_and_an_empty_one() {
+        let conn = migrated();
+        assert_eq!(
+            table_columns(&conn, "block_tool_choice"),
+            vec!["block_id", "names"]
+        );
+
+        conn.execute_batch(
+            "INSERT INTO blocks (block_type) VALUES ('tool_choice');
+             INSERT INTO block_tool_choice (block_id, names) VALUES (1, '[\"read\",\"write\"]');
+             INSERT INTO blocks (block_type) VALUES ('tool_choice');
+             INSERT INTO block_tool_choice (block_id, names) VALUES (2, '[]');",
+        )
+        .unwrap();
+        let recorded: Vec<String> = conn
+            .prepare("SELECT names FROM block_tool_choice ORDER BY block_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            recorded,
+            vec!["[\"read\",\"write\"]".to_owned(), "[]".to_owned()]
+        );
+    }
+
+    /// A populated store from before v7 gains the table in place: its rows
+    /// survive, it carries no choice at all — which is what makes every
+    /// conversation written before this step read as "no record" and not
+    /// "no tools" — and a choice writes through afterwards.
+    #[test]
+    fn a_populated_store_gains_the_tool_choice_table_in_place() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for sql in &MIGRATIONS[..6] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.execute_batch(
+            "INSERT INTO blocks (block_type) VALUES ('text');
+             INSERT INTO block_text (block_id, role, content) VALUES (1, 'user', 'before');",
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+        assert_eq!(version(&conn), u32::try_from(MIGRATIONS.len()).unwrap());
+
+        let said: String = conn
+            .query_row(
+                "SELECT content FROM block_text WHERE block_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(said, "before", "the existing history survives the step");
+        let recorded: i64 = conn
+            .query_row("SELECT COUNT(*) FROM block_tool_choice", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recorded, 0, "an older store recorded no choice");
+
+        conn.execute_batch(
+            "INSERT INTO blocks (block_type) VALUES ('tool_choice');
+             INSERT INTO block_tool_choice (block_id, names) VALUES (2, '[\"read\"]');",
+        )
+        .unwrap();
+        let names: String = conn
+            .query_row(
+                "SELECT names FROM block_tool_choice WHERE block_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(names, "[\"read\"]");
     }
 
     /// The display-only summary channel sits beside content and the opaque

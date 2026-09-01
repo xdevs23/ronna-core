@@ -28,7 +28,8 @@ use super::StoreError;
 /// The ancestor reference is in here for the same reason as the date marker
 /// (2026-08-31): it carries no role either, so a role-less run a fork is
 /// anchored on can hold one, and a deep copy of that run arrives here
-/// holding it.
+/// holding it. The tool choice joins them on the same reasoning
+/// (2026-09-01).
 ///
 /// The date marker is in here for the same reason and its mirror image
 /// (2026-08-27): it carries NO role, so the group walk keeps it inside any
@@ -69,6 +70,12 @@ pub(super) enum BlockContent {
     },
     AncestorReference {
         ancestor_conversation_id: i64,
+    },
+    ToolChoice {
+        /// The serialized name list, carried verbatim: a copy of a recorded
+        /// choice records the same choice, and nothing is recomputed against
+        /// whatever registry happens to be loaded at copy time.
+        names: String,
     },
 }
 
@@ -166,6 +173,7 @@ impl BlockContent {
                     ancestor_conversation_id,
                 })
             }
+            "tool_choice" => Self::read_tool_choice(conn, block_id),
             other => {
                 // The kind is genuinely outside what this type models — which
                 // is a fact about this type, not a malformed statement. It used
@@ -202,6 +210,18 @@ impl BlockContent {
             tz_name,
             written_at,
         })
+    }
+
+    /// The choice's row: the serialized name list, read as stored. Its own
+    /// function for the reason the marker's is one — a copy carries the row
+    /// VERBATIM, and nothing about what the names mean is decided here.
+    fn read_tool_choice(conn: &Connection, block_id: i64) -> Result<Self, StoreError> {
+        let names: String = conn.query_row(
+            "SELECT names FROM block_tool_choice WHERE block_id = ?1",
+            [block_id],
+            |row| row.get(0),
+        )?;
+        Ok(Self::ToolChoice { names })
     }
 
     /// Insert this content as the payload for `new_block_id`.
@@ -292,6 +312,12 @@ impl BlockContent {
                     params![new_block_id, ancestor_conversation_id],
                 )?;
             }
+            Self::ToolChoice { names } => {
+                conn.execute(
+                    "INSERT INTO block_tool_choice (block_id, names) VALUES (?1, ?2)",
+                    params![new_block_id, names],
+                )?;
+            }
         }
         Ok(())
     }
@@ -314,11 +340,13 @@ impl BlockContent {
             // states the same date wherever it lands. An ancestor reference
             // names a CONVERSATION, which this map does not describe — the
             // remap rewrites block ids, and a copy of the reference records
-            // the same ancestry the original did.
+            // the same ancestry the original did. A tool choice names TOOLS,
+            // which are not ledger rows at all.
             Self::Text { .. }
             | Self::Code { .. }
             | Self::DateMarker { .. }
-            | Self::AncestorReference { .. } => Vec::new(),
+            | Self::AncestorReference { .. }
+            | Self::ToolChoice { .. } => Vec::new(),
         };
         for reference in references {
             if let Some(&copied) = remap.get(reference) {

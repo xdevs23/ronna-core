@@ -39,6 +39,7 @@ mod system_prompt;
 mod text;
 mod thinking;
 mod tool_call;
+mod tool_choice;
 mod tool_error;
 mod tool_result;
 
@@ -65,6 +66,7 @@ pub use system_prompt::SystemPrompt;
 pub use text::Text;
 pub use thinking::Thinking;
 pub use tool_call::ToolCall;
+pub use tool_choice::ToolChoice;
 pub use tool_error::{Refusal, ToolError};
 pub use tool_result::ToolResult;
 #[cfg(test)]
@@ -159,8 +161,8 @@ pub trait Agency {
     /// skipped when the frontier's tail is read, and the block behind it
     /// answers instead. Default: opaque — the tail speaks for itself.
     ///
-    /// One property answers `true`, and two shapes carry it: the row that
-    /// STORES A TURN'S END. Either the status record carrying a stored
+    /// Two properties answer `true`. The first is the row that STORES A
+    /// TURN'S END. Either the status record carrying a stored
     /// turn-closure key ([`Status`]) — written where a turn ends with no row
     /// of its own to record it, by a close that ends a turn over an
     /// unanswered outcome, and (2026-08-30) by the forced end a run of
@@ -175,29 +177,16 @@ pub trait Agency {
     /// each kind answers it from its own data. The interrupt's status
     /// stays opaque on purpose: its capping under the latch is that path's
     /// recorded semantics, and the latch's own release re-checks there.
+    ///
+    /// The second is the row that is NEITHER AN ASK NOR AN ANSWER and is
+    /// appended into the middle of a live history (2026-09-01):
+    /// [`ToolChoice`], which a consumer records whenever the set of tools a
+    /// conversation has changes — behind an unanswered message as readily as
+    /// anywhere else. The burial is the same one, reached from the other
+    /// side: a record that spoke for the frontier would leave the message
+    /// behind it owed by nobody.
     fn frontier_transparent(&self) -> bool {
         false
-    }
-
-    /// Whether a turn THIS block summons is offered the tool registry's
-    /// definitions. Default: yes — a turn is offered what the consumer
-    /// registered.
-    ///
-    /// Read at the dispatch, off the very block whose
-    /// [`awaiting`](Self::awaiting) summoned the turn, so a kind that asks
-    /// for an answer in words alone gets a turn that has nothing else to
-    /// answer with. It is a fact about the ASK, which is why it lives beside
-    /// `awaiting` on the kind instead of as a branch at the dispatch: the
-    /// actor reads one hook and never learns which kind it just read.
-    ///
-    /// Exactly one KIND answers `false` (2026-08-31, the compaction slice):
-    /// [`HarnessMessage`], the harness's own instruction to the model. Its
-    /// whole purpose is a turn that reads the conversation in front of it and
-    /// writes prose about it, and a tool offered there is a round the harness
-    /// has no use for. Every other kind, in every voice, is offered the
-    /// registry as before.
-    fn offers_tools(&self) -> bool {
-        true
     }
 
     /// Vet this block before [`run`](Self::run).
@@ -284,7 +273,7 @@ pub trait FromBlock {
 
     /// Every stored type string this implementor resolves to a typed kind —
     /// its claim on the stored-string namespace. [`BlockKind`]'s lists the
-    /// library's nineteen; a composing enum's is the union of its leaves'
+    /// library's twenty; a composing enum's is the union of its leaves'
     /// [`LeafKind::KINDS`] and its delegate's claim, which is what lets the
     /// derive refuse a collision at compile time at every nesting depth: a
     /// leaf whose string is already claimed would silently shadow the earlier
@@ -572,6 +561,8 @@ pub enum BlockKind {
     AncestorReference(AncestorReference),
     /// The harness's own message to the model, and the ask it carries.
     HarnessMessage(HarnessMessage),
+    /// Which tools this conversation has.
+    ToolChoice(ToolChoice),
     /// A block type this build does not know — fully inert, so an old build
     /// reading a newer ledger fails safe instead of misinterpreting it.
     Unknown(Unknown),
@@ -580,7 +571,7 @@ pub enum BlockKind {
 /// One arm of the core parse chain: does the leaf's [`LeafKind::KINDS`] claim
 /// this stored string, and if so, which variant does its parse feed?
 ///
-/// A macro instead of nineteen hand-written if-returns so the shape cannot
+/// A macro instead of twenty hand-written if-returns so the shape cannot
 /// drift per kind — the same reason the dispatch below is one macro. The type
 /// strings themselves live on the leaf kinds as consts; nothing here names
 /// one.
@@ -593,7 +584,7 @@ macro_rules! try_leaf {
 }
 
 impl FromBlock for BlockKind {
-    /// The library's nineteen stored type strings, concatenated at compile
+    /// The library's twenty stored type strings, concatenated at compile
     /// time from the leaf kinds' own `KINDS` consts — the same "one place per
     /// kind" rule the parse chain below reads by, so the claim cannot drift
     /// from what the chain resolves. [`Unknown`] claims nothing: it is the
@@ -619,6 +610,7 @@ impl FromBlock for BlockKind {
             MetadataTitleResponse::KINDS,
             AncestorReference::KINDS,
             HarnessMessage::KINDS,
+            ToolChoice::KINDS,
         ];
         const CONCATENATED: [&str; kind_count(SETS)] = concat_kinds(SETS);
         &CONCATENATED
@@ -652,6 +644,7 @@ impl FromBlock for BlockKind {
         try_leaf!(block, stored, MetadataTitleResponse => MetadataTitleResponse);
         try_leaf!(block, stored, AncestorReference => AncestorReference);
         try_leaf!(block, stored, HarnessMessage => HarnessMessage);
+        try_leaf!(block, stored, ToolChoice => ToolChoice);
         // A kind this library does not know is the NORMAL case here, not a
         // fault: every consumer-defined kind lands in this arm whenever a
         // library scan reads a mixed ledger through the library's own view
@@ -691,6 +684,7 @@ macro_rules! dispatch {
             BlockKind::MetadataTitleResponse($kind) => $call,
             BlockKind::AncestorReference($kind) => $call,
             BlockKind::HarnessMessage($kind) => $call,
+            BlockKind::ToolChoice($kind) => $call,
             BlockKind::Unknown($kind) => $call,
         }
     };
@@ -707,10 +701,6 @@ impl Agency for BlockKind {
 
     fn frontier_transparent(&self) -> bool {
         dispatch!(self, kind => kind.frontier_transparent())
-    }
-
-    fn offers_tools(&self) -> bool {
-        dispatch!(self, kind => kind.offers_tools())
     }
 
     async fn gate<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> GateDecision {

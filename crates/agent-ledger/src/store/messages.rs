@@ -218,6 +218,8 @@ impl Store {
     ///
     /// If the query fails or the store's actor has stopped.
     pub async fn list_blocks(&self, conversation_id: i64) -> Result<Vec<Block>, StoreError> {
+        #[cfg(test)]
+        self.count_ledger_load();
         let descriptors = self.descriptors;
         let gate = self.gate.clone();
         self.run(move |conn| {

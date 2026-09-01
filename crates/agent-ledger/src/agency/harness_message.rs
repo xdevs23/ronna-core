@@ -22,13 +22,14 @@ use super::projection::{ContentPart, Projection, render_text};
 /// ([`Store::fork_temporary`](crate::store::Store::fork_temporary)) and no
 /// consumer can write at all.
 ///
-/// Two facts, both about the ask and both read off this block by the
-/// dispatch:
+/// One fact about the ask, read off this block by the dispatch: it awaits the
+/// MODEL, so appending it is what makes the conversation owe a turn.
 ///
-/// - it awaits the MODEL, so appending it is what makes the conversation owe
-///   a turn;
-/// - it is offered NO tools, because the answer it asks for is words about
-///   the ledger and a tool is a round nothing here has a use for.
+/// What that turn is OFFERED is not this kind's answer (2026-09-01). The
+/// conversation the fork builds records an empty
+/// [`ToolChoice`](super::ToolChoice) of its own, written by the same door that
+/// writes this block, so the turn is offered nothing because the ledger says
+/// so — one fact, in the ledger, read by the dispatch and by the runner alike.
 #[derive(Debug, Clone)]
 pub struct HarnessMessage {
     /// The voice the block was written in — the harness's own, which is the
@@ -56,11 +57,6 @@ impl Agency for HarnessMessage {
     /// kind exists because something wanted a turn.
     fn awaiting(&self) -> Option<Awaiting> {
         Some(Awaiting::Model)
-    }
-
-    /// Answered in words alone, so the turn it summons is offered nothing.
-    fn offers_tools(&self) -> bool {
-        false
     }
 }
 

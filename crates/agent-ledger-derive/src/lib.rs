@@ -703,13 +703,6 @@ fn agency_impl(name: &Ident, composition: &Composition<'_>) -> proc_macro2::Toke
                 }
             }
 
-            fn offers_tools(&self) -> bool {
-                match self {
-                    #( Self::#all_ident(kind) =>
-                        #krate::agency::Agency::offers_tools(kind), )*
-                }
-            }
-
             async fn gate<__E: #krate::RuntimeEvent>(
                 &self,
                 ctx: &#krate::AgencyCtx<__E>,

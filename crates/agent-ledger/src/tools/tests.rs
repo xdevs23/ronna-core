@@ -1115,48 +1115,373 @@ fn a_gated_interactive_handler_is_refused_at_registration() {
     ToolRegistry::<CoreEvent>::new().register("contradictory", ContradictoryProbe);
 }
 
-/// The unknown-tool refusal carries the fix: the names that WOULD resolve, in
-/// the registry's sorted order.
-#[tokio::test]
-async fn an_unknown_tool_error_names_the_registered_tools() {
-    let mut registry = ToolRegistry::new();
-    for name in ["zeta", "alpha"] {
-        registry.register(name, NamedProbe(name));
+// ─── What a call resolves against (2026-09-01) ───────────────────────────────
+
+/// A named tool that counts every time its body runs, so a test can assert
+/// that a refused call never reached it.
+struct CountingProbe(&'static str, Arc<AtomicUsize>);
+
+impl ToolHandler<CoreEvent> for CountingProbe {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.0.into(),
+            description: format!("the {} tool", self.0),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
     }
-    let runner = ToolRunner::<BlockKind, _>::new(Arc::new(registry));
+
+    fn execute<'a>(
+        &'a self,
+        _input: &'a str,
+        _ctx: ToolContext<'a, CoreEvent>,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            ToolOutcome::Done("ok".into())
+        })
+    }
+}
+
+/// A runner over the named tools, and an oracle whose conversation already
+/// carries a summoning message.
+async fn resolution_rig(
+    names: &[&'static str],
+) -> (Oracle, ToolRunner<BlockKind, CoreEvent>, Arc<AtomicUsize>) {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    for name in names {
+        registry.register(*name, CountingProbe(name, Arc::clone(&executions)));
+    }
     let o = Oracle::new().await;
     o.user_text("go").await;
+    (
+        o,
+        ToolRunner::<BlockKind, _>::new(Arc::new(registry)),
+        executions,
+    )
+}
+
+/// Record one call under `name` and feed the chokepoint one wakeup.
+async fn call_once(o: &Oracle, runner: &ToolRunner<BlockKind, CoreEvent>, name: &str) {
     let call = runner
         .insert_call(
             &o.ctx,
             false,
-            "nope-1".into(),
-            "no_such_tool".into(),
+            format!("call-{name}"),
+            name.to_owned(),
             "{}".into(),
             CallOrigin::default(),
         )
         .await
         .unwrap();
     runner.run_wakeup(&o.ctx, false, call).await;
+}
 
-    let errors: Vec<Block> = o
-        .ctx
+/// Every tool error the conversation carries, as its sentence and whether the
+/// row records a refusal.
+async fn recorded_failures(o: &Oracle) -> Vec<(String, bool)> {
+    o.ctx
         .store
         .list_blocks(o.ctx.conversation_id)
         .await
         .unwrap()
         .into_iter()
-        .filter(|b| b.block_type == "tool_error")
-        .collect();
+        .filter(|block| block.block_type == "tool_error")
+        .map(|block| {
+            (
+                block.fields["error"].as_str().unwrap().to_owned(),
+                block.fields["refusal"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// AC7, AC8, AC10 — a name outside the conversation's choice never reaches its
+/// handler even though the registry holds it, the sentence names the
+/// conversation's own two tools and not the third, and the outcome is an
+/// ordinary failure because the next round can succeed.
+#[tokio::test]
+async fn a_tool_outside_the_choice_is_refused_and_the_sentence_names_the_conversations_own() {
+    let (o, runner, executions) = resolution_rig(&["alpha", "mid", "zeta"]).await;
+    o.ctx
+        .store
+        .append_tool_choice(o.ctx.conversation_id, vec!["alpha".into(), "zeta".into()])
+        .await
+        .unwrap();
+
+    call_once(&o, &runner, "mid").await;
+
     assert_eq!(
-        errors.len(),
-        1,
-        "the unknown call is resolved, not dangling"
+        executions.load(Ordering::SeqCst),
+        0,
+        "a tool the conversation does not have never reaches its handler"
     );
+    let failures = recorded_failures(&o).await;
+    assert_eq!(failures.len(), 1, "the call is resolved, not dangling");
     assert_eq!(
-        errors[0].fields["error"],
-        Value::from("unknown tool: no_such_tool. The registered tools are: alpha, zeta"),
-        "the refusal names the tools that do exist, sorted"
+        failures[0].0, "unknown tool: mid. This conversation's tools are: alpha, zeta",
+        "the sentence names this conversation's tools, never the registry"
+    );
+    assert!(
+        !failures[0].0.contains("mid, "),
+        "the third registered tool is not disclosed"
+    );
+    assert!(
+        !failures[0].1,
+        "with names to offer, the model can correct itself — an ordinary failure"
+    );
+}
+
+/// AC8 — the two ways a name fails to resolve read identically, byte for
+/// byte: one was never registered anywhere, the other is registered and
+/// outside this conversation's choice. Any difference would disclose the
+/// existence of the tool the conversation was deliberately not given.
+#[tokio::test]
+async fn a_name_outside_the_choice_and_a_name_nobody_registered_read_the_same() {
+    let (o, runner, _) = resolution_rig(&["alpha", "mid", "zeta"]).await;
+    o.ctx
+        .store
+        .append_tool_choice(o.ctx.conversation_id, vec!["alpha".into(), "zeta".into()])
+        .await
+        .unwrap();
+
+    call_once(&o, &runner, "mid").await;
+    let outside_the_choice = recorded_failures(&o).await[0].0.clone();
+
+    // The same conversation's choice, over a registry that never held `mid`
+    // at all.
+    let (fresh, runner, _) = resolution_rig(&["alpha", "zeta"]).await;
+    fresh
+        .ctx
+        .store
+        .append_tool_choice(
+            fresh.ctx.conversation_id,
+            vec!["alpha".into(), "zeta".into()],
+        )
+        .await
+        .unwrap();
+    call_once(&fresh, &runner, "mid").await;
+    let never_registered = recorded_failures(&fresh).await[0].0.clone();
+
+    assert_eq!(
+        outside_the_choice, never_registered,
+        "registered-but-outside and never-registered read identically"
+    );
+}
+
+/// AC9 — a conversation whose resolved set is empty, against a registry that
+/// HAS tools: the sentence states the conversation has no tools, names none of
+/// them, says nothing about the registry, and the row records a refusal
+/// because no next round can resolve either.
+#[tokio::test]
+async fn an_empty_choice_answers_with_no_tools_and_records_a_refusal() {
+    let (o, runner, executions) = resolution_rig(&["alpha", "mid", "zeta"]).await;
+    o.ctx
+        .store
+        .append_tool_choice(o.ctx.conversation_id, Vec::new())
+        .await
+        .unwrap();
+
+    call_once(&o, &runner, "alpha").await;
+
+    assert_eq!(executions.load(Ordering::SeqCst), 0, "nothing ran");
+    let failures = recorded_failures(&o).await;
+    assert_eq!(failures.len(), 1);
+    assert_eq!(
+        failures[0].0,
+        "this conversation has no tools, so no tool call can be answered."
+    );
+    for name in ["alpha", "mid", "zeta", "registered"] {
+        assert!(
+            !failures[0].0.contains(name),
+            "the sentence names no tool and asserts nothing about the registry"
+        );
+    }
+    assert!(
+        failures[0].1,
+        "nothing it calls can resolve, so this is a standing no"
+    );
+}
+
+/// AC6 — a recorded name the registry does not hold resolves to nothing: it is
+/// offered to nobody and resolvable by nobody. The dispatch's half of this
+/// criterion is asserted at the dispatch itself; here is the runner's.
+#[tokio::test]
+async fn a_recorded_name_the_registry_does_not_hold_resolves_to_nothing() {
+    let (o, runner, executions) = resolution_rig(&["alpha"]).await;
+    o.ctx
+        .store
+        .append_tool_choice(o.ctx.conversation_id, vec!["alpha".into(), "gone".into()])
+        .await
+        .unwrap();
+
+    call_once(&o, &runner, "gone").await;
+
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    let failures = recorded_failures(&o).await;
+    assert_eq!(
+        failures[0].0, "unknown tool: gone. This conversation's tools are: alpha",
+        "the intersection is the whole rule: the recorded name the registry lost is \
+         not among this conversation's tools"
+    );
+}
+
+/// AC5 — a conversation that recorded no choice at all resolves against every
+/// registered tool, exactly as every conversation did before the record
+/// existed.
+#[tokio::test]
+async fn a_conversation_with_no_recorded_choice_resolves_against_the_registry() {
+    let (o, runner, executions) = resolution_rig(&["alpha", "zeta"]).await;
+
+    call_once(&o, &runner, "zeta").await;
+
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        1,
+        "no record filters nothing"
+    );
+    assert!(recorded_failures(&o).await.is_empty());
+}
+
+// ─── The consumer's own admission hook (2026-09-01) ──────────────────────────
+
+/// A tool whose admission answers from the ledger it is handed, recording what
+/// it saw so a test can prove the snapshot travelled in instead of being
+/// fetched.
+struct AdmittingProbe {
+    executions: Arc<AtomicUsize>,
+    refuse: bool,
+    seen: Arc<std::sync::Mutex<Vec<Vec<i64>>>>,
+}
+
+impl ToolHandler<CoreEvent> for AdmittingProbe {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "admitted".into(),
+            description: "a test-only tool with its own admission".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn admit<'a>(
+        &'a self,
+        ctx: &'a ToolContext<'a, CoreEvent>,
+        ledger: &'a [Block],
+    ) -> BoxFuture<'a, crate::tools::Admission> {
+        let ids: Vec<i64> = ledger.iter().map(|block| block.id).collect();
+        let carries_call = ids.contains(&ctx.block_id);
+        Box::pin(async move {
+            self.seen.lock().unwrap().push(ids);
+            assert!(
+                carries_call,
+                "the snapshot carries the call under admission"
+            );
+            if self.refuse {
+                crate::tools::Admission::Refuse {
+                    reason: "the consumer said no".into(),
+                }
+            } else {
+                crate::tools::Admission::Admit
+            }
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _input: &'a str,
+        _ctx: ToolContext<'a, CoreEvent>,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            ToolOutcome::Done("ok".into())
+        })
+    }
+}
+
+/// AC15 — the hook's refusal resolves the call with its own sentence, records
+/// it `Refusal::Refused`, and the body never runs.
+#[tokio::test]
+async fn the_consumers_admission_refuses_with_its_sentence_and_the_body_never_runs() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::new();
+    registry.register(
+        "admitted",
+        AdmittingProbe {
+            executions: Arc::clone(&executions),
+            refuse: true,
+            seen: Arc::clone(&seen),
+        },
+    );
+    let runner = ToolRunner::<BlockKind, _>::new(Arc::new(registry));
+    let o = Oracle::new().await;
+    o.user_text("go").await;
+
+    call_once(&o, &runner, "admitted").await;
+
+    assert_eq!(executions.load(Ordering::SeqCst), 0, "the body never ran");
+    let failures = recorded_failures(&o).await;
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, "the consumer said no");
+    assert!(
+        failures[0].1,
+        "the consumer's decline is a refusal, so a run of them ends the turn"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1, "the hook was consulted once");
+}
+
+/// AC16 — the admission pass loads the conversation's ledger EXACTLY ONCE per
+/// call, and the hook is handed that snapshot instead of loading one of its
+/// own. The counter is the store's own, so a hook that read the ledger through
+/// its context would push the count past one — which is what makes the
+/// reading mean anything.
+#[tokio::test]
+async fn the_admission_pass_loads_the_ledger_once_and_hands_it_to_the_hook() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::new();
+    registry.register(
+        "admitted",
+        AdmittingProbe {
+            executions: Arc::new(AtomicUsize::new(0)),
+            refuse: true,
+            seen: Arc::clone(&seen),
+        },
+    );
+    let runner = ToolRunner::<BlockKind, _>::new(Arc::new(registry));
+    let o = Oracle::new().await;
+    o.user_text("go").await;
+
+    let call = runner
+        .insert_call(
+            &o.ctx,
+            true,
+            "counted".into(),
+            "admitted".into(),
+            "{}".into(),
+            CallOrigin::default(),
+        )
+        .await
+        .unwrap();
+    let before = o.ctx.store.ledger_loads();
+    runner.run_wakeup(&o.ctx, false, call).await;
+    assert_eq!(
+        o.ctx.store.ledger_loads() - before,
+        1,
+        "one pass, one ledger load — the hook was handed the snapshot"
+    );
+
+    let ledger = o
+        .ctx
+        .store
+        .list_blocks(o.ctx.conversation_id)
+        .await
+        .unwrap();
+    let ids: Vec<i64> = ledger.iter().map(|block| block.id).collect();
+    let saw = seen.lock().unwrap();
+    assert_eq!(saw.len(), 1);
+    assert!(
+        saw[0].iter().all(|id| ids.contains(id)) && saw[0].contains(&call),
+        "the hook read the pass's own snapshot of this conversation"
     );
 }
 
