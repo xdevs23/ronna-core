@@ -300,6 +300,22 @@ struct ActorEntry {
     accepts: fn(&CoreEvent) -> bool,
 }
 
+/// What a conversation's scheduler tells its actor, both read off the SAME
+/// drive (2026-09-01).
+///
+/// The channel carried a bare wakeup while the frontier gate was the only
+/// thing a drive could report. The second fact is the conversation's own
+/// existence — the drive's cursor read answers it — and it belongs on this
+/// channel for the same reason the first does: the scheduler is the single
+/// driver, so what it derives travels one way, to the actor that acts on it.
+pub(crate) enum SchedulerSignal {
+    /// The frontier gate owes a model turn.
+    OwesTurn,
+    /// The conversation no longer exists. Its actor ends, and the set the
+    /// actor owns ends with it.
+    ConversationGone,
+}
+
 /// Register all per-conversation actor types. Generates `spawn_actor_set`,
 /// which the reactor calls to create the full set of actors for a new
 /// conversation.
@@ -326,24 +342,26 @@ macro_rules! register_actors {
 /// drives turns automatically.
 ///
 /// Owns the provider channel (via lazy `bind()`). The scheduler signals
-/// `blocks_ready` when the frontier gate owes a model turn; the actor reads
-/// the ledger, sends [`ProviderRequest::Stream`], and the ingestion reader
-/// handles responses.
+/// [`SchedulerSignal::OwesTurn`] when the frontier gate owes a model turn; the
+/// actor reads the ledger, sends [`ProviderRequest::Stream`], and the
+/// ingestion reader handles responses. It signals
+/// [`SchedulerSignal::ConversationGone`] when the conversation ceased to
+/// exist, and this actor's own end is the end of its whole set.
 struct ConversationActor<K: RuntimeKind, E> {
     id: i64,
     ctx: RuntimeContext<K, E>,
     mailbox: tokio::sync::mpsc::UnboundedReceiver<CoreEvent>,
     write_latched: WriteSignal<bool>,
     read_latched: ReadSignal<bool>,
-    blocks_ready: tokio::sync::mpsc::UnboundedReceiver<()>,
+    from_scheduler: tokio::sync::mpsc::UnboundedReceiver<SchedulerSignal>,
     /// The close edges' re-check nudge: a monotonic count the scheduler's
     /// reactive loop tracks, bumped when a close finds an owed-turn signal
     /// was swallowed while the turn was open. The nudge wakes the SCHEDULER,
     /// never the dispatch delivery directly: the scheduler's ratchet drive is
     /// the one place the owed-turn check lives — its parked gate included —
     /// so the close re-runs the whole check instead of a tail-only half of
-    /// it, and the drive signals `blocks_ready` exactly when the re-checked
-    /// ledger really owes a turn.
+    /// it, and the drive signals [`SchedulerSignal::OwesTurn`] exactly when
+    /// the re-checked ledger really owes a turn.
     recheck: WriteSignal<u64>,
     provider_tx: Option<ProviderTx>,
     /// The dispatch state (reworked 2026-08-22): opened at delivery, closed on
@@ -493,8 +511,22 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
                         None => break,
                     }
                 }
-                Some(()) = self.blocks_ready.recv() => {
-                    ready = true;
+                Some(signal) = self.from_scheduler.recv() => {
+                    match signal {
+                        SchedulerSignal::OwesTurn => ready = true,
+                        // The conversation this actor exists for is gone, so
+                        // the actor is over — and the whole set with it, since
+                        // this loop's return aborts every loop spawned beside
+                        // it. Nothing was told to stop: the scheduler read the
+                        // fact off the ledger's own cursor and reported it.
+                        SchedulerSignal::ConversationGone => {
+                            tracing::info!(
+                                conversation_id = self.id,
+                                "conversation gone — the actor set ends"
+                            );
+                            break;
+                        }
+                    }
                 }
             }
             if ready {
@@ -1324,10 +1356,11 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     /// that path writes nothing.
     ///
     /// The rule reads the LEDGER, on the dispatch's own snapshot: when the
-    /// turn's trailing tool outcomes are all rate-limit refusals — either
-    /// window's, since both are written with the one machine prefix — as many
-    /// of them as the ONE consecutive limit the runtime carries
-    /// ([`ToolCall::trailing_refusal_run`]), the model has stopped making
+    /// turn's trailing tool outcomes are all REFUSALS — every one of them,
+    /// whoever refused, each carrying that fact on its own row
+    /// ([`Refusal`](crate::agency::Refusal), whose reading is the one home for
+    /// what counts) — as many of them as the ONE consecutive limit the runtime
+    /// carries ([`ToolCall::trailing_refusal_run`]), the model has stopped making
     /// progress — a history that deep in refusals has gone bad — and every
     /// further round costs a paid request for another refusal. The turn the
     /// rule scopes to is the RESOLVED anchor the caller just decided, held
@@ -1381,7 +1414,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
                     conversation_id = self.id,
                     anchor,
                     refusals = limit,
-                    "a run of tool-call rate-limit refusals ended this turn — standing the \
+                    "a run of refused tool calls ended this turn — standing the \
                      dispatch down"
                 );
             }
@@ -1495,31 +1528,50 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
 
 // ─── Reactive scheduler ─────────────────────────────────────────────────────
 
-/// One scheduler tick: rest while latched (the whole ratchet family runs only
-/// unlatched), otherwise drive the cursor, signal the actor when the frontier
+/// One scheduler tick: read whether the conversation is still there and then
+/// rest while latched (the whole ratchet family runs only unlatched),
+/// otherwise drive the cursor, signal the actor when the frontier
 /// gate owes a turn, and run the redispatch walk — which rides the same tick
 /// but is ungated by the model-turn axis, so deferred work resumes even when
 /// no turn is owed. Returns the drive's Outcome for the state broadcaster to
 /// consume; `None` when nothing was driven.
+///
+/// A tick that reads its conversation GONE (2026-09-01) signals the actor and
+/// returns at once, redispatch walk included: there is no ledger left to walk,
+/// and this tick is the last one the set runs. That read happens LATCHED TOO —
+/// the latch decides whether the ratchet runs, never whether the set may
+/// outlive its conversation, and a set latched at boot or by a stream failure
+/// would otherwise never meet the one fact that ends it.
 pub(crate) async fn scheduler_tick<K: RuntimeKind, E: RuntimeEvent>(
     ctx: &AgencyCtx<E>,
     latched: bool,
-    blocks_ready: &tokio::sync::mpsc::UnboundedSender<()>,
+    signals: &tokio::sync::mpsc::UnboundedSender<SchedulerSignal>,
 ) -> Option<ratchet::Outcome> {
     if latched {
+        match ratchet::conversation_gone(ctx).await {
+            Ok(true) => signal_conversation_gone(ctx, signals),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!(conversation_id = ctx.conversation_id, error = %e, "scheduler: reading whether the conversation still exists failed");
+            }
+        }
         return None;
     }
     let outcome = match ratchet::drive::<K, E>(ctx).await {
-        Ok(outcome) => {
+        Ok(ratchet::Driven::Ran(outcome)) => {
             tracing::debug!(
                 conversation_id = ctx.conversation_id,
                 ?outcome,
                 "scheduler tick"
             );
             if outcome.owes_turn {
-                let _ = blocks_ready.send(());
+                let _ = signals.send(SchedulerSignal::OwesTurn);
             }
             Some(outcome)
+        }
+        Ok(ratchet::Driven::ConversationGone) => {
+            signal_conversation_gone(ctx, signals);
+            return None;
         }
         Err(e) => {
             tracing::error!(conversation_id = ctx.conversation_id, error = %e, "scheduler: ratchet drive failed");
@@ -1530,6 +1582,20 @@ pub(crate) async fn scheduler_tick<K: RuntimeKind, E: RuntimeEvent>(
         tracing::error!(conversation_id = ctx.conversation_id, error = %e, "scheduler: redispatch walk failed");
     }
     outcome
+}
+
+/// Tell the actor its conversation is gone — the one place the scheduler says
+/// it, for the two reads that can find it: the drive's own cursor read and the
+/// latched tick's existence read.
+fn signal_conversation_gone<E: RuntimeEvent>(
+    ctx: &AgencyCtx<E>,
+    signals: &tokio::sync::mpsc::UnboundedSender<SchedulerSignal>,
+) {
+    tracing::info!(
+        conversation_id = ctx.conversation_id,
+        "scheduler: the conversation is gone — ending the actor set"
+    );
+    let _ = signals.send(SchedulerSignal::ConversationGone);
 }
 
 /// Turn scheduler — the SINGLE ratchet driver for its conversation. Two
@@ -1556,7 +1622,7 @@ async fn run_scheduler<K: RuntimeKind, E: RuntimeEvent>(
     ctx: RuntimeContext<K, E>,
     read_latched: ReadSignal<bool>,
     recheck: ReadSignal<u64>,
-    blocks_ready: tokio::sync::mpsc::UnboundedSender<()>,
+    signals: tokio::sync::mpsc::UnboundedSender<SchedulerSignal>,
     write_outcome: WriteSignal<Option<ratchet::Outcome>>,
 ) {
     let agency = ctx.agency(conv_id);
@@ -1577,7 +1643,7 @@ async fn run_scheduler<K: RuntimeKind, E: RuntimeEvent>(
         let _ = recheck.get();
         db_changes.react();
 
-        if let Some(outcome) = scheduler_tick::<K, E>(&agency, latched, &blocks_ready).await {
+        if let Some(outcome) = scheduler_tick::<K, E>(&agency, latched, &signals).await {
             write_outcome.set_if_changed(Some(outcome));
         }
     }
@@ -1712,7 +1778,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> PerConversationActor<K, E>
         // restart cannot fire turns out of a ledger nobody asked to resume.
         let (read_latched, write_latched) = create_signal(true);
 
-        let (blocks_ready_tx, blocks_ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (signals_tx, signals_rx) = tokio::sync::mpsc::unbounded_channel();
         let (read_outcome, write_outcome) = create_signal(None::<ratchet::Outcome>);
         // The close edges' re-check nudge, actor-written and scheduler-read.
         let (read_recheck, write_recheck) = create_signal(0u64);
@@ -1722,7 +1788,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> PerConversationActor<K, E>
             ctx.clone(),
             read_latched.clone(),
             read_recheck,
-            blocks_ready_tx,
+            signals_tx,
             write_outcome,
         ));
         let tool_handles = spawn_tool_pipeline(id, &ctx, &read_latched);
@@ -1742,7 +1808,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> PerConversationActor<K, E>
             mailbox: rx,
             write_latched,
             read_latched,
-            blocks_ready: blocks_ready_rx,
+            from_scheduler: signals_rx,
             recheck: write_recheck,
             provider_tx: None,
             streaming: false,
@@ -1848,7 +1914,8 @@ fn spawn_conversations_watcher<K: RuntimeKind, E: RuntimeEvent>(ctx: &RuntimeCon
 
 /// Block watcher — emits [`CoreEvent::BlocksChanged`] when block-related
 /// tables change. Runs globally (not per-conversation). The update hook
-/// provides the rowid, and the conversation id is resolved from the store.
+/// provides the rowid, and the conversation each event names is read from the
+/// row that rowid names.
 ///
 /// The tables it watches are the header, the junction, and the store's own
 /// effective content-table list — the one list the change-hook allowlist is
@@ -1864,63 +1931,77 @@ fn spawn_block_watcher<K: RuntimeKind, E: RuntimeEvent>(ctx: &RuntimeContext<K, 
 
     tokio::spawn(async move {
         reactive!(db_changes, change, {
-            if change.table == "blocks"
+            if !(change.table == "blocks"
                 || change.table == "conversation_blocks"
-                || store.content_tables().iter().any(|t| *t == change.table)
+                || store.content_tables().iter().any(|t| *t == change.table))
             {
-                let block_id = if change.table == "conversation_blocks" {
-                    // For junction table changes, the rowid IS the junction
-                    // row, but we need the block_id. Query it.
-                    let rowid = change.rowid;
-                    match store
-                        .run(move |conn| {
-                            use rusqlite::OptionalExtension;
-                            conn.query_row(
-                                "SELECT block_id FROM conversation_blocks WHERE id = ?1",
-                                [rowid],
-                                |row| row.get::<_, i64>(0),
-                            )
-                            .optional()
-                            .map_err(Into::into)
-                        })
-                        .await
-                    {
-                        Ok(Some(id)) => id,
-                        _ => continue,
-                    }
-                } else {
-                    // The header's rowid is the block id, and a content
-                    // table's block_id is its primary key (= rowid).
-                    change.rowid
-                };
+                continue;
+            }
 
-                match store.conversation_for_block(block_id).await {
-                    Ok(Some(conversation_id)) => {
-                        tracing::debug!(
-                            conversation_id,
-                            block_id,
-                            change_table = %change.table,
-                            change_rowid = change.rowid,
-                            "block watcher: BlocksChanged"
-                        );
-                        bus.emit(CoreEvent::BlocksChanged {
-                            conversation_id,
-                            block_id,
-                        });
+            // Which conversations a change concerns is read from the ROW THE
+            // CHANGE NAMES (2026-09-01), and the two shapes of row answer
+            // differently — which is why the branch is here and not behind a
+            // shared lookup.
+            let announcements: Vec<(i64, i64)> = if change.table == "conversation_blocks" {
+                // A junction row carries both facts itself. Reading the block
+                // from it and then asking which conversation holds that block
+                // was the mis-attribution: a block shared with a fork answered
+                // for whichever join the index reached first, so a fork's own
+                // copies were announced to the conversation they were copied
+                // FROM.
+                match store.joined_block(change.rowid).await {
+                    Ok(Some(joined)) => {
+                        vec![(joined.conversation_id, joined.block_id)]
                     }
-                    Ok(None) => {
-                        // A block with no conversation is a normal transient,
-                        // not a fault: the header and content rows land before
-                        // the junction row inside one flow, so their change
-                        // events can arrive first, and draft blocks live
-                        // unjoined by design. The junction row's own event
-                        // carries the notification, so nothing is missed.
-                        tracing::debug!(block_id, change_table = %change.table, change_rowid = change.rowid, "block watcher: block not joined to a conversation yet");
-                    }
+                    // Gone by read time — a delete, or an insert whose
+                    // transaction rolled back after the hook already fired.
+                    // It attributes nothing and announces nothing.
+                    Ok(None) => continue,
                     Err(e) => {
-                        tracing::warn!(block_id, change_table = %change.table, change_rowid = change.rowid, error = %e, "block watcher: conversation_for_block failed");
+                        tracing::warn!(change_rowid = change.rowid, error = %e, "block watcher: reading the junction row failed");
+                        continue;
                     }
                 }
+            } else {
+                // The header's rowid is the block id, and a content table's
+                // block_id is its primary key (= rowid). This row names no
+                // conversation, so the block's joins are looked up — and EVERY
+                // one of them is told, because a change to a block is a change
+                // for each conversation that reads it.
+                let block_id = change.rowid;
+                match store.conversations_for_block(block_id).await {
+                    Ok(conversations) => conversations
+                        .into_iter()
+                        .map(|conversation_id| (conversation_id, block_id))
+                        .collect(),
+                    Err(e) => {
+                        tracing::warn!(block_id, change_table = %change.table, change_rowid = change.rowid, error = %e, "block watcher: reading a block's conversations failed");
+                        continue;
+                    }
+                }
+            };
+
+            if announcements.is_empty() {
+                // A block joined to nothing is a normal transient, not a
+                // fault: the header and content rows land before the junction
+                // row inside one flow, so their change events can arrive
+                // first, and draft blocks live unjoined by design. The
+                // junction row's own event carries the notification, so
+                // nothing is missed.
+                tracing::debug!(block_id = change.rowid, change_table = %change.table, "block watcher: block not joined to a conversation yet");
+            }
+            for (conversation_id, block_id) in announcements {
+                tracing::debug!(
+                    conversation_id,
+                    block_id,
+                    change_table = %change.table,
+                    change_rowid = change.rowid,
+                    "block watcher: BlocksChanged"
+                );
+                bus.emit(CoreEvent::BlocksChanged {
+                    conversation_id,
+                    block_id,
+                });
             }
         });
     });
@@ -1936,6 +2017,14 @@ fn route_event<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent>(
     routes: &mut HashMap<i64, Vec<ActorEntry>>,
     event: &CoreEvent,
 ) {
+    // An ended set is forgotten before anything is routed (2026-09-01). A set
+    // ends itself when its conversation ceases to exist, and its mailbox
+    // closing IS that end — nothing here is told about it. Forgetting matters
+    // beyond tidiness: the database reuses a deleted conversation's id, and a
+    // fresh conversation that inherits one would otherwise route into the dead
+    // set standing in its place.
+    routes.retain(|_, actors| !actors.iter().any(|actor| actor.tx.is_closed()));
+
     match event.conversation_id() {
         Some(conv_id) => {
             let actors = routes
@@ -2170,8 +2259,8 @@ mod tests {
         );
         assert!(!actor.owed_turn_deferred, "the close consumes the deferral");
         assert!(
-            actor.blocks_ready.try_recv().is_err(),
-            "the actor never produces an owed-turn signal of its own"
+            actor.from_scheduler.try_recv().is_err(),
+            "the actor never produces a scheduler signal of its own"
         );
 
         // A close with nothing swallowed rests: no nudge, no signal — the
@@ -2283,9 +2372,17 @@ mod tests {
         // because the abandoned mark above is a binding-liveness fact and
         // deliberately survives every later close on that seam.
         let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        // A REAL summons: the teardown's status is anchored on the open
+        // turn, and a block id nothing wrote is a broken reference the store
+        // now refuses outright (2026-09-01).
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
         let (mut actor, _recheck) = bare_actor(conv, ctx, false);
         actor.streaming = true;
-        actor.open_turn = Some(11);
+        actor.open_turn = Some(summons);
         actor.handle_stream_done(Some(StopReason::ToolUse));
         actor.handle_interrupt().await;
         assert_eq!(actor.open_turn, None, "the teardown ends the turn");
@@ -4832,7 +4929,8 @@ mod tests {
     ) -> (ConversationActor<BlockKind, CoreEvent>, ReadSignal<u64>) {
         let (read_latched, write_latched) = create_signal(latched);
         let (_mail_tx, mailbox) = tokio::sync::mpsc::unbounded_channel();
-        let (_blocks_ready_tx, blocks_ready) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (_signals_tx, from_scheduler) =
+            tokio::sync::mpsc::unbounded_channel::<SchedulerSignal>();
         let (read_recheck, write_recheck) = create_signal(0u64);
         let actor = ConversationActor {
             id: conv,
@@ -4840,7 +4938,7 @@ mod tests {
             mailbox,
             write_latched,
             read_latched,
-            blocks_ready,
+            from_scheduler,
             recheck: write_recheck,
             provider_tx: None,
             streaming: false,
@@ -6892,11 +6990,12 @@ mod tests {
     }
 
     /// `count` refused rounds on one turn, written the way the runner writes
-    /// them: a call anchored on the turn, resolved through the public store
-    /// surface with the conversation window's own refusal — rendered from
+    /// them: a call anchored on the turn, resolved through the store surface
+    /// the runner itself uses — the one that MARKS the outcome a refusal
+    /// (2026-09-01) — with the conversation window's own refusal rendered from
     /// [`small_window`]'s own numbers through that window's template (the
-    /// per-tool window has a template of its own), so the text here is the
-    /// text the runner would have written under that window. The
+    /// per-tool window has a template of its own), so both the text and the
+    /// stored fact here are what the runner would have written. The
     /// call block between two errors is the reason the run is read as an
     /// outcome SUBSEQUENCE — two tool errors are never neighbours in a
     /// ledger.
@@ -6926,11 +7025,12 @@ mod tests {
                 .await
                 .unwrap();
             ctx.store
-                .fail_tool_call_block(
+                .fail_tool_call_block_marked(
                     conv,
                     id,
                     crate::agency::ToolError::rate_limit_refusal(window.calls, window.seconds),
                     call,
+                    crate::agency::Refusal::Refused,
                 )
                 .await
                 .unwrap()
@@ -7626,6 +7726,265 @@ mod tests {
             answer.dispatch_anchor,
             Some(absorbed),
             "the line's turn anchors on itself, never on the turn that ended over it"
+        );
+    }
+
+    // ─── Unit 51: an actor set lives exactly as long as its conversation ──
+
+    /// Drain every `BlocksChanged` the watcher emitted, as
+    /// `(conversation_id, block_id)` pairs, after giving it a moment to run.
+    /// The watcher is the only emitter in these tests — no reactor is
+    /// spawned — so what arrives here is exactly what it attributed.
+    async fn blocks_changed(
+        rx: &mut tokio::sync::broadcast::Receiver<CoreEvent>,
+    ) -> Vec<(i64, i64)> {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut seen = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let CoreEvent::BlocksChanged {
+                conversation_id,
+                block_id,
+            } = event
+            {
+                seen.push((conversation_id, block_id));
+            }
+        }
+        seen
+    }
+
+    /// F1/AC3 — the deletion itself ends the set, and nothing commanded it.
+    ///
+    /// The conversation is deleted while its set sits idle, so the ONLY change
+    /// the scheduler can wake on is the deletion. It wakes, its drive reads the
+    /// cursor as `None`, and the set ends: the actor's mailbox closes, which is
+    /// also the fact the reactor reads to forget the route.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_deletion_itself_ends_the_actor_set() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+
+        let tx = <ConversationActor<BlockKind, CoreEvent> as PerConversationActor<
+            BlockKind,
+            CoreEvent,
+        >>::spawn(conv, ctx.clone());
+        // Boot-latched sets never drive, so nothing would ever read the
+        // cursor. Release it, then let the set settle into rest.
+        tx.send(CoreEvent::UnlatchRequested {
+            conversation_id: conv,
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !tx.is_closed(),
+            "the set of a conversation that exists stays alive"
+        );
+
+        ctx.store.delete_conversation(conv).await.unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !tx.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the deleted conversation's actor set never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// F1/AC3 — a LATCHED set learns it too (2026-09-01).
+    ///
+    /// The latch stops the ratchet; it never grants a set a life past its
+    /// conversation. This set is never unlatched — it stays boot-latched, the
+    /// same state a stream failure leaves behind — so the only read that can
+    /// end it is the existence read a latched tick makes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_set_ends_when_its_conversation_is_deleted() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+
+        let tx = <ConversationActor<BlockKind, CoreEvent> as PerConversationActor<
+            BlockKind,
+            CoreEvent,
+        >>::spawn(conv, ctx.clone());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !tx.is_closed(),
+            "a latched set of a conversation that exists stays alive"
+        );
+
+        ctx.store.delete_conversation(conv).await.unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !tx.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a latched set outlived its conversation"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// F1 — the scheduler reports the death rather than acting on it, and it
+    /// reports it off the same drive that does everything else.
+    #[tokio::test]
+    async fn a_gone_conversation_signals_the_actor_and_drives_nothing() {
+        let o = Oracle::new().await;
+        o.ctx
+            .store
+            .delete_conversation(o.ctx.conversation_id)
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            scheduler_tick::<BlockKind, _>(&o.ctx, false, &tx).await,
+            None,
+            "a gone conversation publishes no drive outcome"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(SchedulerSignal::ConversationGone)),
+            "the actor is told the conversation is gone"
+        );
+
+        // Latched, the same tick reports the same death: the ratchet does not
+        // run, the existence read does.
+        let (latched_tx, mut latched_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            scheduler_tick::<BlockKind, _>(&o.ctx, true, &latched_tx).await,
+            None,
+            "a latched tick publishes no drive outcome"
+        );
+        assert!(
+            matches!(latched_rx.try_recv(), Ok(SchedulerSignal::ConversationGone)),
+            "a latched set is told the conversation is gone too"
+        );
+    }
+
+    /// F1 — an ended set is forgotten before anything routes, so a conversation
+    /// id the database hands out again cannot land in the dead set standing in
+    /// its place.
+    #[tokio::test]
+    async fn routing_forgets_a_set_whose_actor_ended() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(dead_rx);
+        let mut routes: HashMap<i64, Vec<ActorEntry>> = HashMap::new();
+        routes.insert(
+            conv,
+            vec![ActorEntry {
+                tx: dead_tx,
+                accepts: |_| true,
+            }],
+        );
+
+        // A global event routes to every live set and spawns none.
+        route_event(&ctx, &mut routes, &CoreEvent::UnlatchAll {});
+        assert!(
+            routes.is_empty(),
+            "the ended set is forgotten, not carried forever"
+        );
+
+        // The same id arriving again gets a set of its own.
+        route_event(
+            &ctx,
+            &mut routes,
+            &CoreEvent::UnlatchRequested {
+                conversation_id: conv,
+            },
+        );
+        assert_eq!(routes.len(), 1, "a fresh set is spawned for the id");
+        assert!(
+            !routes[&conv][0].tx.is_closed(),
+            "and it is a live one, not the corpse"
+        );
+    }
+
+    // ─── Unit 51: a change event names the row's own conversation ─────────
+
+    /// F2/AC4 — a junction change is attributed from its own row, so a fork's
+    /// copies announce to the FORK and nothing to the conversation they were
+    /// copied from.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_junction_change_names_the_conversation_on_its_own_row() {
+        let (ctx, source, _probe) = scripted_context(Script::CountOnly).await;
+        let block = ctx
+            .store
+            .insert_text_block(source, crate::block::Role::User, "hello".into())
+            .await
+            .unwrap();
+
+        let mut rx = ctx.bus.subscribe();
+        spawn_block_watcher(&ctx);
+
+        let fork = ctx
+            .store
+            .fork_conversation(source, block, crate::store::ModelOverride::default())
+            .await
+            .unwrap();
+
+        let seen = blocks_changed(&mut rx).await;
+        assert!(
+            seen.contains(&(fork, block)),
+            "the fork's own junction row announces to the fork; saw {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|(conversation, _)| *conversation == source),
+            "and nothing a fork writes is attributed to the source; saw {seen:?}"
+        );
+    }
+
+    /// F2/AC4 — a block joined to more than one conversation is announced to
+    /// EVERY one of them: the row that changed names no conversation, so the
+    /// joins are what answer, all of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shared_blocks_change_is_announced_to_every_conversation() {
+        let (ctx, source, _probe) = scripted_context(Script::CountOnly).await;
+        let block = ctx
+            .store
+            .insert_streaming_block(source, crate::block::Role::Assistant)
+            .await
+            .unwrap();
+        let fork = ctx
+            .store
+            .fork_conversation(source, block, crate::store::ModelOverride::default())
+            .await
+            .unwrap();
+
+        let mut rx = ctx.bus.subscribe();
+        spawn_block_watcher(&ctx);
+
+        ctx.store
+            .append_to_block_by_id(block, "block_text", "hi".into(), "2026-09-01".into())
+            .await
+            .unwrap();
+
+        let seen = blocks_changed(&mut rx).await;
+        assert!(
+            seen.contains(&(source, block)) && seen.contains(&(fork, block)),
+            "both conversations reading the block hear about it; saw {seen:?}"
+        );
+    }
+
+    /// F2/AC4 — a junction row that is gone by the time the watcher reads it
+    /// attributes nothing and announces nothing. Deletion is the ordinary way
+    /// that happens: every one of the conversation's junction rows fires a
+    /// change whose row no longer exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_junction_row_gone_by_read_time_announces_nothing() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        ctx.store
+            .insert_text_block(conv, crate::block::Role::User, "hello".into())
+            .await
+            .unwrap();
+
+        let mut rx = ctx.bus.subscribe();
+        spawn_block_watcher(&ctx);
+
+        ctx.store.delete_conversation(conv).await.unwrap();
+
+        assert_eq!(
+            blocks_changed(&mut rx).await,
+            Vec::new(),
+            "a row read after its delete announces nothing"
         );
     }
 }

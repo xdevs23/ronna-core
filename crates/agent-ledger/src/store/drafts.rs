@@ -208,10 +208,20 @@ impl Store {
             let now = now_iso8601();
             let tx = conn.transaction()?;
 
+            // A conversation with nothing drafted is an ordinary answer, not a
+            // broken database, so it is reported as this library's own refusal
+            // (2026-09-01). Written as a missing row it would read as a query
+            // the design guarantees, and the integrity check would take the
+            // process down for a caller that simply promoted an empty draft.
             let draft_id: i64 = tx
                 .prepare("SELECT id FROM drafts WHERE conversation_id = ?1")?
                 .query_row([conversation_id], |row| row.get(0))
-                .map_err(|_| StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))?;
+                .optional()?
+                .ok_or_else(|| {
+                    StoreError::Other(format!(
+                        "conversation {conversation_id} has no draft to promote"
+                    ))
+                })?;
 
             let draft_blocks: Vec<(i64, String)> = {
                 let mut stmt = tx.prepare(

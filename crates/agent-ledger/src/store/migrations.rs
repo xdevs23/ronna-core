@@ -376,6 +376,21 @@ const MIGRATIONS: &[&str] = &[
         ancestor_conversation_id INTEGER NOT NULL
     );
     ",
+    // v6 (2026-09-01): the refusal fact on a tool failure — whether the call
+    // was REFUSED before it ran, not attempted and failed. The forced
+    // turn end counts a run of refusals, and it used to count them by matching
+    // the opening bytes of the rendered sentence; a second producer of
+    // refusals then needed the same fact, and a framework that matches a
+    // consumer's prose to find it is a decision path nobody can see. So the
+    // fact is stored where every other machine-read fact about a resolution
+    // lives — on the row — and the sentence goes back to being only what the
+    // model reads. Defaulting to 0, like the stamp v4 records: every failure
+    // written before the column reads back as an ordinary failure, which ends
+    // a run exactly as it did. A step, not an edit to v1's CREATE TABLE, for
+    // the reason v3 records.
+    "
+    ALTER TABLE block_tool_error ADD COLUMN refusal INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 /// Apply every unapplied step, advancing `user_version` as each lands.

@@ -272,8 +272,8 @@ impl ToolCall {
         calls
     }
 
-    /// How many of the turn's LAST tool outcomes are tool-call rate-limit
-    /// refusals, counted back from the newest until one is not (2026-08-30).
+    /// How many of the turn's LAST tool outcomes are REFUSALS, counted back
+    /// from the newest until one is not (2026-08-30).
     ///
     /// The outcome SUBSEQUENCE, never raw block adjacency: every refused
     /// round appends the next round's call block behind the previous error,
@@ -282,16 +282,21 @@ impl ToolCall {
     /// errors anchored on `anchor` are the subsequence, in ledger order —
     /// which is the ids' own order for a conversation's appends — and a
     /// result, a gate refusal or any other failure ends the run as an
-    /// ordinary outcome: only a rate-limit refusal means the model is
-    /// looping on a window.
+    /// ordinary outcome: only a refusal means the model spent a round and was
+    /// handed nothing but the reason.
     ///
-    /// EITHER window's refusal counts (2026-08-30, the per-tool windows):
-    /// the conversation's own and a single tool's alike, because both are
-    /// recorded through the one machine prefix
-    /// ([`ToolError::RATE_LIMIT_PREFIX`](super::ToolError::RATE_LIMIT_PREFIX))
-    /// and both mean the same thing — the model is spending rounds on
+    /// EVERY refusal counts, whoever refused (2026-09-01): the conversation's
+    /// own window, a single tool's window, and a consumer's own decline alike,
+    /// because they mean the same thing — the model is spending rounds on
     /// refusals. A model looping on one bounded tool therefore ends its turn
-    /// exactly as a burst does, on the one consecutive limit.
+    /// exactly as a burst does, on the one consecutive limit, and so does one
+    /// reaching for a tool a turn never offered.
+    ///
+    /// Read off the row's own fact ([`Refusal`](super::Refusal)), which is
+    /// what makes that sentence true for a producer this crate has never
+    /// heard of. It was read off the opening bytes of the rendered error until
+    /// the second producer arrived; the supersession is recorded on
+    /// [`ToolError::RATE_LIMIT_PREFIX`](super::ToolError::RATE_LIMIT_PREFIX).
     ///
     /// Anchor-keyed like every other turn fold here, which is also what
     /// keeps an out-of-band call — recorded with a NULL anchor — out of the
@@ -313,7 +318,7 @@ impl ToolCall {
             .take_while(|block| block.id > anchor)
             .filter(|block| block.dispatch_anchor == Some(anchor))
             .filter_map(|block| match BlockKind::from_block(block) {
-                BlockKind::ToolError(error) => Some(error.records_rate_limit_refusal()),
+                BlockKind::ToolError(error) => Some(error.records_refusal()),
                 BlockKind::ToolResult(_) => Some(false),
                 _ => None,
             })

@@ -75,6 +75,18 @@ pub enum ToolOutcome {
     /// The body failed. The runner appends the error block, which resolves the
     /// call just as firmly as a result does — the model reads it and re-plans.
     Error(String),
+    /// The call was REFUSED — declined before it ran, so the model spent a
+    /// round and is handed only the reason (2026-09-01). The runner appends
+    /// the same error block a failure gets, and marks it a refusal on the row.
+    ///
+    /// This is the typed surface for a consumer's own decline. It exists
+    /// because a refusal counts toward the forced end of a looping turn, and
+    /// the framework must be able to know one without reading the consumer's
+    /// sentence: the words are the consumer's, the fact is the framework's.
+    ///
+    /// A body that TRIED and failed answers [`Error`](ToolOutcome::Error)
+    /// instead — the distinction is what the count means.
+    Refused(String),
     /// The body handed the work to a backing system that will resolve the call
     /// itself, later, through the conditional resolution writes
     /// ([`Store::complete_tool_call_block`] /

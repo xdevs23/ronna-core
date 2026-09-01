@@ -66,8 +66,8 @@ use crate::agency::{BlockKind, FromBlock, HarnessMessage, LeafKind, Text};
 use crate::block::{Block, Role};
 
 use super::conversations::{
-    confirm_inherited_history, copy_junction_after, insert_conversation,
-    insert_system_prompt_block, resolve_model_for_fork, resolve_reasoning_for_fork, role_run,
+    ForkSettings, confirm_inherited_history, copy_junction_after, insert_conversation,
+    insert_system_prompt_block, resolve_fork_settings, role_run,
 };
 use super::messages::insert_block;
 use super::{ModelOverride, Store, StoreError, transact};
@@ -240,8 +240,10 @@ impl Store {
         thread: CompactedThread,
     ) -> Result<i64, StoreError> {
         self.run(move |conn| {
-            let model_id = resolve_model_for_fork(conn, source_id, &thread.model)?;
-            let reasoning = resolve_reasoning_for_fork(conn, source_id, &thread.model)?;
+            let ForkSettings {
+                model_id,
+                reasoning,
+            } = resolve_fork_settings(conn, source_id, &thread.model)?;
 
             transact(conn, |tx| {
                 let new_id = insert_conversation(tx, None, model_id, reasoning.as_deref())?;

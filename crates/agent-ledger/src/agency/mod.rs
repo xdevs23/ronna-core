@@ -65,7 +65,7 @@ pub use system_prompt::SystemPrompt;
 pub use text::Text;
 pub use thinking::Thinking;
 pub use tool_call::ToolCall;
-pub use tool_error::ToolError;
+pub use tool_error::{Refusal, ToolError};
 pub use tool_result::ToolResult;
 #[cfg(test)]
 pub(crate) use tool_result::results_with_stamps;

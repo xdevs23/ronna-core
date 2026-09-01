@@ -19,26 +19,78 @@ pub struct ToolError {
     pub tool_call_id: String,
     /// Why it failed.
     pub error: String,
+    /// Whether a standing no declined the call instead of it being attempted —
+    /// the stored fact the forced turn end counts.
+    pub refusal: Refusal,
+}
+
+/// Whether a recorded tool failure is a REFUSAL (2026-09-01).
+///
+/// A refusal is a call a STANDING no declined before it ran: a spent window, a
+/// consumer that offered no tools at all. The model spent a round and got
+/// nothing back but the reason, and nothing it can re-plan inside this turn
+/// changes the answer — so a run of them is a model looping against something
+/// that will keep saying no, which is what the forced turn end exists to stop.
+///
+/// A no the model can ACT on is not one. A tool's own check refusing this
+/// input, a name no registry holds — each hands the model something to
+/// correct, the next round can succeed, and each ends the run as an ordinary
+/// outcome. Which of the two a failure is belongs to whoever refuses it: this
+/// fact is set at the deciding pass and read back off the row, so the answer
+/// is never re-derived from the words the model was handed.
+///
+/// A refused call is still a recorded call and still counts against the
+/// tool-call windows; this fact is about what the model was handed, not about
+/// what was spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// A standing no declined the call. It counts toward the trailing refusal
+    /// run.
+    Refused,
+    /// The call was attempted and failed, or was declined in a way the model
+    /// can correct within the turn. It ends the run, like any ordinary
+    /// outcome.
+    Failed,
+}
+
+impl Refusal {
+    /// The stored form: the row's own column, and the field a parsed block
+    /// carries.
+    #[must_use]
+    pub fn is_refusal(self) -> bool {
+        self == Refusal::Refused
+    }
+
+    /// Read one back from the stored form.
+    #[must_use]
+    pub fn from_stored(refusal: bool) -> Self {
+        if refusal {
+            Refusal::Refused
+        } else {
+            Refusal::Failed
+        }
+    }
 }
 
 impl ToolError {
-    /// The stable machine prefix of a tool-call rate-limit refusal
-    /// (2026-08-30) — the conversation's own window and a single tool's
-    /// window alike, since both mean the same thing to everything that reads
-    /// it back. The error string's own fixed prefix IS the machine key
-    /// here, the way a status row carries its documented key: an error is
-    /// already a durable block the model reads, and a column beside it would
-    /// be a second place recording what one string already says.
+    /// The stable opening of a tool-call rate-limit refusal (2026-08-30) — the
+    /// conversation's own window and a single tool's window alike, since both
+    /// mean the same thing to the model reading them.
     ///
-    /// ONE prefix for both windows (2026-08-30): a prefix per tool would make
-    /// the run the forced end counts read a list of prefixes instead of one
-    /// key — two decisions where one stands.
-    ///
-    /// Read back with a starts-with test, in one place, which is how the
-    /// forced end counts a run of refusals. A handler whose own error opened
-    /// with these bytes would feed that count — knowingly accepted: it is
-    /// vanishingly unlikely, and five consecutive claimed rate limits ending
-    /// the turn is defensible behavior even then.
+    /// **It is prose, not a key (superseded 2026-09-01).** It WAS the machine
+    /// key: the run the forced turn end counts was found by testing these
+    /// bytes against the start of a stored error, on the reasoning that an
+    /// error is already a durable block and a column beside it would record
+    /// twice what one string said. That fell to a second producer. A
+    /// consumer's own decline — a call arriving for a turn that offered no
+    /// tools — must feed the same count, and there are only two ways to reach
+    /// it through a prefix: match the consumer's sentence from in here, which
+    /// hardcodes a vocabulary the framework must never know, or have the
+    /// consumer open its sentence with these bytes, which ships a message that
+    /// lies to the model about what refused it. The fact moved onto the row
+    /// instead ([`Refusal`]), where any producer can set it and no reader has
+    /// to parse anything. What is left here is one shared opening for two
+    /// templates, read by nothing.
     pub const RATE_LIMIT_PREFIX: &'static str = "tool-call rate limit:";
 
     /// The CONVERSATION window's refusal, rendered for the model: the machine
@@ -81,9 +133,10 @@ impl ToolError {
     ///
     /// The tail is where the two templates part: the conversation is still
     /// free to use a different tool, so the advice says so before it says
-    /// wait. The prefix is shared deliberately — a refusal here feeds the
-    /// same run the forced end counts, so a model looping on one bounded tool
-    /// ends its turn exactly as a burst does.
+    /// wait. The opening is shared because the two sentences mean the same
+    /// thing to the model reading them; what makes a refusal here feed the
+    /// run the forced end counts is the fact its row carries
+    /// ([`Refusal`]), the same for both windows.
     #[must_use]
     pub(crate) fn per_tool_rate_limit_refusal(name: &str, calls: usize, seconds: i64) -> String {
         let prefix = Self::RATE_LIMIT_PREFIX;
@@ -112,12 +165,10 @@ impl ToolError {
         "is a contract defect, and this call is refused."
     );
 
-    /// Whether this error is a tool-call rate-limit refusal — either window's,
-    /// since both are written with the one prefix. The read half of
-    /// [`RATE_LIMIT_PREFIX`](Self::RATE_LIMIT_PREFIX), and the only place the
-    /// prefix is matched.
-    pub(crate) fn records_rate_limit_refusal(&self) -> bool {
-        self.error.starts_with(Self::RATE_LIMIT_PREFIX)
+    /// Whether this failure counts toward the trailing refusal run — read off
+    /// the row's own fact, never off its text.
+    pub(crate) fn records_refusal(&self) -> bool {
+        self.refusal.is_refusal()
     }
 }
 
@@ -128,6 +179,17 @@ impl super::LeafKind for ToolError {
         Self {
             tool_call_id: super::string_field(block, "tool_call_id"),
             error: super::string_field(block, "error"),
+            // Read optionally, the turn-ending stamp's own shape: the column
+            // is NOT NULL with a default, so every failure the widening step
+            // backfilled reads as an ordinary failure and ends a run exactly
+            // as it always did.
+            refusal: Refusal::from_stored(
+                block
+                    .fields
+                    .get("refusal")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            ),
         }
     }
 }

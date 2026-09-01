@@ -1430,6 +1430,9 @@ mod tests {
     /// join and one selected column, and the harness message was added to the
     /// prose table's kind list — the first change to the join list since it
     /// was pinned.
+    ///
+    /// Updated 2026-09-01 with the statement: the tool error's existing join
+    /// gained the refusal fact, with the join list itself untouched.
     const PINNED_BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
@@ -1438,7 +1441,7 @@ mod tests {
             btc.role AS btc_role, btc.tool_call_id AS btc_tool_call_id, btc.name AS btc_name, btc.input AS btc_input, btc.interactive AS btc_interactive,
             bstc.role AS bstc_role, bstc.tool_call_id AS bstc_tool_call_id, bstc.name AS bstc_name, bstc.input AS bstc_input,
             btr.tool_call_id AS btr_tool_call_id, btr.content AS btr_content, btr.ends_turn AS btr_ends_turn,
-            bte.tool_call_id AS bte_tool_call_id, bte.error AS bte_error,
+            bte.tool_call_id AS bte_tool_call_id, bte.error AS bte_error, bte.refusal AS bte_refusal,
             bth.role AS bth_role, bth.content AS bth_content, bth.title AS bth_title, bth.summary AS bth_summary,
             bth.opaque_kind AS bth_opaque_kind, bth.opaque_data AS bth_opaque_data, bth.opaque_item_id AS bth_opaque_item_id,
             bs.status AS bs_status, bs.subtitle AS bs_subtitle,
@@ -3097,8 +3100,14 @@ mod tests {
         }
     }
 
-    /// The write is one transaction: a content row the table's own constraints
-    /// refuse takes the header and junction rows down with it.
+    /// The write is one transaction: a content row that fails to go in takes
+    /// the header and junction rows down with it.
+    ///
+    /// The failure is injected as a trigger whose body names a table that does
+    /// not exist, so the content INSERT fails at prepare with `SQLITE_ERROR` —
+    /// an operational failure, the only kind a test may provoke here. A
+    /// constraint violation would be impossible state and would end the
+    /// process instead of returning (see [`super::integrity`]).
     #[tokio::test]
     async fn a_refused_consumer_write_leaves_no_residue_rows() {
         let s = configured_store();
@@ -3123,12 +3132,28 @@ mod tests {
         };
 
         let before = counts(&s).await;
-        // `body` is NOT NULL and no field supplies it, so the content insert
-        // is refused after the header and junction rows were written.
+        s.run(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER refuse_the_note BEFORE INSERT ON block_note
+                 BEGIN INSERT INTO no_such_table_for_the_injected_failure VALUES (1); END",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // The content insert is refused after the header and junction rows
+        // were written.
         assert!(
-            s.append_consumer_block(conv, Some(Role::User), "note", Map::new(), None)
-                .await
-                .is_err()
+            s.append_consumer_block(
+                conv,
+                Some(Role::User),
+                "note",
+                note_fields("body", None),
+                None
+            )
+            .await
+            .is_err()
         );
         assert_eq!(
             counts(&s).await,

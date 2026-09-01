@@ -253,16 +253,26 @@ impl Store {
     /// How far the ratchet has CONFIRMED driving this conversation's ledger.
     /// 0 means nothing is confirmed — the drive re-derives from the start.
     ///
+    /// `None` means the conversation is GONE (2026-09-01): the row that
+    /// carries the cursor is the conversation's own, so its absence is the
+    /// conversation's absence and this read is where the runtime learns it.
+    /// The whole per-conversation machinery derives its existence from this
+    /// answer and never from anything commanding it — the deleter commands
+    /// nothing — so the read that already runs on every drive is also the
+    /// death signal, in one place, with nothing to keep in step.
+    ///
     /// # Errors
     ///
-    /// If the conversation does not exist, or the store's actor has stopped.
-    pub async fn cursor(&self, conversation_id: i64) -> Result<i64, StoreError> {
+    /// If the read fails or the store's actor has stopped. A missing
+    /// conversation is NOT an error: it is the `None` above.
+    pub async fn cursor(&self, conversation_id: i64) -> Result<Option<i64>, StoreError> {
         self.run(move |conn| {
             conn.query_row(
                 "SELECT last_processed_block_id FROM conversations WHERE id = ?1",
                 [conversation_id],
                 |row| row.get(0),
             )
+            .optional()
             .map_err(Into::into)
         })
         .await
@@ -322,12 +332,15 @@ impl Store {
         model: ModelOverride,
     ) -> Result<i64, StoreError> {
         self.run(move |conn| {
-            let model_id = resolve_model_for_fork(conn, source_id, &model)?;
-            let reasoning = resolve_reasoning_for_fork(conn, source_id, &model)?;
+            let settings = resolve_fork_settings(conn, source_id, &model)?;
 
             let tx = conn.transaction()?;
-            let fork_id =
-                insert_conversation(&tx, Some(source_id), model_id, reasoning.as_deref())?;
+            let fork_id = insert_conversation(
+                &tx,
+                Some(source_id),
+                settings.model_id,
+                settings.reasoning.as_deref(),
+            )?;
             copy_junction_up_to(&tx, source_id, fork_id, up_to_block_id)?;
             confirm_inherited_history(&tx, source_id, fork_id)?;
             tx.commit()?;
@@ -442,8 +455,10 @@ impl Store {
         let descriptors = self.descriptors;
         let gate = self.gate.clone();
         self.run(move |conn| {
-            let model_id = resolve_model_for_fork(conn, source_id, &model)?;
-            let reasoning = resolve_reasoning_for_fork(conn, source_id, &model)?;
+            let ForkSettings {
+                model_id,
+                reasoning,
+            } = resolve_fork_settings(conn, source_id, &model)?;
 
             let tx = conn.transaction()?;
 
@@ -579,7 +594,56 @@ struct GroupBounds {
     block_ids: Vec<i64>,
 }
 
-pub(super) fn resolve_model_for_fork(
+/// The refusal every fork entry answers when the conversation it was asked to
+/// fork is not there (2026-09-01).
+///
+/// A source id is the CALLER's, and a caller's id can name a conversation that
+/// was deleted before the call reached the store — the fork family documents
+/// exactly that as an error. Left as a missing row it would read as a query
+/// the design guarantees answers, and the integrity check would end the
+/// process over an argument the caller can simply be told about. The same
+/// reading [`find_group_bounds`] states for its anchor.
+fn no_such_source(source_id: i64) -> StoreError {
+    StoreError::Other(format!("conversation {source_id} does not exist"))
+}
+
+/// What a fork inherits from its source's own row.
+pub(super) struct ForkSettings {
+    /// The model the new conversation opens on.
+    pub model_id: i64,
+    /// Its reasoning level, `None` for the provider's default.
+    pub reasoning: Option<String>,
+}
+
+/// The settings a fork inherits, and the ONE door every fork entry opens with
+/// (2026-09-01).
+///
+/// The source's existence is answered HERE, before a fork inserts anything.
+/// It cannot be left to the reads below: an override supplies both the model
+/// and the reasoning, so neither touches the source row, and the first thing
+/// to meet a deleted source would then be the new conversation's own
+/// `parent_id` — a foreign key the schema declares, which the integrity check
+/// ends the process over. A caller's id gets a caller's answer, and every
+/// entry gets it by construction because every entry needs these settings.
+pub(super) fn resolve_fork_settings(
+    conn: &rusqlite::Connection,
+    source_id: i64,
+    model: &ModelOverride,
+) -> Result<ForkSettings, StoreError> {
+    conn.query_row(
+        "SELECT 1 FROM conversations WHERE id = ?1",
+        [source_id],
+        |_| Ok(()),
+    )
+    .optional()?
+    .ok_or_else(|| no_such_source(source_id))?;
+    Ok(ForkSettings {
+        model_id: resolve_model_for_fork(conn, source_id, model)?,
+        reasoning: resolve_reasoning_for_fork(conn, source_id, model)?,
+    })
+}
+
+fn resolve_model_for_fork(
     conn: &rusqlite::Connection,
     source_id: i64,
     model: &ModelOverride,
@@ -590,11 +654,14 @@ pub(super) fn resolve_model_for_fork(
             let vendor = model.vendor.as_deref().unwrap_or("");
             resolve_model(conn, pid, eid, name, vendor)
         }
-        _ => Ok(conn.query_row(
-            "SELECT model_id FROM conversations WHERE id = ?1",
-            [source_id],
-            |row| row.get(0),
-        )?),
+        _ => conn
+            .query_row(
+                "SELECT model_id FROM conversations WHERE id = ?1",
+                [source_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| no_such_source(source_id)),
     }
 }
 
@@ -609,15 +676,18 @@ fn resolve_override_for_fork(
     match override_value {
         Some(v) if v.is_empty() => Ok(None),
         Some(v) => Ok(Some(v.clone())),
-        None => Ok(conn.query_row(
-            &format!("SELECT {column} FROM conversations WHERE id = ?1"),
-            [source_id],
-            |row| row.get(0),
-        )?),
+        None => conn
+            .query_row(
+                &format!("SELECT {column} FROM conversations WHERE id = ?1"),
+                [source_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| no_such_source(source_id)),
     }
 }
 
-pub(super) fn resolve_reasoning_for_fork(
+fn resolve_reasoning_for_fork(
     conn: &rusqlite::Connection,
     source_id: i64,
     model: &ModelOverride,
@@ -636,10 +706,18 @@ fn find_group_bounds(
     anchor_block_id: i64,
 ) -> Result<GroupBounds, StoreError> {
     let blocks = super::blocks::load_blocks_for_conversation(conn, descriptors, gate, source_id)?;
+    // An anchor from another conversation is a caller's mistake, answered as
+    // this library's own refusal (2026-09-01). Reported as a missing row it
+    // would read as a query the design guarantees, and the integrity check
+    // would end the process over a bad argument.
     let idx = blocks
         .iter()
         .position(|b| b.id == anchor_block_id)
-        .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        .ok_or_else(|| {
+            StoreError::Other(format!(
+                "block {anchor_block_id} is not in conversation {source_id}"
+            ))
+        })?;
     let run = role_run(&blocks, idx);
     let (start, end) = (*run.start(), *run.end());
 
@@ -742,6 +820,30 @@ pub(super) fn confirm_inherited_history(
     Ok(())
 }
 
+/// The source's junction rowid for `block_id` — the cutoff a half-copy is
+/// taken at, and the ONE place the three copies below ask for it.
+///
+/// Absent means the caller named a block the source conversation does not
+/// hold, a source that is itself gone included: its own refusal, for the
+/// reason [`no_such_source`] states.
+fn junction_cutoff(
+    conn: &rusqlite::Connection,
+    source_id: i64,
+    block_id: i64,
+) -> Result<i64, StoreError> {
+    conn.query_row(
+        "SELECT id FROM conversation_blocks WHERE conversation_id = ?1 AND block_id = ?2",
+        (source_id, block_id),
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| {
+        StoreError::Other(format!(
+            "block {block_id} is not in conversation {source_id}"
+        ))
+    })
+}
+
 /// Copy source junction rows up to and including `last_block_id`.
 fn copy_junction_up_to(
     conn: &rusqlite::Connection,
@@ -749,11 +851,7 @@ fn copy_junction_up_to(
     dst_id: i64,
     last_block_id: i64,
 ) -> Result<(), StoreError> {
-    let cutoff: i64 = conn.query_row(
-        "SELECT id FROM conversation_blocks WHERE conversation_id = ?1 AND block_id = ?2",
-        (source_id, last_block_id),
-        |row| row.get(0),
-    )?;
+    let cutoff = junction_cutoff(conn, source_id, last_block_id)?;
     conn.execute(
         "INSERT INTO conversation_blocks (conversation_id, block_id)
          SELECT ?1, block_id FROM conversation_blocks
@@ -776,11 +874,7 @@ pub(super) fn copy_junction_after(
     dst_id: i64,
     last_block_id: i64,
 ) -> Result<(), StoreError> {
-    let cutoff: i64 = conn.query_row(
-        "SELECT id FROM conversation_blocks WHERE conversation_id = ?1 AND block_id = ?2",
-        (source_id, last_block_id),
-        |row| row.get(0),
-    )?;
+    let cutoff = junction_cutoff(conn, source_id, last_block_id)?;
     conn.execute(
         "INSERT INTO conversation_blocks (conversation_id, block_id)
          SELECT ?1, block_id FROM conversation_blocks
@@ -798,11 +892,7 @@ fn copy_junction_before(
     dst_id: i64,
     first_block_id: i64,
 ) -> Result<(), StoreError> {
-    let cutoff: i64 = conn.query_row(
-        "SELECT id FROM conversation_blocks WHERE conversation_id = ?1 AND block_id = ?2",
-        (source_id, first_block_id),
-        |row| row.get(0),
-    )?;
+    let cutoff = junction_cutoff(conn, source_id, first_block_id)?;
     conn.execute(
         "INSERT INTO conversation_blocks (conversation_id, block_id)
          SELECT ?1, block_id FROM conversation_blocks

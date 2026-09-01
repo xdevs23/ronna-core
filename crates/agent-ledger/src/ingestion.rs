@@ -2188,7 +2188,9 @@ mod tests {
         );
         let outcome = crate::agency::ratchet::drive::<crate::agency::BlockKind, _>(&ctx)
             .await
-            .unwrap();
+            .unwrap()
+            .outcome()
+            .expect("the conversation exists");
         assert!(outcome.owes_turn, "the frontier stays owed after the sweep");
     }
 
@@ -2260,14 +2262,20 @@ mod tests {
         )
     }
 
-    /// Inject (or lift) a transient store failure: a RAISE trigger on the
-    /// `blocks` header insert, so every block-committing write fails and its
-    /// transaction rolls back — the finalization-insert failure the guards
-    /// must survive.
+    /// Inject (or lift) a transient store failure: a trigger on the `blocks`
+    /// header insert that reaches for a table which does not exist, so every
+    /// block-committing write fails and its transaction rolls back — the
+    /// finalization-insert failure the guards must survive.
+    ///
+    /// The failure is an OPERATIONAL one on purpose (2026-09-01): a
+    /// `RAISE(ABORT)` is a constraint violation, which the store now reads as
+    /// a database in a state the design forbids and ends the process over.
+    /// What these tests need is the other class — a write that simply did not
+    /// happen — and a missing table is exactly that.
     async fn set_insert_failure(ctx: &AgencyCtx<CoreEvent>, failing: bool) {
         let sql = if failing {
             "CREATE TRIGGER injected_insert_failure BEFORE INSERT ON blocks \
-             BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+             BEGIN INSERT INTO no_such_table_for_the_injected_failure VALUES (1); END"
         } else {
             "DROP TRIGGER injected_insert_failure"
         };
@@ -3056,7 +3064,9 @@ mod tests {
 
         let outcome = crate::agency::ratchet::drive::<crate::agency::BlockKind, _>(&ctx)
             .await
-            .unwrap();
+            .unwrap()
+            .outcome()
+            .expect("the conversation exists");
         assert!(
             !outcome.owes_turn,
             "the empty block settles the frontier — the debt closes once and \
@@ -3383,7 +3393,9 @@ mod tests {
         assert_eq!(count_type(&ctx, "text").await, 1, "only the user's block");
         let outcome = crate::agency::ratchet::drive::<crate::agency::BlockKind, _>(&ctx)
             .await
-            .unwrap();
+            .unwrap()
+            .outcome()
+            .expect("the conversation exists");
         assert!(
             outcome.owes_turn,
             "the errored turn keeps the message owing — nothing buried it"

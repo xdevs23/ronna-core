@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 use crate::agency::{
-    AgencyCtx, BlockKind, FromBlock, GateDecision, RuntimeKind, ToolCall, ToolError,
+    AgencyCtx, BlockKind, FromBlock, GateDecision, Refusal, RuntimeKind, ToolCall, ToolError,
 };
 use crate::block::{Block, Role};
 use crate::bus::RuntimeEvent;
@@ -82,11 +82,13 @@ pub(crate) struct ToolCallWindow {
     pub calls: usize,
     /// The span, in seconds, the count is taken over.
     pub seconds: i64,
-    /// How many of a turn's trailing tool outcomes must all be rate-limit
-    /// refusals before the turn is forced to end between rounds. ONE number
-    /// for the whole runtime: a refusal from this window and a refusal from a
-    /// tool's own [`ToolWindowBound`] lengthen the same run, because both say
-    /// the model is spending rounds on refusals.
+    /// How many of a turn's trailing tool outcomes must all be REFUSALS
+    /// before the turn is forced to end between rounds. ONE number for the
+    /// whole runtime, and one run for every producer: this window's refusal, a
+    /// tool's own [`ToolWindowBound`] refusal and a consumer's own decline all
+    /// lengthen it, because each says the model is spending rounds on
+    /// refusals. What counts is the outcome row's own fact
+    /// ([`Refusal`](crate::agency::Refusal)).
     pub consecutive_limit: usize,
 }
 
@@ -116,7 +118,8 @@ impl Default for ToolCallWindow {
 /// No consecutive limit of its own: the run that forces a turn to end is one
 /// number for the whole runtime
 /// ([`ToolCallWindow::consecutive_limit`]), and both windows' refusals feed it
-/// through the one machine prefix.
+/// the same way every other refusal does — through the fact each outcome row
+/// carries ([`Refusal`](crate::agency::Refusal)).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ToolWindowBound {
     /// How many calls of this tool one conversation may record in the
@@ -508,7 +511,11 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
                     known.join(", ")
                 )
             };
-            self.resolve_with_error(ctx, &call.tool_call_id, unknown, call.id)
+            // An ordinary outcome, not a refusal (2026-09-01): the sentence
+            // above hands the model the names that WOULD resolve, so the next
+            // round can succeed and the model is not looping against a
+            // standing no. See [`Refusal`].
+            self.resolve_with_error(ctx, &call.tool_call_id, unknown, call.id, Refusal::Failed)
                 .await;
             return;
         };
@@ -614,7 +621,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
             seconds,
             "tool runner: {which} is spent — refusing"
         );
-        self.resolve_with_error(ctx, &call.tool_call_id, refusal, call.id)
+        self.resolve_with_error(ctx, &call.tool_call_id, refusal, call.id, Refusal::Refused)
             .await;
         true
     }
@@ -643,8 +650,17 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
             ApprovalState::Unrequested => match handler.gate(&call.input).await {
                 GateDecision::Proceed => true,
                 GateDecision::Refuse { reason } => {
-                    self.resolve_with_error(ctx, &call.tool_call_id, reason, call.id)
-                        .await;
+                    // The tool refused THIS input and said why, so the model
+                    // has something to correct: an ordinary outcome, ending
+                    // the trailing run. See [`Refusal`].
+                    self.resolve_with_error(
+                        ctx,
+                        &call.tool_call_id,
+                        reason,
+                        call.id,
+                        Refusal::Failed,
+                    )
+                    .await;
                     false
                 }
                 GateDecision::Defer => {
@@ -779,7 +795,16 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
                 }
             }
             ToolOutcome::Error(error) => {
-                self.resolve_with_error(ctx, &call.tool_call_id, error, call.id)
+                self.resolve_with_error(ctx, &call.tool_call_id, error, call.id, Refusal::Failed)
+                    .await;
+            }
+            // The consumer DECLINED the call: same recorded outcome, same
+            // re-planning round for the model, and the row carries the fact
+            // (2026-09-01) — so a loop of declines runs into the forced end of
+            // the turn instead of going on until the model tires of it. The
+            // words are the consumer's; the fact is the framework's.
+            ToolOutcome::Refused(reason) => {
+                self.resolve_with_error(ctx, &call.tool_call_id, reason, call.id, Refusal::Refused)
                     .await;
             }
             // An ends-turn tool that defers is refused, loudly (2026-08-30):
@@ -799,6 +824,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
                     &call.tool_call_id,
                     ToolError::ENDS_TURN_DEFERRAL_REFUSAL.to_owned(),
                     call.id,
+                    Refusal::Failed,
                 )
                 .await;
             }
@@ -814,20 +840,28 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
     /// and never an exception that leaves the call dangling. A lost conditional
     /// write is a stale pass — the call already carries an outcome — and is
     /// stood down, never retried.
+    ///
+    /// The caller names WHICH KIND of outcome this is (2026-09-01): a
+    /// [`Refusal::Refused`] is a decision not to run the call, a
+    /// [`Refusal::Failed`] is a run that went wrong. The fact is stored on the
+    /// outcome row, so the forced end of a turn counts refusals off the row
+    /// instead of reading the words back out of the error text.
     async fn resolve_with_error(
         &self,
         ctx: &AgencyCtx<E>,
         tool_call_id: &str,
         error: String,
         call_block_id: i64,
+        refusal: Refusal,
     ) {
         match ctx
             .store
-            .fail_tool_call_block(
+            .fail_tool_call_block_marked(
                 ctx.conversation_id,
                 tool_call_id.to_string(),
                 error,
                 call_block_id,
+                refusal,
             )
             .await
         {
