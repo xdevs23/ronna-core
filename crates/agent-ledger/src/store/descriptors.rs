@@ -238,6 +238,33 @@ pub struct StoreConfig {
     pub descriptors: &'static [ContentDescriptor],
     /// The consumer's domain migrations, run at open before validation.
     pub domain_migrations: Vec<DomainMigrations>,
+    /// Content tables this consumer has WITHDRAWN: kinds it used to define
+    /// and no longer does.
+    ///
+    /// Descriptors are durable facts, so a database that registered a table
+    /// refuses to reopen without it ([`StoreError::MissingDescriptors`]) —
+    /// which, without a way to say this, makes deleting a kind impossible for
+    /// any database that ever carried one. Naming the table here is that way:
+    /// the registry's row for it is no longer a reopen requirement, and the
+    /// domain migration that DROPS the table clears the row in the same step,
+    /// so the withdrawal is a schema change with a record of itself rather
+    /// than a permanent exception carried in code.
+    ///
+    /// The consumer's migration does the dropping and the clearing; the store
+    /// verifies it, after the migrations run. A table named here that is still
+    /// in the schema fails the open, and so does a registry row still standing
+    /// for one — a declared withdrawal whose migration was never written would
+    /// otherwise open onto a table no descriptor covers, reading its blocks
+    /// back as empty content.
+    ///
+    /// A table named here and declared by a descriptor at the same time is
+    /// refused at open: the two statements contradict each other, and
+    /// accepting both would make the withdrawal a silent no-op.
+    ///
+    /// Withdrawing a table that was never registered is legal and does
+    /// nothing, which is what lets a consumer keep the declaration through the
+    /// deployments that never had the table.
+    pub withdrawn_tables: &'static [&'static str],
 }
 
 /// The column name that carries a block's voice in a content table.
@@ -279,6 +306,7 @@ pub(super) const CORE_CONTENT_TABLES: &[&str] = &[
     "block_approval_decision",
     "block_date_marker",
     "block_ancestor_reference",
+    "block_tool_choice",
 ];
 
 /// Ledger tables the change hook announces whose rowid is NOT a block id: the
@@ -323,6 +351,7 @@ const CORE_KINDS: &[&str] = &[
     "title_response",
     "ancestor_reference",
     "harness_message",
+    "tool_choice",
 ];
 
 /// The effective content-table list: the library's own content tables followed
@@ -495,9 +524,24 @@ struct TableColumn {
 pub(super) fn validate(
     conn: &Connection,
     descriptors: &[ContentDescriptor],
+    withdrawn: &[&'static str],
     core_tables: &HashSet<String>,
 ) -> Result<(), StoreError> {
     let descriptor_tables: HashSet<&str> = descriptors.iter().map(|d| d.table).collect();
+    // A withdrawal and a declaration of the same table are two statements
+    // that cannot both be true. Accepting both would leave the descriptor
+    // standing and the withdrawal doing nothing at all, which is the silent
+    // shape this refusal exists to prevent.
+    for table in withdrawn {
+        if descriptor_tables.contains(table) {
+            return Err(StoreError::InvalidDescriptor {
+                table: (*table).to_owned(),
+                reason: "the table is withdrawn and declared by a descriptor at once — a \
+                         withdrawn kind has no descriptor, or the withdrawal says nothing"
+                    .into(),
+            });
+        }
+    }
     let mut claimed_tables: HashSet<&str> = HashSet::new();
     let mut claimed_kinds: HashSet<&str> = HashSet::new();
 
@@ -844,9 +888,15 @@ fn table_shape(conn: &Connection, table: &str) -> Result<Vec<TableColumn>, Store
 /// migrations: a database that was created with descriptors NEEDS them on
 /// every open — read without them it is a different ledger, rendering consumer
 /// blocks as empty content and aborting collection on their references.
+///
+/// A table the configuration WITHDRAWS is exempt: the consumer has stated that
+/// the kind is gone, and the migration that drops the table clears its row in
+/// the same step. Without the exemption the first open after a kind is deleted
+/// fails and the deletion can never happen at all.
 pub(super) fn check_registry(
     conn: &Connection,
     descriptors: &[ContentDescriptor],
+    withdrawn: &[&'static str],
 ) -> Result<(), StoreError> {
     let mut stmt =
         conn.prepare("SELECT table_name, kinds FROM content_descriptors ORDER BY table_name")?;
@@ -869,6 +919,7 @@ pub(super) fn check_registry(
         .collect();
     let tables: Vec<String> = registered
         .into_iter()
+        .filter(|(table, _)| !withdrawn.contains(&table.as_str()))
         .filter(|(table, kinds)| supplied.get(table.as_str()) != Some(kinds))
         .map(|(table, _)| table)
         .collect();
@@ -877,6 +928,57 @@ pub(super) fn check_registry(
     } else {
         Err(StoreError::MissingDescriptors { tables })
     }
+}
+
+/// Check that each withdrawal actually happened. Runs at open AFTER the
+/// consumer's migrations, so it reads the schema those migrations produced.
+///
+/// The contract splits the work in two, and this is the second half: the
+/// consumer's domain migration drops the table and clears its registry row,
+/// and the store verifies that both are true before serving anything. Either
+/// one still standing fails the open, naming the table.
+///
+/// Without this the exemption in [`check_registry`] would be the whole
+/// mechanism, and a consumer that declared the withdrawal but forgot the DROP
+/// would open onto a table no descriptor covers any more — whose blocks read
+/// back as empty core content and whose references abort collection, which is
+/// the exact misread the registry exists to refuse. A withdrawal is a schema
+/// change, and a schema change nobody made is a defect, not a state to serve.
+///
+/// A withdrawal over a database that never had the table passes untouched:
+/// there is no table and no row, which is what lets a consumer keep the
+/// declaration through the deployments that never carried the kind, and
+/// through every reopen after the one that dropped it.
+pub(super) fn check_withdrawals(
+    conn: &Connection,
+    withdrawn: &[&'static str],
+) -> Result<(), StoreError> {
+    for table in withdrawn {
+        let fail = |reason: &str| {
+            Err(StoreError::InvalidDescriptor {
+                table: (*table).to_owned(),
+                reason: reason.to_owned(),
+            })
+        };
+        if table_exists(conn, table)? {
+            return fail(
+                "the table is withdrawn and still in the schema — the domain migration \
+                 that withdraws a kind is what drops its table, and nothing else does",
+            );
+        }
+        let registered: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM content_descriptors WHERE table_name = ?1",
+            [*table],
+            |row| row.get(0),
+        )?;
+        if registered > 0 {
+            return fail(
+                "the table is withdrawn and its content_descriptors row still stands — \
+                 the migration that drops the table clears the row in the same step",
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Record every descriptor's table and kinds durably, making the registry the
@@ -1432,7 +1534,8 @@ mod tests {
     /// was pinned.
     ///
     /// Updated 2026-09-01 with the statement: the tool error's existing join
-    /// gained the refusal fact, with the join list itself untouched.
+    /// gained the refusal fact, with the join list itself untouched, and the
+    /// tool choice added one join and one selected column.
     const PINNED_BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
@@ -1448,7 +1551,8 @@ mod tests {
             bar.for_block_id AS bar_for_block_id,
             bad.for_block_id AS bad_for_block_id, bad.decision AS bad_decision, bad.system_reason AS bad_system_reason, bad.user_reason AS bad_user_reason,
             bdm.date AS bdm_date, bdm.tz_abbrev AS bdm_tz_abbrev, bdm.tz_name AS bdm_tz_name, bdm.written_at AS bdm_written_at,
-            banc.ancestor_conversation_id AS banc_ancestor
+            banc.ancestor_conversation_id AS banc_ancestor,
+            btch.names AS btch_names
      FROM blocks b
      LEFT JOIN block_text bt ON bt.block_id = b.id AND b.block_type IN ('text', 'streaming', 'system_prompt', 'harness_message')
      LEFT JOIN block_quote bq ON bq.block_id = b.id AND b.block_type = 'quote'
@@ -1462,7 +1566,8 @@ mod tests {
      LEFT JOIN block_approval_request bar ON bar.block_id = b.id AND b.block_type = 'approval_request'
      LEFT JOIN block_approval_decision bad ON bad.block_id = b.id AND b.block_type = 'approval_decision'
      LEFT JOIN block_date_marker bdm ON bdm.block_id = b.id AND b.block_type = 'date_marker'
-     LEFT JOIN block_ancestor_reference banc ON banc.block_id = b.id AND b.block_type = 'ancestor_reference'";
+     LEFT JOIN block_ancestor_reference banc ON banc.block_id = b.id AND b.block_type = 'ancestor_reference'
+     LEFT JOIN block_tool_choice btch ON btch.block_id = b.id AND b.block_type = 'tool_choice'";
 
     /// The collector's reference union for a core-only store, spelled out.
     ///
@@ -1492,6 +1597,7 @@ mod tests {
         "block_approval_decision",
         "block_date_marker",
         "block_ancestor_reference",
+        "block_tool_choice",
         "metadata",
     ];
 
@@ -1538,7 +1644,7 @@ mod tests {
     /// fallback), the claimed kinds the query does not serve are exactly
     /// the metadata ledger's, which surface through the metadata read path —
     /// and the parse chain's own claim (`BlockKind::CLAIMED_KINDS`, the const
-    /// the derive checks consumer leaves against) is the same nineteen
+    /// the derive checks consumer leaves against) is the same twenty
     /// strings. Any drift between the claims and what the code serves goes
     /// red here.
     #[test]
@@ -1555,7 +1661,7 @@ mod tests {
         );
         assert_eq!(
             BlockKind::CLAIMED_KINDS.len(),
-            19,
+            20,
             "one claim per core kind, no duplicates"
         );
         for kind in &served {
@@ -1615,6 +1721,7 @@ mod tests {
         "title_response",
         "ancestor_reference",
         "harness_message",
+        "tool_choice",
     ];
 
     static CORE_SET_AS_DESCRIPTORS: &[ContentDescriptor] = &[
@@ -1761,6 +1868,7 @@ mod tests {
     fn note_config() -> StoreConfig {
         StoreConfig {
             descriptors: NOTE_DESCRIPTORS,
+            withdrawn_tables: &[],
             domain_migrations: note_migrations(),
         }
     }
@@ -1985,6 +2093,7 @@ mod tests {
     fn probe_config() -> StoreConfig {
         StoreConfig {
             descriptors: PROBE_DESCRIPTORS,
+            withdrawn_tables: &[],
             domain_migrations: vec![super::DomainMigrations {
                 domain: "probes",
                 sqls: vec![PROBE_SCHEMA],
@@ -2093,6 +2202,7 @@ mod tests {
     async fn a_keyword_named_column_round_trips_safely() {
         let s = Store::in_memory_with(StoreConfig {
             descriptors: KEYWORD_DESCRIPTORS,
+            withdrawn_tables: &[],
             domain_migrations: vec![super::DomainMigrations {
                 domain: "keywords",
                 sqls: vec![KEYWORD_SCHEMA],
@@ -2143,6 +2253,7 @@ mod tests {
                 &path,
                 StoreConfig {
                     descriptors: KEYWORD_DESCRIPTORS,
+                    withdrawn_tables: &[],
                     domain_migrations: vec![super::DomainMigrations {
                         domain: "keywords",
                         sqls: vec![KEYWORD_SCHEMA],
@@ -2162,6 +2273,7 @@ mod tests {
             &path,
             StoreConfig {
                 descriptors: RENAMED,
+                withdrawn_tables: &[],
                 domain_migrations: vec![],
             },
         )
@@ -2172,6 +2284,238 @@ mod tests {
                 if tables == &vec!["block_keyword".to_string()]),
             "the refusal names the table whose registered kinds differ: {err:?}"
         );
+    }
+
+    // ─── Withdrawing a descriptor (2026-09-01) ───────────────────────────
+
+    /// What a consumer's withdrawal migration does: drop the table and clear
+    /// its registry row, in one step, so the schema change and the record of
+    /// it can never come apart.
+    const KEYWORD_WITHDRAWAL: &str = "
+        DROP TABLE block_keyword;
+        DELETE FROM content_descriptors WHERE table_name = 'block_keyword';";
+
+    /// The keyword store's own configuration, at whichever stage of the
+    /// withdrawal the caller is at.
+    fn keyword_config(
+        descriptors: &'static [ContentDescriptor],
+        withdrawn_tables: &'static [&'static str],
+        sqls: Vec<&'static str>,
+    ) -> StoreConfig {
+        StoreConfig {
+            descriptors,
+            withdrawn_tables,
+            domain_migrations: vec![super::DomainMigrations {
+                domain: "keywords",
+                sqls,
+            }],
+        }
+    }
+
+    /// Whether the registry still names a table.
+    async fn registry_names(store: &Store, table: &'static str) -> bool {
+        store
+            .run(move |conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM content_descriptors WHERE table_name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )?;
+                Ok(count > 0)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// AC17 — a database that registered a table reopens after the consumer
+    /// declares the table withdrawn and its domain migration drops it, and the
+    /// registry row is gone afterwards. Without this, deleting a kind is
+    /// impossible for any database that ever carried one: the reopen refuses
+    /// before the migration that would remove it can run.
+    #[tokio::test]
+    async fn a_registered_table_can_be_withdrawn_and_the_database_reopens() {
+        let dir = temp_dir("descriptor-withdrawal");
+        let path = dir.join("ledger.sqlite3");
+        let conv = {
+            let s = Store::open_with(
+                &path,
+                keyword_config(KEYWORD_DESCRIPTORS, &[], vec![KEYWORD_SCHEMA]),
+            )
+            .unwrap();
+            let conv = make_conv(&s).await;
+            let mut fields = Map::new();
+            fields.insert("order".into(), json!(1));
+            s.append_consumer_block(conv, None, "keyword_note", fields, None)
+                .await
+                .unwrap();
+            assert!(registry_names(&s, "block_keyword").await);
+            conv
+        };
+
+        // Without the withdrawal the reopen refuses, which is the state this
+        // mechanism exists for — proven here so the success below is not the
+        // same reading as doing nothing.
+        let refused = Store::open_with(&path, StoreConfig::default())
+            .err()
+            .expect("a registered table refuses an open that neither covers nor withdraws it");
+        assert!(
+            matches!(refused, StoreError::MissingDescriptors { ref tables }
+                if tables == &vec!["block_keyword".to_string()]),
+            "{refused:?}"
+        );
+
+        let s = Store::open_with(
+            &path,
+            keyword_config(
+                &[],
+                &["block_keyword"],
+                vec![KEYWORD_SCHEMA, KEYWORD_WITHDRAWAL],
+            ),
+        )
+        .expect("the withdrawal reopens the database");
+        assert!(
+            !registry_names(&s, "block_keyword").await,
+            "the migration that dropped the table took its registry row with it"
+        );
+        assert_eq!(
+            s.list_conversations().await.unwrap().len(),
+            1,
+            "the rest of the ledger is untouched"
+        );
+        let _ = conv;
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// AC18 — withdrawing a table that was never registered does nothing, and
+    /// reopening twice after a withdrawal succeeds unchanged. Both are what
+    /// let a consumer keep the declaration in place across the deployments
+    /// that never carried the table and the ones that already dropped it.
+    #[tokio::test]
+    async fn a_withdrawal_is_inert_when_unregistered_and_survives_repeated_opens() {
+        // Never registered: the withdrawal names a table this database has
+        // never heard of, and the open is an ordinary one.
+        let unregistered = Store::in_memory_with(StoreConfig {
+            descriptors: &[],
+            withdrawn_tables: &["block_keyword"],
+            domain_migrations: vec![],
+        })
+        .expect("withdrawing what was never registered changes nothing");
+        assert!(!registry_names(&unregistered, "block_keyword").await);
+        make_conv(&unregistered).await;
+
+        // And twice over a database that DID register it: the second and
+        // third opens meet a dropped table, an already-cleared registry, and
+        // a domain migration counter that skips both applied steps.
+        let dir = temp_dir("descriptor-withdrawal-twice");
+        let path = dir.join("ledger.sqlite3");
+        {
+            let s = Store::open_with(
+                &path,
+                keyword_config(KEYWORD_DESCRIPTORS, &[], vec![KEYWORD_SCHEMA]),
+            )
+            .unwrap();
+            make_conv(&s).await;
+        }
+        for attempt in 0..3 {
+            let s = Store::open_with(
+                &path,
+                keyword_config(
+                    &[],
+                    &["block_keyword"],
+                    vec![KEYWORD_SCHEMA, KEYWORD_WITHDRAWAL],
+                ),
+            )
+            .unwrap_or_else(|error| panic!("open {attempt} after the withdrawal: {error}"));
+            assert!(!registry_names(&s, "block_keyword").await);
+            assert_eq!(s.list_conversations().await.unwrap().len(), 1);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A table declared and withdrawn at once is two statements that cannot
+    /// both be true. Accepting them would leave the descriptor standing and
+    /// the withdrawal doing nothing at all, silently.
+    #[test]
+    fn a_table_that_is_declared_and_withdrawn_at_once_is_refused() {
+        let error = Store::in_memory_with(keyword_config(
+            KEYWORD_DESCRIPTORS,
+            &["block_keyword"],
+            vec![KEYWORD_SCHEMA],
+        ))
+        .err()
+        .expect("a contradiction is refused loudly");
+        assert!(
+            matches!(error, StoreError::InvalidDescriptor { ref table, ref reason }
+                if table == "block_keyword" && reason.contains("withdrawn")),
+            "{error:?}"
+        );
+    }
+
+    /// A withdrawal migration that drops the table and leaves the registry row
+    /// behind — the half-done form of [`KEYWORD_WITHDRAWAL`].
+    const KEYWORD_DROP_ONLY: &str = "DROP TABLE block_keyword;";
+
+    /// A database that registered the keyword table, with one conversation in
+    /// it, at the path a withdrawal is then attempted over.
+    async fn keyword_database(label: &str) -> std::path::PathBuf {
+        let dir = temp_dir(label);
+        let path = dir.join("ledger.sqlite3");
+        let s = Store::open_with(
+            &path,
+            keyword_config(KEYWORD_DESCRIPTORS, &[], vec![KEYWORD_SCHEMA]),
+        )
+        .unwrap();
+        make_conv(&s).await;
+        path
+    }
+
+    /// A declared withdrawal whose migration never dropped the table fails the
+    /// open, naming it. The declaration alone stops `check_registry` asking for
+    /// the descriptor, so without this check the open would succeed onto a
+    /// table no descriptor covers any more and read its blocks back as empty
+    /// core content — silently, which is the one outcome the registry exists to
+    /// refuse.
+    #[tokio::test]
+    async fn a_withdrawn_table_still_in_the_schema_fails_the_open() {
+        let path = keyword_database("descriptor-withdrawal-no-drop").await;
+        let error = Store::open_with(
+            &path,
+            keyword_config(&[], &["block_keyword"], vec![KEYWORD_SCHEMA]),
+        )
+        .err()
+        .expect("a withdrawal whose table still stands is refused");
+        assert!(
+            matches!(error, StoreError::InvalidDescriptor { ref table, ref reason }
+                if table == "block_keyword" && reason.contains("still in the schema")),
+            "{error:?}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The other half of the same contract: the table is gone and its registry
+    /// row is not. The row is what a later open reads to decide which
+    /// descriptors a database needs, so leaving it standing hands the next
+    /// consumer a requirement for a table that no longer exists.
+    #[tokio::test]
+    async fn a_withdrawn_tables_registry_row_must_go_with_it() {
+        let path = keyword_database("descriptor-withdrawal-row-left").await;
+        let error = Store::open_with(
+            &path,
+            keyword_config(
+                &[],
+                &["block_keyword"],
+                vec![KEYWORD_SCHEMA, KEYWORD_DROP_ONLY],
+            ),
+        )
+        .err()
+        .expect("a withdrawal whose registry row still stands is refused");
+        assert!(
+            matches!(error, StoreError::InvalidDescriptor { ref table, ref reason }
+                if table == "block_keyword" && reason.contains("row still stands")),
+            "{error:?}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     /// Forked: a new thread deep-copies a consumer block generically from its
@@ -2384,6 +2728,7 @@ mod tests {
     fn cross_ref_config() -> StoreConfig {
         StoreConfig {
             descriptors: CROSS_REF_DESCRIPTORS,
+            withdrawn_tables: &[],
             domain_migrations: vec![super::DomainMigrations {
                 domain: "pins",
                 sqls: vec![CROSS_REF_SCHEMA],
@@ -2577,6 +2922,7 @@ mod tests {
             &db,
             StoreConfig {
                 descriptors: UNDECLARED_COLUMN,
+                withdrawn_tables: &[],
                 domain_migrations: note_migrations(),
             },
         ) {
@@ -2846,6 +3192,7 @@ mod tests {
     async fn open_with_refuses_a_descriptor_naming_a_missing_table() {
         let (table, reason) = open_fails_with(StoreConfig {
             descriptors: MISSING_TABLE,
+            withdrawn_tables: &[],
             domain_migrations: Vec::new(),
         });
         assert_eq!(table, "block_absent");
@@ -2859,12 +3206,14 @@ mod tests {
     async fn open_with_refuses_a_colliding_or_missing_column() {
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: COLLIDING_COLUMN,
+            withdrawn_tables: &[],
             domain_migrations: note_migrations(),
         });
         assert!(reason.contains("collides with the row header"), "{reason}");
 
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: UNDECLARED_COLUMN,
+            withdrawn_tables: &[],
             domain_migrations: note_migrations(),
         });
         assert!(reason.contains("does not exist in the table"), "{reason}");
@@ -2875,6 +3224,7 @@ mod tests {
         // drop it — data loss with no open-time rejection.
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: ANCHOR_COLUMN,
+            withdrawn_tables: &[],
             domain_migrations: note_migrations(),
         });
         assert!(reason.contains("collides with the row header"), "{reason}");
@@ -2907,24 +3257,28 @@ mod tests {
     async fn open_with_refuses_collisions_with_the_core_set_and_between_descriptors() {
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: CORE_KIND_COLLISION,
+            withdrawn_tables: &[],
             domain_migrations: note_migrations(),
         });
         assert!(reason.contains("collides with a library kind"), "{reason}");
 
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: CORE_TABLE_COLLISION,
+            withdrawn_tables: &[],
             domain_migrations: Vec::new(),
         });
         assert!(reason.contains("collides with a library table"), "{reason}");
 
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: KIND_CLAIMED_TWICE,
+            withdrawn_tables: &[],
             domain_migrations: note_migrations(),
         });
         assert!(reason.contains("claimed by another descriptor"), "{reason}");
 
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: CORE_DOMAIN_CLAIM,
+            withdrawn_tables: &[],
             domain_migrations: note_migrations(),
         });
         assert!(reason.contains("library's own"), "{reason}");
@@ -2939,6 +3293,7 @@ mod tests {
     async fn open_with_refuses_a_reference_into_a_library_table() {
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: CORE_TABLE_REFERENCE,
+            withdrawn_tables: &[],
             domain_migrations: note_migrations(),
         });
         assert!(
@@ -2955,6 +3310,7 @@ mod tests {
     async fn open_with_refuses_a_block_id_that_does_not_cascade() {
         let (table, reason) = open_fails_with(StoreConfig {
             descriptors: UNCASCADED_KEY,
+            withdrawn_tables: &[],
             domain_migrations: loose_migrations(),
         });
         assert_eq!(table, "block_loose_note");
@@ -2962,6 +3318,7 @@ mod tests {
 
         let (table, reason) = open_fails_with(StoreConfig {
             descriptors: KEYLESS,
+            withdrawn_tables: &[],
             domain_migrations: loose_migrations(),
         });
         assert_eq!(table, "block_keyless_note");
@@ -3028,6 +3385,7 @@ mod tests {
     async fn open_with_refuses_a_block_id_that_is_not_the_rowid_alias() {
         let (table, reason) = open_fails_with(StoreConfig {
             descriptors: TEXT_KEY,
+            withdrawn_tables: &[],
             domain_migrations: miskeyed_migrations(),
         });
         assert_eq!(table, "block_textkey_note");
@@ -3039,6 +3397,7 @@ mod tests {
     async fn open_with_refuses_a_without_rowid_table() {
         let (table, reason) = open_fails_with(StoreConfig {
             descriptors: NO_ROWID,
+            withdrawn_tables: &[],
             domain_migrations: miskeyed_migrations(),
         });
         assert_eq!(table, "block_norowid_note");
@@ -3049,6 +3408,7 @@ mod tests {
     async fn open_with_refuses_a_blob_affinity_column() {
         let (table, reason) = open_fails_with(StoreConfig {
             descriptors: BLOB_COLUMN,
+            withdrawn_tables: &[],
             domain_migrations: miskeyed_migrations(),
         });
         assert_eq!(table, "block_blob_note");
@@ -3072,6 +3432,7 @@ mod tests {
     async fn open_with_refuses_a_declared_type_the_affinity_cannot_hold() {
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: AFFINITY_MISMATCH,
+            withdrawn_tables: &[],
             domain_migrations: note_migrations(),
         });
         assert!(
@@ -3089,6 +3450,7 @@ mod tests {
         migrations.extend(note_migrations());
         match Store::in_memory_with(StoreConfig {
             descriptors: NOTE_DESCRIPTORS,
+            withdrawn_tables: &[],
             domain_migrations: migrations,
         }) {
             Err(StoreError::Other(message)) => {
@@ -3588,6 +3950,7 @@ mod tests {
     fn remark_store() -> Store {
         Store::in_memory_with(StoreConfig {
             descriptors: REMARK_DESCRIPTORS,
+            withdrawn_tables: &[],
             domain_migrations: remark_migrations(),
         })
         .unwrap()
@@ -3912,6 +4275,7 @@ mod tests {
     async fn open_with_refuses_a_wrong_quotable_declaration() {
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: QUOTABLE_UNDECLARED,
+            withdrawn_tables: &[],
             domain_migrations: remark_migrations(),
         });
         assert!(
@@ -3921,6 +4285,7 @@ mod tests {
 
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: QUOTABLE_NON_TEXT,
+            withdrawn_tables: &[],
             domain_migrations: remark_migrations(),
         });
         assert!(reason.contains("is declared Integer"), "{reason}");
@@ -3929,18 +4294,21 @@ mod tests {
         // the refusal is by declared VARIANT, and this is the pin that says so.
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: QUOTABLE_JSON,
+            withdrawn_tables: &[],
             domain_migrations: remark_migrations(),
         });
         assert!(reason.contains("is declared Json"), "{reason}");
 
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: QUOTABLE_ROLE,
+            withdrawn_tables: &[],
             domain_migrations: remark_migrations(),
         });
         assert!(reason.contains("names the role column"), "{reason}");
 
         let (_, reason) = open_fails_with(StoreConfig {
             descriptors: QUOTABLE_EPHEMERAL,
+            withdrawn_tables: &[],
             domain_migrations: remark_migrations(),
         });
         assert!(reason.contains("ephemeral kind"), "{reason}");

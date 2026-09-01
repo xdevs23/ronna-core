@@ -124,6 +124,42 @@ async fn single_call_parks_then_fires_on_its_result() {
     o.expect_silence();
 }
 
+/// AC1 — a recorded tool choice appended OVER an unanswered message does not
+/// bury it. The record is appended at arbitrary points in a live history, so
+/// an opaque one would make itself the frontier's answer and leave the message
+/// behind it owed by nobody, forever. The frontier reads through it and the
+/// message still owes its turn.
+#[tokio::test]
+async fn a_tool_choice_over_an_unanswered_message_leaves_the_message_owed() {
+    let o = Oracle::new().await;
+    o.user_text("answer me").await;
+    assert!(o.drive().await.owes_turn, "the message owes a turn");
+
+    o.ctx
+        .store
+        .append_tool_choice(o.ctx.conversation_id, vec!["read".into()])
+        .await
+        .unwrap();
+    let outcome = o.drive().await;
+    assert!(
+        outcome.owes_turn,
+        "the record does not answer the message it was appended over"
+    );
+    assert_eq!(
+        outcome.awaiting,
+        Some(crate::types::Awaiting::Model),
+        "the model still owes the turn"
+    );
+
+    // And it is the MESSAGE that is still owed, not the record: answering the
+    // message rests the frontier even with the record standing behind it.
+    o.assistant_text("here you are").await;
+    assert!(
+        !o.drive().await.owes_turn,
+        "with the message answered, nothing is owed"
+    );
+}
+
 // ─── Cursor persistence ordering ─────────────────────────────────────────
 
 /// The crash window: a block's `run()` persisted its effect but the cursor did

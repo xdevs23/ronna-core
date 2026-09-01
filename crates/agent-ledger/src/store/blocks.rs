@@ -8,6 +8,7 @@ use crate::block::{Block, OpaquePayload, ReasoningDetailEntry, Role};
 
 use super::block_content::parse_role;
 use super::descriptors::{ContentDescriptor, overlay_consumer_content, read_quoted_text};
+use super::tool_choice::decode_tool_names;
 use super::{DomainGate, StoreError};
 
 /// One statement joining every LIBRARY content table by name — the core kinds'
@@ -38,6 +39,9 @@ use super::{DomainGate, StoreError};
 /// other text-shaped kinds already share — a kind absent from that IN list
 /// loads its content empty, which is the same silence as a column never
 /// selected.
+///
+/// 2026-09-01, the same lockstep again: the tool choice arrived as a join of
+/// its own, carrying the one column that holds the recorded names.
 pub(super) const BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
@@ -53,7 +57,8 @@ pub(super) const BLOCKS_QUERY: &str = "SELECT
             bar.for_block_id AS bar_for_block_id,
             bad.for_block_id AS bad_for_block_id, bad.decision AS bad_decision, bad.system_reason AS bad_system_reason, bad.user_reason AS bad_user_reason,
             bdm.date AS bdm_date, bdm.tz_abbrev AS bdm_tz_abbrev, bdm.tz_name AS bdm_tz_name, bdm.written_at AS bdm_written_at,
-            banc.ancestor_conversation_id AS banc_ancestor
+            banc.ancestor_conversation_id AS banc_ancestor,
+            btch.names AS btch_names
      FROM blocks b
      LEFT JOIN block_text bt ON bt.block_id = b.id AND b.block_type IN ('text', 'streaming', 'system_prompt', 'harness_message')
      LEFT JOIN block_quote bq ON bq.block_id = b.id AND b.block_type = 'quote'
@@ -67,7 +72,8 @@ pub(super) const BLOCKS_QUERY: &str = "SELECT
      LEFT JOIN block_approval_request bar ON bar.block_id = b.id AND b.block_type = 'approval_request'
      LEFT JOIN block_approval_decision bad ON bad.block_id = b.id AND b.block_type = 'approval_decision'
      LEFT JOIN block_date_marker bdm ON bdm.block_id = b.id AND b.block_type = 'date_marker'
-     LEFT JOIN block_ancestor_reference banc ON banc.block_id = b.id AND b.block_type = 'ancestor_reference'";
+     LEFT JOIN block_ancestor_reference banc ON banc.block_id = b.id AND b.block_type = 'ancestor_reference'
+     LEFT JOIN block_tool_choice btch ON btch.block_id = b.id AND b.block_type = 'tool_choice'";
 
 /// The conversation's last block by junction order, or None when empty.
 ///
@@ -422,6 +428,26 @@ fn structural_payload(
             fields.insert(
                 "ancestor_conversation_id".into(),
                 Value::Number(ancestor.into()),
+            );
+        }
+        // Roleless in the row, and carrying the one list this schema holds in
+        // a column: the tool names, serialized. Read back through the one
+        // decoding of that form, the writer's own `decode_tool_names`, so the
+        // kind is handed a list of strings and the other reader of a stored
+        // row cannot answer differently. A column that does not hold
+        // that list is a corrupt row, not an empty choice — the two mean
+        // opposite things to the resolution — so it is reported instead of
+        // resolving to nothing.
+        "tool_choice" => {
+            let stored = required_str(row, "btch_names", block_id, block_type)?;
+            let names = decode_tool_names(&stored).map_err(|error| {
+                StoreError::Other(format!(
+                    "block {block_id} records a tool choice whose names do not parse: {error}"
+                ))
+            })?;
+            fields.insert(
+                "names".into(),
+                Value::Array(names.into_iter().map(Value::String).collect()),
             );
         }
         // Roleless in the row — its grouping under the harness's voice is the

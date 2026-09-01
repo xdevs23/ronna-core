@@ -41,6 +41,7 @@ mod migrations;
 mod models;
 mod providers;
 mod tool_calls;
+mod tool_choice;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -127,7 +128,9 @@ pub enum StoreError {
     /// missing, a declared column is missing or collides with a reserved name,
     /// or its table or a kind collides with another descriptor or the library's
     /// own set. The open fails loudly instead of leaving a kind that would load
-    /// empty payloads silently.
+    /// empty payloads silently. A withdrawal answers here too, for the same
+    /// reason: a table declared and withdrawn at once, or withdrawn and still
+    /// in the schema, is a declaration the database contradicts.
     #[error("descriptor for table '{table}' is invalid: {reason}")]
     InvalidDescriptor {
         /// The table the failing descriptor names.
@@ -236,6 +239,17 @@ pub struct Store {
     /// Fires whenever a relevant table changes, carrying the action, the table
     /// and the row id per change. Backed by the database's own row change hook.
     pub changes: ChangeLog,
+    /// How many times a conversation's ledger has been loaded through this
+    /// store, counted for the suites that assert a pass reads it a bounded
+    /// number of times.
+    ///
+    /// Test-only, and shared by every clone, so it counts loads made through
+    /// any handle — including one a hook reached for through its own context.
+    /// That is what makes the count able to tell the two outcomes apart: a
+    /// pass that hands its snapshot down and a pass whose callee fetches its
+    /// own read differently here.
+    #[cfg(test)]
+    ledger_loads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Store {
@@ -335,12 +349,14 @@ impl Store {
         let StoreConfig {
             descriptors,
             domain_migrations,
+            withdrawn_tables,
         } = config;
 
         // Descriptors are durable facts: a database created with them refuses
         // an open that does not supply them, before anything else consumer-side
-        // runs.
-        descriptors::check_registry(&conn, descriptors)?;
+        // runs. A table the configuration withdraws is the one exemption, and
+        // it is stated by the consumer, never inferred here.
+        descriptors::check_registry(&conn, descriptors, withdrawn_tables)?;
 
         // The consumer's own migrations, before anything can query: the
         // descriptors are validated against the schema these create, so they
@@ -370,7 +386,14 @@ impl Store {
             premigrated.insert(migration.domain);
         }
 
-        descriptors::validate(&conn, descriptors, &core_tables)?;
+        descriptors::validate(&conn, descriptors, withdrawn_tables, &core_tables)?;
+
+        // The withdrawal's other half, checked now that the migrations have
+        // run: the consumer's migration drops the table and clears its
+        // registry row, and a withdrawal whose schema change never happened
+        // fails the open instead of serving a table no descriptor covers.
+        descriptors::check_withdrawals(&conn, withdrawn_tables)?;
+
         descriptors::record_registry(&conn, descriptors)?;
 
         // A descriptor's domain is ready the moment its schema validated: its
@@ -439,7 +462,25 @@ impl Store {
             content_tables,
             gate,
             changes,
+            #[cfg(test)]
+            ledger_loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// How many ledger loads this store has served, across every clone of the
+    /// handle.
+    #[cfg(test)]
+    pub(crate) fn ledger_loads(&self) -> usize {
+        self.ledger_loads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Count one ledger load. Called by [`Store::list_blocks`] and nowhere
+    /// else, so the number means exactly "how often the whole ledger was
+    /// read".
+    #[cfg(test)]
+    fn count_ledger_load(&self) {
+        self.ledger_loads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The actor loop — owns the connection and executes operations

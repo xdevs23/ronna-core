@@ -147,6 +147,46 @@ impl ToolError {
         )
     }
 
+    /// What the model reads when a call names a tool THIS CONVERSATION does
+    /// not have (2026-09-01), where it has others to reach for.
+    ///
+    /// It lists the conversation's own tools and never the process registry,
+    /// and it is one sentence for two situations on purpose: a name nothing
+    /// ever registered and a name registered but outside this conversation's
+    /// choice read identically, byte for byte. Any difference between the two
+    /// answers would disclose the existence of a tool the conversation was
+    /// deliberately not given, which is exactly what the recorded choice
+    /// exists to stop.
+    ///
+    /// The names arrive already resolved and already sorted; this renders
+    /// them and decides nothing.
+    #[must_use]
+    pub(crate) fn unresolved_tool(name: &str, tools: &[String]) -> String {
+        format!(
+            "unknown tool: {name}. This conversation's tools are: {}",
+            tools.join(", ")
+        )
+    }
+
+    /// What the model reads when a call arrives in a conversation that has NO
+    /// tools (2026-09-01).
+    ///
+    /// It names no tool and says nothing about what this process registered:
+    /// a conversation whose recorded choice is empty has no tools while the
+    /// registry is full, and a sentence about the registry would be a fact
+    /// the model has no business reading and, here, not even a true one.
+    ///
+    /// The empty-registry sentence this replaces asserted exactly that fact.
+    /// An empty registry is now just one of the ways a conversation ends up
+    /// with nothing, and every one of them reads the same.
+    ///
+    /// A constant, not a template, for the reason the deferral refusal below
+    /// is one: there is nothing to interpolate, and the whole answer is that
+    /// nothing here can resolve. Recorded [`Refusal::Refused`] by its caller —
+    /// no next round can succeed, so a run of them ends the turn.
+    pub(crate) const NO_TOOLS_REFUSAL: &'static str =
+        "this conversation has no tools, so no tool call can be answered.";
+
     /// The refusal a deferring ends-turn tool gets (2026-08-30), pinned byte
     /// for byte like every other sentence the model reads back.
     ///

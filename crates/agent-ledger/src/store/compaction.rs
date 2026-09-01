@@ -35,13 +35,16 @@
 //! mechanism
 //!
 //! [`Store::fork_temporary`] forks the first half, records the caller's own
-//! blocks on it, and appends the instructions LAST, as a
+//! blocks on it, records an EMPTY
+//! [`ToolChoice`](crate::agency::ToolChoice) of the library's own, and appends
+//! the instructions LAST, as a
 //! [`HarnessMessage`](crate::agency::HarnessMessage) in the system voice.
 //! That order is not tidiness: that kind is the harness ASKING for a turn, so
 //! appending it is what summons the turn, and everything the caller wants
-//! that turn governed by has to be in the ledger before it lands. The
-//! conversation boots latched like every other, so nothing runs until the
-//! caller unlatches it.
+//! that turn governed by has to be in the ledger before it lands — the empty
+//! choice included, which is what makes the summoned turn a turn with no
+//! tools. The conversation boots latched like every other, so nothing runs
+//! until the caller unlatches it.
 //!
 //! The ask is a KIND, never a voice, and the difference is load-bearing here:
 //! the digest [`Store::open_compacted_thread`] writes is system-voiced prose
@@ -55,10 +58,11 @@
 //! [`Store::open_compacted_thread`] writes, in exactly this order: the
 //! thread's system prompt (configuration, if the caller has one), the
 //! ancestor-reference block naming where the history came from, the
-//! compaction message carrying the captured summary, and then the source's
-//! junction rows from past the cut. Two separate appends for the reference
-//! and the message, never one fused block — they say different things and
-//! the ledger records them as the two facts they are.
+//! compaction message carrying the captured summary, the source's newest tool
+//! choice where it recorded one, and then the source's junction rows from past
+//! the cut. Two separate appends for the reference and the message, never one
+//! fused block — they say different things and the ledger records them as the
+//! two facts they are.
 
 use rusqlite::params;
 
@@ -70,6 +74,7 @@ use super::conversations::{
     insert_system_prompt_block, resolve_fork_settings, role_run,
 };
 use super::messages::insert_block;
+use super::tool_choice::{insert_tool_choice_block, newest_tool_choice};
 use super::{ModelOverride, Store, StoreError, transact};
 
 /// Where one conversation's ledger splits for a compaction.
@@ -176,7 +181,7 @@ impl Store {
     /// and not before. Retiring the temporary conversation once its answer
     /// has been read is the caller's, through
     /// [`delete_conversation`](Store::delete_conversation) — the first
-    /// half's blocks all live on in the source, and only the two blocks this
+    /// half's blocks all live on in the source, and only the blocks this
     /// call and that turn appended are left for the collector.
     ///
     /// # Errors
@@ -203,6 +208,14 @@ impl Store {
             )
             .await?;
         }
+        // The library states this conversation's tool choice, and states it
+        // EMPTY: the turn the instructions summon reads the history in front
+        // of it and writes prose about it, and a tool there is a round
+        // nothing here has a use for. Written by the door that owns the fork,
+        // so no consumer supplies it and no consumer can forget it — and
+        // written after the caller's own records, so the library's word is
+        // the newest one the turn reads.
+        self.append_tool_choice(conversation_id, Vec::new()).await?;
         // Last, and that is the mechanism: this is the block that owes the
         // turn, so nothing the caller wanted recorded first can land behind
         // it.
@@ -254,6 +267,17 @@ impl Store {
                 // blocks: where the history came from, then what it said.
                 insert_ancestor_reference_block(tx, new_id, thread.ancestor_conversation_id)?;
                 insert_compaction_message_block(tx, new_id, &thread.compaction_message)?;
+                // The source's newest tool choice comes across, because a
+                // compacted thread continues the same session and the tools
+                // that session has do not change by being carried forward.
+                // Recorded BEFORE the inherited rows: one of those may itself
+                // owe a turn, and that turn must read this thread's own
+                // choice. A source that recorded none passes none on — the
+                // absence is a record too, and inventing one here would
+                // decide for a consumer that has not decided.
+                if let Some(names) = newest_tool_choice(tx, source_id)? {
+                    insert_tool_choice_block(tx, new_id, &names)?;
+                }
                 copy_junction_after(tx, source_id, new_id, after_block_id)?;
                 // The inherited rows are confirmed exactly as far as the
                 // source confirmed them, so the outbound edge is born

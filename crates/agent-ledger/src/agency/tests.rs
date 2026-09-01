@@ -227,34 +227,41 @@ fn non_user_authored_blocks_await_nothing() {
     }
 }
 
-/// The harness's own message asks the model for a turn, and asks for it in
-/// words: it awaits the model AND is offered no tools. Both facts on the one
-/// kind, so the dispatch never has to know which kind it just read.
+/// The harness's own message asks the model for a turn: it awaits the model,
+/// whatever voice the row carries, so the dispatch never has to know which
+/// kind it just read. What that turn is OFFERED is no longer this kind's
+/// answer — the door that writes this block writes an empty tool choice beside
+/// it, and the dispatch reads that record.
 #[test]
-fn the_harness_message_asks_the_model_for_a_turn_in_words() {
+fn the_harness_message_asks_the_model_for_a_turn() {
     for role in [Some(Role::System), None] {
-        let harness = kind(HarnessMessage::KINDS[0], role);
         assert_eq!(
-            harness.awaiting(),
+            kind(HarnessMessage::KINDS[0], role).awaiting(),
             Some(Awaiting::Model),
             "the ask is the KIND's, not the voice's"
         );
-        assert!(!harness.offers_tools());
     }
+}
 
-    for block_type in AUTHORED_TYPES {
-        for role in [
-            Some(Role::User),
-            Some(Role::Assistant),
-            Some(Role::Tool),
-            Some(Role::System),
-        ] {
-            assert!(
-                kind(block_type, role).offers_tools(),
-                "{block_type} in {role:?} is offered the registry"
-            );
-        }
-    }
+/// AC1 — the recorded tool choice is inert in every direction: it asks
+/// nobody for anything, does its own work by existing, and says nothing to
+/// the model. What it is NOT is opaque to the frontier — that half is
+/// asserted against a stored ledger next door, where the burial it prevents
+/// can actually happen.
+#[test]
+fn the_tool_choice_is_a_record_and_behaves_like_one() {
+    let recorded = kind(ToolChoice::KINDS[0], None);
+    assert_eq!(recorded.awaiting(), None, "a record asks nobody");
+    assert_eq!(
+        recorded.llm_parts(),
+        None,
+        "a record shows the model nothing"
+    );
+    assert_eq!(recorded.llm_text(), None);
+    assert!(
+        recorded.frontier_transparent(),
+        "the frontier reads through it, or a message behind one is owed by nobody"
+    );
 }
 
 /// The harness STATING is not the harness asking (2026-08-31, the review of

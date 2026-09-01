@@ -107,6 +107,7 @@ const CHAT_SCHEMA: &str = "
 fn chat_config() -> StoreConfig {
     StoreConfig {
         descriptors: AssistantKind::DESCRIPTORS,
+        withdrawn_tables: &[],
         domain_migrations: vec![DomainMigrations {
             domain: "chat",
             sqls: vec![CHAT_SCHEMA],

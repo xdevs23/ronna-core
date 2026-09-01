@@ -55,6 +55,7 @@ use crate::providers::{ModelSelector, ProviderRegistry, ProviderRequest, Provide
 use crate::reactive;
 use crate::reactivity::{ReadSignal, WriteSignal, create_signal};
 use crate::store::Store;
+use crate::tools::choice::ResolvedTools;
 use crate::tools::{CallOrigin, ToolRegistry, ToolRunner, submit_approval};
 use crate::types::{ApprovalChoice, InputBlock, StopReason};
 
@@ -1274,18 +1275,15 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             return;
         };
 
-        // What the turn is offered is the ASKING BLOCK's own answer
-        // (2026-08-31, the compaction slice): the registry's definitions for
-        // every ordinary ask, and nothing at all for a kind whose ask is
-        // answered in words alone. Read off the frontier block the owed-turn
-        // decision above just read, through the kind — this site names no
-        // kind and branches on no type string, exactly as it does for the
-        // frontier rule itself.
-        let tool_defs = if K::from_block(tail).offers_tools() {
-            self.ctx.runner.registry().definitions()
-        } else {
-            Vec::new()
-        };
+        // What the turn is offered is the CONVERSATION's own recorded answer
+        // (2026-09-01): the tools its newest tool choice names, intersected
+        // with what this process registered. A ledger carrying no choice is
+        // offered the registry, unchanged from before the record existed; an
+        // empty choice is offered nothing. The runner resolves a call through
+        // the very same function on its own snapshot, so what the model is
+        // shown and what a call resolves against can never disagree — and
+        // this site still names no kind and branches on no type string.
+        let tool_defs = ResolvedTools::of(&blocks, self.ctx.runner.registry()).definitions();
         // The stored form is the level's canonical key; a key this build does
         // not know defers to the provider's own default rather than failing
         // the turn.
@@ -3914,6 +3912,11 @@ mod tests {
         /// window test asserts WHAT a request carried, not just that one
         /// fired.
         seen: Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
+        /// The tool names every request was offered, in arrival order, taken
+        /// before anything else is read off the request — the recorded-choice
+        /// tests assert WHAT the dispatch offered, and an empty offer is one
+        /// of the answers they assert.
+        offered: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
         /// The held-window scripts' latch, shared with the probe: notifying
         /// it lets a held tool round proceed.
         release: Arc<tokio::sync::Notify>,
@@ -4022,6 +4025,7 @@ mod tests {
             let requests = Arc::clone(&self.requests);
             let shapes = Arc::clone(&self.shapes);
             let seen = Arc::clone(&self.seen);
+            let offered = Arc::clone(&self.offered);
             let release = Arc::clone(&self.release);
             let finish = Arc::clone(&self.finish);
             let title_requests = Arc::clone(&self.title_requests);
@@ -4040,6 +4044,14 @@ mod tests {
                         }
                         continue;
                     };
+                    // Recorded FIRST, before the title-derivation branch: a
+                    // turn whose conversation recorded an empty choice is
+                    // offered nothing too, and the tests that assert that need
+                    // to see it.
+                    offered
+                        .lock()
+                        .unwrap()
+                        .push(tools.iter().map(|tool| tool.name.clone()).collect());
                     // The metadata worker shares this provider and its
                     // derivation request is the one carrying no tool
                     // definitions — answer it with a title and keep it out of
@@ -4534,6 +4546,8 @@ mod tests {
         shapes: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
         /// Every turn request's full neutral messages, in arrival order.
         seen: Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
+        /// The tool names every request was offered, in arrival order.
+        offered: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
         /// The held-window scripts' latch: notify it to let a held tool round
         /// proceed. Inert for every other script.
         release: Arc<tokio::sync::Notify>,
@@ -4583,6 +4597,7 @@ mod tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let shapes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
         let release = Arc::new(tokio::sync::Notify::new());
         let finish = Arc::new(tokio::sync::Notify::new());
         let title_requests = Arc::new(AtomicUsize::new(0));
@@ -4592,6 +4607,7 @@ mod tests {
             requests: Arc::clone(&requests),
             shapes: Arc::clone(&shapes),
             seen: Arc::clone(&seen),
+            offered: Arc::clone(&offered),
             release: Arc::clone(&release),
             finish: Arc::clone(&finish),
             title_requests: Arc::clone(&title_requests),
@@ -4626,6 +4642,7 @@ mod tests {
                 requests,
                 shapes,
                 seen,
+                offered,
                 release,
                 finish,
                 title_requests,
@@ -7314,6 +7331,183 @@ mod tests {
             "the end is anchored on the turn the LEDGER still owed"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ─── What a turn is offered (2026-09-01) ─────────────────────────────
+
+    /// Dispatch one turn off a fresh summons and answer what the request was
+    /// offered, in the order the definitions arrived.
+    async fn offered_by_one_dispatch(
+        ctx: &RuntimeContext<BlockKind, CoreEvent>,
+        conv: i64,
+        probe: &ComposedProbe,
+    ) -> Vec<String> {
+        ctx.store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert!(actor.streaming, "the turn dispatched");
+        // The request crosses a channel into the provider's own task, so the
+        // read waits for it to arrive instead of assuming it already has.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let offered = probe.offered.lock().unwrap().clone();
+            if let [only] = offered.as_slice() {
+                return only.clone();
+            }
+            assert!(
+                offered.len() < 2,
+                "exactly one request went out, got {offered:?}"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out awaiting the dispatched request"
+            );
+            drop(offered);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// AC3 — the dispatch offers exactly the definitions the conversation's
+    /// newest recorded choice names, and nothing else the registry holds.
+    #[tokio::test]
+    async fn a_recorded_choice_offers_exactly_the_tools_it_names() {
+        let (ctx, conv, probe) = scripted_context(Script::CountOnly).await;
+        assert!(
+            ctx.runner().registry().names().count() > 2,
+            "the registry holds more than the choice names, or this proves nothing"
+        );
+        ctx.store
+            .append_tool_choice(conv, vec!["echo".into(), "park".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            offered_by_one_dispatch(&ctx, conv, &probe).await,
+            vec!["echo".to_owned(), "park".to_owned()]
+        );
+    }
+
+    /// AC4 — an empty recorded choice offers no definitions at all, with a
+    /// full registry loaded the whole time.
+    #[tokio::test]
+    async fn an_empty_recorded_choice_offers_nothing() {
+        let (ctx, conv, probe) = scripted_context(Script::CountOnly).await;
+        assert!(ctx.runner().registry().names().count() > 0);
+        ctx.store
+            .append_tool_choice(conv, Vec::new())
+            .await
+            .unwrap();
+
+        assert!(
+            offered_by_one_dispatch(&ctx, conv, &probe).await.is_empty(),
+            "an empty choice is a decision, and the decision is nothing"
+        );
+    }
+
+    /// AC5 — a conversation that recorded no choice is offered every
+    /// registered definition, unchanged from before the record existed. The
+    /// record is an exposure decision; a ledger carrying none filters nothing.
+    #[tokio::test]
+    async fn a_conversation_with_no_recorded_choice_is_offered_the_registry() {
+        let (ctx, conv, probe) = scripted_context(Script::CountOnly).await;
+        let registered: Vec<String> = ctx.runner().registry().names().map(str::to_owned).collect();
+
+        assert_eq!(
+            offered_by_one_dispatch(&ctx, conv, &probe).await,
+            registered
+        );
+    }
+
+    /// AC6 — a recorded name the registry does not hold is offered to nobody:
+    /// the intersection is the whole rule, and the state is reachable, because
+    /// a restart can register fewer tools than a persisted record names.
+    #[tokio::test]
+    async fn a_recorded_name_the_registry_lost_is_offered_to_nobody() {
+        let (ctx, conv, probe) = scripted_context(Script::CountOnly).await;
+        ctx.store
+            .append_tool_choice(conv, vec!["echo".into(), "departed".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            offered_by_one_dispatch(&ctx, conv, &probe).await,
+            vec!["echo".to_owned()],
+            "the name the registry no longer holds resolves to nothing"
+        );
+    }
+
+    /// AC11 — a conversation with an empty choice cannot resolve anything the
+    /// model calls, so each call is refused, and a run of those as long as the
+    /// configured consecutive limit forces the turn to end: no request is
+    /// spent, the end is written down anchored on the turn, and the held
+    /// identity is released.
+    #[tokio::test]
+    async fn a_run_of_unresolvable_calls_in_a_toolless_conversation_ends_the_turn() {
+        let (ctx, conv, probe) = scripted_context(Script::CountOnly).await;
+        let limit = ctx.runner().window().consecutive_limit;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        ctx.store
+            .append_tool_choice(conv, Vec::new())
+            .await
+            .unwrap();
+
+        // The model spends a round on a call each time, through the REAL
+        // chokepoint: nothing resolves, so every one is refused.
+        let agency = ctx.agency(conv);
+        for round in 0..limit {
+            let call = ctx
+                .runner
+                .insert_call(
+                    &agency,
+                    false,
+                    format!("toolless-{round}"),
+                    "echo".into(),
+                    "{}".into(),
+                    CallOrigin::streamed(None, Some(summons)),
+                )
+                .await
+                .unwrap();
+            ctx.runner.run_wakeup(&agency, false, call).await;
+        }
+
+        let blocks = ctx.store.list_blocks(conv).await.unwrap();
+        let refusals: Vec<&Block> = blocks
+            .iter()
+            .filter(|block| block.block_type == "tool_error")
+            .collect();
+        assert_eq!(refusals.len(), limit, "one refusal per round");
+        assert!(
+            refusals.iter().all(|block| {
+                block.fields["error"].as_str().unwrap()
+                    == "this conversation has no tools, so no tool call can be answered."
+                    && block.fields["refusal"].as_bool().unwrap()
+            }),
+            "each one says the conversation has no tools and records itself a refusal"
+        );
+
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.open_turn = Some(summons);
+        actor.handle_blocks_ready().await;
+
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            0,
+            "the dispatch stood down before it spent"
+        );
+        assert_eq!(
+            status_markers(&ctx, conv).await,
+            vec![("tool_calls_exhausted".to_owned(), Some(summons))],
+            "the turn's end is written down, anchored on the turn"
+        );
+        assert_eq!(actor.open_turn, None, "the append released the identity");
+        assert!(!actor.streaming, "nothing was dispatched");
     }
 
     // ─── The per-tool windows (2026-08-30) ───────────────────────────────

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_ledger::agency::{
-    Agency, AncestorReference, Awaiting, FromBlock, HarnessMessage, LeafKind, Text,
+    Agency, AncestorReference, Awaiting, FromBlock, HarnessMessage, LeafKind, Text, ToolChoice,
 };
 use agent_ledger::providers::{
     BoxFuture, LlmError, ModelInfo, ProviderModule, ProviderRequest, ProviderResponse, ProviderRx,
@@ -252,7 +252,8 @@ async fn captured_answer(
 ///
 /// The tool count is the one assertion that cannot be made from the ledger:
 /// the harness's turn is offered NOTHING, while the registry holds a tool
-/// the whole time.
+/// the whole time. What makes that true is in the ledger, and asserted there
+/// too — the empty tool choice this door writes itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_consumer_cuts_a_ledger_and_summarizes_its_first_half() {
     let (ctx, offered) = consumer_runtime().await;
@@ -289,14 +290,37 @@ async fn a_consumer_cuts_a_ledger_and_summarizes_its_first_half() {
         .await
         .unwrap();
     let held = store.list_blocks(temporary.conversation_id).await.unwrap();
+    let choice_at = held.len() - 2;
     assert_eq!(
         held.iter().map(|block| block.id).collect::<Vec<i64>>(),
         {
             let mut ids = source_ids[..=at].to_vec();
+            ids.push(held[choice_at].id);
             ids.push(temporary.instructions_block_id);
             ids
         },
-        "the temporary conversation is the first half plus the harness message"
+        "the temporary conversation is the first half, the library's own tool choice, \
+         and the harness message"
+    );
+    // AC13 — the library states this conversation's tools, states them EMPTY,
+    // and states them BEFORE the block that summons the turn. No consumer
+    // supplied it: the fork above was handed no records at all.
+    assert_eq!(
+        held[choice_at].block_type,
+        ToolChoice::KINDS[0],
+        "the fork records the choice itself"
+    );
+    assert!(
+        ToolChoice::parse(&held[choice_at]).names.is_empty(),
+        "and the choice it records is the empty one"
+    );
+    assert_eq!(
+        store
+            .newest_tool_choice(temporary.conversation_id)
+            .await
+            .unwrap(),
+        Some(Vec::new()),
+        "so the turn the instructions summon reads an empty choice"
     );
     let instructions = held.last().unwrap();
     assert_eq!(
@@ -329,7 +353,7 @@ async fn a_consumer_cuts_a_ledger_and_summarizes_its_first_half() {
     );
 
     // Retired junction-only: the first half's blocks all live on in the
-    // source, and only this conversation's own two are left behind.
+    // source, and only this conversation's own are left behind.
     store
         .delete_conversation(temporary.conversation_id)
         .await
@@ -431,5 +455,173 @@ async fn a_consumer_opens_the_thread_the_summary_carries() {
         AncestorReference::parse(&blocks[1]).conversation_id,
         source,
         "the record survives the conversation it names"
+    );
+}
+
+/// AC14 — a compacted thread continues the same session, so the tools that
+/// session has come across with it: the new thread's newest choice equals the
+/// source's, and it is recorded ahead of the inherited history, one of whose
+/// blocks may itself owe a turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compacted_thread_carries_the_sources_newest_tool_choice() {
+    let (ctx, _offered) = consumer_runtime().await;
+    let store = ctx.store();
+    let source = conversation(&ctx).await;
+    store
+        .append_tool_choice(source, vec!["lookup".into()])
+        .await
+        .unwrap();
+    // A later append supersedes the first: what comes across is the NEWEST
+    // record, not the first one the session ever made.
+    store
+        .append_tool_choice(source, vec!["lookup".into(), "recall".into()])
+        .await
+        .unwrap();
+    let cut = store
+        .compaction_cut(source)
+        .await
+        .unwrap()
+        .expect("the ledger splits");
+
+    let thread = store
+        .open_compacted_thread(
+            source,
+            cut.first_half_ends,
+            CompactedThread {
+                ancestor_conversation_id: source,
+                system_prompt: None,
+                compaction_message: SUMMARY.into(),
+                model: ModelOverride::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.newest_tool_choice(thread).await.unwrap(),
+        store.newest_tool_choice(source).await.unwrap(),
+        "the thread continues the session, and so do its tools"
+    );
+    let blocks = store.list_blocks(thread).await.unwrap();
+    let at = blocks
+        .iter()
+        .position(|block| block.block_type == ToolChoice::KINDS[0])
+        .expect("the thread carries the choice");
+    assert_eq!(
+        ToolChoice::parse(&blocks[at]).names,
+        vec!["lookup".to_owned(), "recall".to_owned()]
+    );
+    let inherited = blocks
+        .iter()
+        .position(|block| block.id == cut.second_half_begins)
+        .expect("the second half rides across");
+    assert!(
+        at < inherited,
+        "the record is in place before the history that may owe a turn"
+    );
+}
+
+/// AC14, the overlap it leaves open — a source whose newest record lies PAST
+/// the cut hands that record across twice: once written by the opening, once
+/// inherited with the second half, which carries the source's rows verbatim.
+///
+/// Both name the same tools, and a later record superseding an earlier one is
+/// the kind's own rule, so the copy IS the same decision stated twice and both
+/// readers of the thread answer exactly what the source said. Suppressing the
+/// second one costs more than it saves: the junction copy is general and
+/// carries every kind alike, and teaching it about this one would put the
+/// kind's name inside a mechanism that must not know it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_past_the_cut_rides_across_twice_and_answers_the_same() {
+    let (ctx, _offered) = consumer_runtime().await;
+    let store = ctx.store();
+    let source = conversation(&ctx).await;
+    let cut = store
+        .compaction_cut(source)
+        .await
+        .unwrap()
+        .expect("the ledger splits");
+    // Recorded after the cut was taken, so the record sits in the half that
+    // rides across verbatim.
+    store
+        .append_tool_choice(source, vec!["lookup".into()])
+        .await
+        .unwrap();
+
+    let thread = store
+        .open_compacted_thread(
+            source,
+            cut.first_half_ends,
+            CompactedThread {
+                ancestor_conversation_id: source,
+                system_prompt: None,
+                compaction_message: SUMMARY.into(),
+                model: ModelOverride::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let blocks = store.list_blocks(thread).await.unwrap();
+    assert_eq!(
+        blocks
+            .iter()
+            .filter(|block| block.block_type == ToolChoice::KINDS[0])
+            .count(),
+        2,
+        "the written record and the inherited one both land"
+    );
+    assert_eq!(
+        store.newest_tool_choice(thread).await.unwrap(),
+        Some(vec!["lookup".to_owned()]),
+        "the statement reads the source's tools and no shortened list"
+    );
+    assert_eq!(
+        ToolChoice::newest_in(&blocks)
+            .expect("the thread carries the record")
+            .names,
+        vec!["lookup".to_owned()],
+        "and the ledger fold agrees with it"
+    );
+}
+
+/// AC14's other half — a source that recorded no choice hands none on.
+/// Inventing one here would decide for a consumer that has not decided, and
+/// the two answers are different: no record is every registered tool, an
+/// empty record is none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compacted_thread_of_a_choiceless_source_records_no_choice() {
+    let (ctx, _offered) = consumer_runtime().await;
+    let store = ctx.store();
+    let source = conversation(&ctx).await;
+    let cut = store
+        .compaction_cut(source)
+        .await
+        .unwrap()
+        .expect("the ledger splits");
+
+    let thread = store
+        .open_compacted_thread(
+            source,
+            cut.first_half_ends,
+            CompactedThread {
+                ancestor_conversation_id: source,
+                system_prompt: None,
+                compaction_message: SUMMARY.into(),
+                model: ModelOverride::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(store.newest_tool_choice(thread).await.unwrap(), None);
+    assert!(
+        store
+            .list_blocks(thread)
+            .await
+            .unwrap()
+            .iter()
+            .all(|block| block.block_type != ToolChoice::KINDS[0]),
+        "nothing invented a record the source never made"
     );
 }
