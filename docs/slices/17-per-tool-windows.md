@@ -123,8 +123,8 @@ builder holds the runner's sole reference (slice 16's carrier decision);
 
 ## Notes for launch
 
-- Framework worktree branch `slice/per-tool-window` from `master`. Build first
-  step: `git rebase master`.
+- Framework worktree branch `slice/per-tool-window` from `main`. Build first
+  step: `git rebase main`.
 - The app's one builder line (`lookup_release`, six per sixty) is the consuming
   application's own commit, landing with the pin move that ships this slice —
   named here, built there.

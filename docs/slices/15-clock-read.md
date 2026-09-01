@@ -49,7 +49,7 @@ this slice is the projected line above, nothing else.
 
 ## Notes for launch
 
-Branches from `master` (worktree `~/projects/agent-ledger-clock`, branch
+Branches from `main` (worktree `~/projects/agent-ledger-clock`, branch
 `slice/clock-read`). Site: `store/date_markers.rs` (or the module its conventions
 prefer for a public reading), tests beside it. The consumer half is the app
-repository's unit 34, which builds only after this merges to master.
+repository's unit 34, which builds only after this merges to main.

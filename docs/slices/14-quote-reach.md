@@ -190,8 +190,8 @@ migration, no new dependency, no change to any existing render pin's meaning.
 
 ## Notes for launch
 
-- Branches from `master` (worktree `~/projects/agent-ledger-quote-reach`, branch
-  `unit/quote-reach`; rebase onto master's tip at launch — 738bfe0 or later, which
+- Branches from `main` (worktree `~/projects/agent-ledger-quote-reach`, branch
+  `unit/quote-reach`; rebase onto main's tip at launch — 738bfe0 or later, which
   carries slices 13 and 15 plus the user-agent change; only slice 12, async
   projection, remains unmerged). Sites:
   `store/descriptors.rs` (the field, open-time validation in `validate_columns`),

@@ -177,7 +177,7 @@ message.
 
 ## Notes for launch
 
-- Branches from `master` (worktree `~/projects/agent-ledger-noresponse`, branch
+- Branches from `main` (worktree `~/projects/agent-ledger-noresponse`, branch
   `unit/empty-turn-closes-debt`). The discard is `ingestion.rs::finalize_streamed_text_tail`
   (~803) and the empty `ContentFinal`/`TextFinal` arms (~705, ~856); the owed decision is
   `ratchet.rs` (~191); the projection is `agency/projection.rs` (~101); the stream signals are

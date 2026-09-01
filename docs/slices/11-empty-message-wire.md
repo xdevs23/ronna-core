@@ -122,7 +122,7 @@ and no new configuration.
 
 ## Notes for launch
 
-- Branches from `master` (worktree `~/projects/agent-ledger-echo`, branch
+- Branches from `main` (worktree `~/projects/agent-ledger-echo`, branch
   `unit/echo-empty-message`). Sites: `providers/empty.rs` (what counts as empty, and the
   record), `providers/chat/base.rs` (the `refuses_empty_assistant` seam and its gated call
   sites), `providers/mistral.rs` (sets it), `providers/anthropic/mod.rs` (converts),

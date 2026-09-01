@@ -251,7 +251,7 @@ through the summons bound (`ratchet.rs:234-263`), not through an opaque cap.
 ## Notes for launch
 
 - Worktree `~/projects/agent-ledger-toolcap`, branch `slice/tool-round-ceiling`,
-  from `master` (`f2bf250`). Build first step: `git rebase master`.
+  from `main` (`f2bf250`). Build first step: `git rebase main`.
 - The key vocabulary's recorded claims that go stale with the widening are
   touched in the same change: `Status::records_turn_end`'s own doc ("the exact
   two machine keys the close writes", `records.rs:42-44`), the

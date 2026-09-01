@@ -236,7 +236,7 @@ deliberately and byte-exactly with the schema.
 
 ## Notes for launch
 
-- Branches from `master` (worktree `~/projects/agent-ledger-dated-appends`, branch
+- Branches from `main` (worktree `~/projects/agent-ledger-dated-appends`, branch
   `unit/dated-consumer-appends`). Sites: `store/date_markers.rs` (the widened seam, the
   stamp type and constructor, the change-detection rule and its tests),
   `store/descriptors.rs` (`append_consumer_block`, its stamped sibling, the amended
