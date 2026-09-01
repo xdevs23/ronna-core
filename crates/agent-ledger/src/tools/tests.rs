@@ -82,7 +82,9 @@ async fn tick(ctx: &AgencyCtx<CoreEvent>, latched: bool) -> Option<ratchet::Outc
     }
     let outcome = ratchet::drive::<BlockKind, _>(ctx)
         .await
-        .expect("the drive reads its ledger");
+        .expect("the drive reads its ledger")
+        .outcome()
+        .expect("the conversation exists");
     redispatch::walk::<BlockKind, _>(ctx)
         .await
         .expect("the walk unwinds");
@@ -1607,8 +1609,8 @@ async fn error_texts(ctx: &AgencyCtx<CoreEvent>) -> Vec<String> {
 
 /// The window's numbers ARE the operator's decision, recorded once as the
 /// defaults, and its refusal reads exactly as specified at those defaults —
-/// pinned byte for byte, because the model reads this sentence and the forced
-/// end matches its prefix.
+/// asserted byte for byte, because the model reads this sentence and acts on
+/// it. The forced end reads the row's own fact, never these bytes.
 #[test]
 fn the_default_window_and_its_refusal_are_pinned() {
     let window = ToolCallWindow::default();
@@ -1632,7 +1634,7 @@ fn the_default_window_and_its_refusal_are_pinned() {
     assert!(
         crate::agency::ToolError::rate_limit_refusal(3, 30)
             .starts_with(crate::agency::ToolError::RATE_LIMIT_PREFIX),
-        "every refusal opens with the machine prefix"
+        "both window templates open the same way for the model reading them"
     );
 }
 
@@ -1966,11 +1968,12 @@ fn per_tool_refusal(name: &str, calls: usize, seconds: i64) -> String {
     crate::agency::ToolError::per_tool_rate_limit_refusal(name, calls, seconds)
 }
 
-/// The two templates read as two sentences, and both open with the ONE machine
-/// prefix the forced end matches on — which is what makes a per-tool refusal
-/// feed the same run a conversation-wide one does.
+/// The two templates read as two sentences and share one opening, because
+/// both refusals mean the same thing to the model. What makes a per-tool
+/// refusal feed the same run a conversation-wide one does is the fact its own
+/// row carries, asserted where the count is.
 #[test]
-fn the_two_refusal_templates_differ_and_share_the_one_prefix() {
+fn the_two_refusal_templates_differ_and_share_the_one_opening() {
     let conversation = crate::agency::ToolError::rate_limit_refusal(6, 60);
     let per_tool = per_tool_refusal("counter", 6, 60);
 
@@ -2607,5 +2610,106 @@ async fn a_park_call_the_window_refuses_does_not_end_the_turn() {
         crate::agency::ToolCall::outcomes_anchored_in(&ledger, summons),
         1,
         "the error asks for a continuation; the stamped result before it does not"
+    );
+}
+
+/// A consumer tool that DECLINES the call: it read the request, decided
+/// against it, and hands back only the reason.
+struct DeclineProbe;
+
+impl ToolHandler<CoreEvent> for DeclineProbe {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "decline".into(),
+            description: "a test-only declining tool".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _input: &'a str,
+        _ctx: ToolContext<'a, CoreEvent>,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async { ToolOutcome::Refused("not this one".into()) })
+    }
+}
+
+/// A consumer tool that TRIED and failed — the same outcome shape, the other
+/// fact.
+struct BreakProbe;
+
+impl ToolHandler<CoreEvent> for BreakProbe {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "break".into(),
+            description: "a test-only failing tool".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _input: &'a str,
+        _ctx: ToolContext<'a, CoreEvent>,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async { ToolOutcome::Error("the file system said no".into()) })
+    }
+}
+
+/// F3 — a consumer's decline counts toward the forced turn end and a
+/// consumer's failure does not, decided off the stored fact on the outcome row
+/// and never off the sentence. The framework matches no consumer vocabulary:
+/// the words are the tool's, the fact is [`ToolOutcome::Refused`] versus
+/// [`ToolOutcome::Error`].
+#[tokio::test]
+async fn a_consumers_decline_counts_toward_the_forced_end_and_its_failure_does_not() {
+    let mut registry = ToolRegistry::new();
+    registry.register("decline", DeclineProbe);
+    registry.register("break", BreakProbe);
+    let runner = ToolRunner::<BlockKind, _>::new(Arc::new(registry));
+    let o = Oracle::new().await;
+    let summons = o.user_text("go").await;
+
+    let run = |o: &Oracle| {
+        let ctx = o.ctx.clone();
+        async move {
+            let ledger = ctx.store.list_blocks(ctx.conversation_id).await.unwrap();
+            crate::agency::ToolCall::trailing_refusal_run(&ledger, summons)
+        }
+    };
+
+    drive_anchored_call(&runner, &o.ctx, "d-1", "decline", summons).await;
+    assert_eq!(run(&o).await, 1, "the decline is a refusal");
+
+    drive_anchored_call(&runner, &o.ctx, "b-1", "break", summons).await;
+    assert_eq!(
+        run(&o).await,
+        0,
+        "a failure is not a refusal, and it breaks the trailing run"
+    );
+
+    drive_anchored_call(&runner, &o.ctx, "d-2", "decline", summons).await;
+    drive_anchored_call(&runner, &o.ctx, "d-3", "decline", summons).await;
+    assert_eq!(run(&o).await, 2, "the run counts from the failure forward");
+
+    assert_eq!(
+        error_texts(&o.ctx).await,
+        vec![
+            "not this one".to_owned(),
+            "the file system said no".to_owned(),
+            "not this one".to_owned(),
+            "not this one".to_owned(),
+        ],
+        "both outcomes reach the model as its own words, unwrapped"
+    );
+    assert!(
+        conversation_results(&o.ctx).await.is_empty(),
+        "neither wrote a result"
+    );
+    assert_eq!(
+        tail_ask(&o.ctx).await,
+        Some(Awaiting::Model),
+        "and either way the model is owed one more round"
     );
 }

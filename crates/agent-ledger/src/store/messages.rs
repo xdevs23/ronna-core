@@ -64,6 +64,18 @@ impl BlockDestination {
     }
 }
 
+/// One junction row's own two facts: a block, and the conversation it is
+/// joined to. Read together because the change hook names the ROW, and the row
+/// is where both answers live — deriving the conversation from the block
+/// afterwards is what let a shared block's change land on the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinedBlock {
+    /// The conversation the row joins the block to.
+    pub conversation_id: i64,
+    /// The block joined.
+    pub block_id: i64,
+}
+
 /// The facts a tool call carries into the ledger, grouped because they travel
 /// together: a call's identity, what it asks for, and whether it is answered in
 /// the chat rather than out of band.
@@ -338,6 +350,13 @@ impl Store {
     /// Append the conversation's system prompt block. The content is the
     /// caller's: prompts are a consumer's own words, and this library has none.
     ///
+    /// A conversation takes ONE system prompt, and a second is refused in this
+    /// library's own words (2026-09-01). The schema's trigger still stands
+    /// behind the rule for whatever writes around this door, but the rule is
+    /// answered here: a refusal a caller is meant to receive must not reach it
+    /// as a constraint violation, which the store reads as a database in a
+    /// state the design forbids and ends the process over.
+    ///
     /// # Errors
     ///
     /// If the insert fails, if the conversation already carries a system
@@ -349,6 +368,21 @@ impl Store {
     ) -> Result<i64, StoreError> {
         self.run(move |conn| {
             transact(conn, |tx| {
+                let taken: bool = tx.query_row(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM conversation_blocks cb
+                         JOIN blocks b ON b.id = cb.block_id
+                         WHERE cb.conversation_id = ?1
+                           AND b.block_type = 'system_prompt'
+                     )",
+                    [conversation_id],
+                    |row| row.get(0),
+                )?;
+                if taken {
+                    return Err(StoreError::Other(format!(
+                        "conversation {conversation_id} already has a system prompt"
+                    )));
+                }
                 let block_id = insert_block(tx, conversation_id, "system_prompt")?;
                 tx.execute(
                     "INSERT INTO block_text (block_id, role, content) VALUES (?1, 'system', ?2)",
@@ -949,21 +983,59 @@ impl Store {
 
     // ─── Block watcher support ───────────────────────────────────────────
 
-    /// Which conversation a block was appended to. A junction-shared block
-    /// answers with one of them.
+    /// One junction row, read by the id the change hook announced: the
+    /// conversation and the block it joins, from the SAME row.
+    ///
+    /// `None` when that row is gone by read time — a delete, or an insert its
+    /// transaction rolled back. The hook announces row changes, not commits,
+    /// so this is ordinary and it attributes nothing: there is no conversation
+    /// to name and no block to name it for.
     ///
     /// # Errors
     ///
     /// If the query fails or the store's actor has stopped.
-    pub async fn conversation_for_block(&self, block_id: i64) -> Result<Option<i64>, StoreError> {
+    pub async fn joined_block(&self, junction_id: i64) -> Result<Option<JoinedBlock>, StoreError> {
         self.run(move |conn| {
             conn.query_row(
-                "SELECT conversation_id FROM conversation_blocks WHERE block_id = ?1 LIMIT 1",
-                [block_id],
-                |row| row.get(0),
+                "SELECT conversation_id, block_id FROM conversation_blocks WHERE id = ?1",
+                [junction_id],
+                |row| {
+                    Ok(JoinedBlock {
+                        conversation_id: row.get(0)?,
+                        block_id: row.get(1)?,
+                    })
+                },
             )
             .optional()
             .map_err(Into::into)
+        })
+        .await
+    }
+
+    /// EVERY conversation a block is joined to, in junction order.
+    ///
+    /// A block is shared by every fork that inherited it, so "which
+    /// conversation" has no single answer and asking for one was the defect
+    /// (2026-09-01): a `LIMIT 1` without an order let the index hand back the
+    /// oldest join, and a fork's own writes were announced to the conversation
+    /// it was forked FROM. A change to a block is a change for each
+    /// conversation that reads it, so each is told.
+    ///
+    /// Empty is normal, not a fault: a header and its content row land before
+    /// the junction row inside one flow, and a draft's blocks are joined to
+    /// nothing by design. The junction row's own change carries the
+    /// announcement.
+    ///
+    /// # Errors
+    ///
+    /// If the query fails or the store's actor has stopped.
+    pub async fn conversations_for_block(&self, block_id: i64) -> Result<Vec<i64>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT conversation_id FROM conversation_blocks WHERE block_id = ?1 ORDER BY id",
+            )?;
+            let rows = stmt.query_map([block_id], |row| row.get::<_, i64>(0))?;
+            Ok(rows.collect::<Result<Vec<i64>, _>>()?)
         })
         .await
     }

@@ -366,13 +366,24 @@ pub(crate) async fn metadata_tick<K: RuntimeKind, E: RuntimeEvent>(
         return None;
     }
     match ratchet::drive_ledger::<K, E>(ctx, &MetadataLedger).await {
-        Ok(outcome) => {
+        Ok(ratchet::Driven::Ran(outcome)) => {
             tracing::debug!(
                 conversation_id = ctx.conversation_id,
                 ?outcome,
                 "metadata tick"
             );
             Some(outcome)
+        }
+        // The conversation is gone, so its metadata ledger is too. This loop
+        // is aborted with the rest of the set the moment the conversation's
+        // actor reads the same fact off the same cursor; there is nothing to
+        // drive until then.
+        Ok(ratchet::Driven::ConversationGone) => {
+            tracing::debug!(
+                conversation_id = ctx.conversation_id,
+                "metadata tick: the conversation is gone"
+            );
+            None
         }
         Err(e) => {
             tracing::error!(conversation_id = ctx.conversation_id, error = %e, "metadata scheduler: drive failed");
@@ -853,6 +864,7 @@ mod tests {
             .metadata_cursor(o.ctx.conversation_id)
             .await
             .unwrap()
+            .expect("the conversation exists")
     }
 
     #[track_caller]
@@ -1238,9 +1250,14 @@ mod tests {
         o.ctx
             .store
             .run(|conn| {
+                // An OPERATIONAL failure (2026-09-01): the trigger reaches
+                // for a table that does not exist, so the persist fails
+                // without claiming the database is in a state the design
+                // forbids — which a `RAISE(ABORT)` would, and which now ends
+                // the process.
                 conn.execute(
                     "CREATE TRIGGER injected_metadata_failure BEFORE INSERT ON metadata \
-                     BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+                     BEGIN INSERT INTO no_such_table_for_the_injected_failure VALUES (1); END",
                     [],
                 )
                 .map(|_| ())

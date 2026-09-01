@@ -244,7 +244,7 @@ impl LedgerSource for CountingLedger {
         ConversationLedger.list(ctx).await
     }
 
-    async fn cursor<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<i64, StoreError> {
+    async fn cursor<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<Option<i64>, StoreError> {
         ConversationLedger.cursor(ctx).await
     }
 
@@ -329,7 +329,9 @@ async fn a_streaming_finalize_costs_one_cursor_write_not_the_ledger_length() {
     let counting = CountingLedger::new();
     let outcome = ratchet::drive_ledger::<BlockKind, _>(&o.ctx, &counting)
         .await
-        .unwrap();
+        .unwrap()
+        .outcome()
+        .expect("the conversation exists");
     assert_eq!(outcome.cursor, finalized);
     assert_eq!(
         counting.writes(),
@@ -374,7 +376,9 @@ async fn a_vanished_anchor_re_drives_only_the_tail_after_it() {
     let counting = CountingLedger::new();
     let outcome = ratchet::drive_ledger::<BlockKind, _>(&o.ctx, &counting)
         .await
-        .unwrap();
+        .unwrap()
+        .outcome()
+        .expect("the conversation exists");
     assert_eq!(outcome.cursor, finalized, "the drive caught up to the tail");
     assert_eq!(
         counting.writes(),
@@ -477,7 +481,7 @@ impl LedgerSource for InterruptingLedger {
         ConversationLedger.list(ctx).await
     }
 
-    async fn cursor<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<i64, StoreError> {
+    async fn cursor<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<Option<i64>, StoreError> {
         ConversationLedger.cursor(ctx).await
     }
 
@@ -506,7 +510,9 @@ async fn a_cap_committed_during_the_drive_caps_the_frontier() {
     };
     let outcome = ratchet::drive_ledger::<BlockKind, _>(&o.ctx, &source)
         .await
-        .unwrap();
+        .unwrap()
+        .outcome()
+        .expect("the conversation exists");
 
     assert!(
         !outcome.owes_turn,
@@ -1308,6 +1314,8 @@ async fn drive_metadata(o: &Oracle) -> ratchet::Outcome {
     ratchet::drive_ledger::<BlockKind, _>(&o.ctx, &MetadataLedger)
         .await
         .unwrap()
+        .outcome()
+        .expect("the conversation exists")
 }
 
 async fn metadata_cursor(o: &Oracle) -> i64 {
@@ -1316,6 +1324,7 @@ async fn metadata_cursor(o: &Oracle) -> i64 {
         .metadata_cursor(o.ctx.conversation_id)
         .await
         .unwrap()
+        .expect("the conversation exists")
 }
 
 #[track_caller]
@@ -1471,4 +1480,104 @@ async fn the_two_cursors_never_interact() {
         "metadata cursor still untouched"
     );
     o.expect_silence();
+}
+
+// ─── Is the turn durably over? ──────────────────────────────────────────
+
+/// The predicate's answer for the shape it exists to serve: a toolless prose
+/// turn that finished. Nothing streams, nothing awaits a continuation, and no
+/// row anywhere records the end — the answer is derived, which is why the
+/// question is a predicate at all.
+#[tokio::test]
+async fn a_finished_toolless_turn_is_durably_over() {
+    let o = Oracle::new().await;
+    o.user_text("hello").await;
+    o.assistant_text("hi").await;
+
+    assert!(
+        ratchet::turn_durably_over::<BlockKind, _>(&o.ctx)
+            .await
+            .unwrap()
+    );
+}
+
+/// Mid tool round the turn is NOT over: the outcome is recorded and the model is
+/// owed the round it summons. The message that carried the tool use ended
+/// long ago, so anything reading a message end would call this over and act
+/// on a turn still in flight.
+#[tokio::test]
+async fn a_turn_awaiting_the_round_its_outcome_summons_is_not_over() {
+    let o = Oracle::new().await;
+    let summons = o.user_text("go").await;
+    anchored_round(&o, summons).await;
+
+    assert!(
+        !ratchet::turn_durably_over::<BlockKind, _>(&o.ctx)
+            .await
+            .unwrap(),
+        "an outcome awaiting its continuation keeps the turn open"
+    );
+
+    // The continuation arrives under the same turn identity, and only now is
+    // the turn over.
+    o.ctx
+        .store
+        .insert_final_text_block(
+            crate::store::BlockDestination::anchored(o.ctx.conversation_id, Some(summons)),
+            Role::Assistant,
+            "read it, here is what it says".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        ratchet::turn_durably_over::<BlockKind, _>(&o.ctx)
+            .await
+            .unwrap(),
+        "the round arrived, so nothing is owed"
+    );
+}
+
+/// A live streaming tail keeps the turn open, read through the kind's own
+/// durability and never off a block type — the ephemeral row is still being
+/// accumulated and its finalization deletes it.
+#[tokio::test]
+async fn a_streaming_tail_keeps_the_turn_open() {
+    let o = Oracle::new().await;
+    o.user_text("write me a poem").await;
+    let tail = o
+        .ctx
+        .store
+        .insert_streaming_block(o.ctx.conversation_id, Role::Assistant)
+        .await
+        .unwrap();
+
+    assert!(
+        !ratchet::turn_durably_over::<BlockKind, _>(&o.ctx)
+            .await
+            .unwrap(),
+        "a tail still accumulating is not a finished turn"
+    );
+
+    assert!(o.ctx.store.discard_streaming_block(tail).await.unwrap());
+    o.assistant_text("roses are red").await;
+
+    assert!(
+        ratchet::turn_durably_over::<BlockKind, _>(&o.ctx)
+            .await
+            .unwrap()
+    );
+}
+
+/// An empty conversation has no turn in flight — the predicate answers over a
+/// ledger with nothing in it, and does not fail to find a turn.
+#[tokio::test]
+async fn an_empty_ledger_has_no_turn_in_flight() {
+    let o = Oracle::new().await;
+    assert!(
+        ratchet::turn_durably_over::<BlockKind, _>(&o.ctx)
+            .await
+            .unwrap()
+    );
 }

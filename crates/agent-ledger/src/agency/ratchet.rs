@@ -59,7 +59,15 @@ pub trait LedgerSource: Sync {
         async { Ok(self.list(ctx).await?.pop()) }
     }
 
-    /// This ledger's persisted cursor; 0 when nothing is confirmed.
+    /// This ledger's persisted cursor; 0 when nothing is confirmed, and `None`
+    /// when the conversation the ledger belongs to NO LONGER EXISTS
+    /// (2026-09-01).
+    ///
+    /// The absence is an answer, not a failure: both store-backed cursors live
+    /// on the conversation's own row, so the read that tells a drive where to
+    /// resume is also the read that tells it there is nothing left to drive.
+    /// [`drive_ledger`] turns that into [`Driven::ConversationGone`], which is
+    /// how a per-conversation actor set learns its own end.
     ///
     /// # Errors
     ///
@@ -67,7 +75,7 @@ pub trait LedgerSource: Sync {
     fn cursor<E: RuntimeEvent>(
         &self,
         ctx: &AgencyCtx<E>,
-    ) -> impl Future<Output = Result<i64, StoreError>> + Send;
+    ) -> impl Future<Output = Result<Option<i64>, StoreError>> + Send;
 
     /// Advance this ledger's persisted cursor to a confirmed block id.
     ///
@@ -90,7 +98,7 @@ impl LedgerSource for ConversationLedger {
         ctx.store.list_blocks(ctx.conversation_id).await
     }
 
-    async fn cursor<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<i64, StoreError> {
+    async fn cursor<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<Option<i64>, StoreError> {
         ctx.store.cursor(ctx.conversation_id).await
     }
 
@@ -122,7 +130,7 @@ impl LedgerSource for MetadataLedger {
         ctx.store.list_metadata_blocks(ctx.conversation_id).await
     }
 
-    async fn cursor<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<i64, StoreError> {
+    async fn cursor<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<Option<i64>, StoreError> {
         ctx.store.metadata_cursor(ctx.conversation_id).await
     }
 
@@ -138,6 +146,33 @@ impl LedgerSource for MetadataLedger {
 
     async fn tail<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<Option<Block>, StoreError> {
         ctx.store.latest_metadata_block(ctx.conversation_id).await
+    }
+}
+
+/// What one drive found (2026-09-01).
+///
+/// The drive reads its ledger's cursor before it reads anything else, and that
+/// cursor lives on the conversation's own row — so "the conversation is gone"
+/// is an answer the drive already holds, not a failure it reports. It
+/// is modelled as an answer here for that reason: the caller ends the work
+/// that belongs to that conversation, and nothing has to be told to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Driven {
+    /// The drive ran over the ledger and left this behind.
+    Ran(Outcome),
+    /// The conversation no longer exists, so neither does its ledger. Every
+    /// per-conversation loop reading this answer is over.
+    ConversationGone,
+}
+
+impl Driven {
+    /// The drive's outcome, or `None` when the conversation is gone.
+    #[must_use]
+    pub fn outcome(self) -> Option<Outcome> {
+        match self {
+            Driven::Ran(outcome) => Some(outcome),
+            Driven::ConversationGone => None,
+        }
     }
 }
 
@@ -361,8 +396,62 @@ pub(crate) fn fresh_turn_anchor(snapshot: &[Block], tail: &Block) -> i64 {
 /// If listing the ledger, reading the cursor or persisting it fails.
 pub async fn drive<K: RuntimeKind, E: RuntimeEvent>(
     ctx: &AgencyCtx<E>,
-) -> Result<Outcome, StoreError> {
+) -> Result<Driven, StoreError> {
     drive_ledger::<K, E>(ctx, &ConversationLedger).await
+}
+
+/// Whether the conversation still exists — the same cursor read [`drive`]
+/// opens with, without the drive (2026-09-01).
+///
+/// A LATCHED conversation is not driven, and existence is not the drive: a
+/// per-conversation loop that skipped this read while latched would outlive
+/// its conversation for the life of the process, silently, which is the leak
+/// the cursor's `None` exists to close. The read confirms nothing and writes
+/// nothing, so it is as true of a latched conversation as of a running one.
+///
+/// # Errors
+///
+/// If reading the cursor fails, or the store's actor has stopped.
+pub async fn conversation_gone<E: RuntimeEvent>(ctx: &AgencyCtx<E>) -> Result<bool, StoreError> {
+    Ok(ConversationLedger.cursor(ctx).await?.is_none())
+}
+
+/// Whether this conversation's turn is DURABLY OVER (2026-09-01) — read off
+/// the ledger, which is the only place the whole answer exists.
+///
+/// Two facts, both stored, and a turn is over only when both hold:
+///
+/// - **No streaming tail remains.** An ephemeral block is a live tail being
+///   accumulated ([`Agency::durable`](super::Agency::durable) answers `false`
+///   for exactly those), and its finalization deletes it. Read through the
+///   kind like every other ledger question here, so a consumer's own ephemeral
+///   kind counts too, and nothing in this predicate names a block type.
+/// - **No tool outcome awaits a continuation**
+///   (`ToolCall::unanswered_outcome_anchor`). A message end is not a turn
+///   end: a tool-use stop's outcomes arrive after it and the model is owed the
+///   round they summon.
+///
+/// It is the framework's question because the second half is: a consumer sees
+/// the stream, never the ledger's own turn folds. And it is a PREDICATE rather
+/// than a stored row because the row does not exist for the common shape —
+/// `settle_turn_identity` records a turn's end only when the turn closed over
+/// an unanswered outcome, so a toolless prose turn writes nothing to read.
+///
+/// # Errors
+///
+/// If reading the ledger fails, or the store's actor has stopped.
+pub async fn turn_durably_over<K: RuntimeKind, E: RuntimeEvent>(
+    ctx: &AgencyCtx<E>,
+) -> Result<bool, StoreError> {
+    Ok(ledger_turn_durably_over::<K>(
+        &ConversationLedger.list(ctx).await?,
+    ))
+}
+
+/// [`turn_durably_over`]'s rule over a ledger already in hand.
+pub(crate) fn ledger_turn_durably_over<K: RuntimeKind>(ledger: &[Block]) -> bool {
+    ledger.iter().all(|block| K::from_block(block).durable())
+        && ToolCall::unanswered_outcome_anchor(ledger).is_none()
 }
 
 /// Drive a ledger forward, inclusively, from its persisted cursor.
@@ -384,16 +473,23 @@ pub async fn drive<K: RuntimeKind, E: RuntimeEvent>(
 /// while they ran. Deciding it off the opening snapshot would let a turn fire
 /// past a cap that had already been committed.
 ///
+/// A conversation that no longer exists answers [`Driven::ConversationGone`]
+/// and nothing else happens: the cursor read is where the drive learns it, and
+/// there is no ledger to walk behind a row that is gone.
+///
 /// # Errors
 ///
 /// If listing the ledger, reading the cursor or persisting it fails. A block's
-/// own `run()` failing is NOT an error here — it parks the drive.
+/// own `run()` failing is NOT an error here — it parks the drive. Nor is a
+/// deleted conversation: that is [`Driven::ConversationGone`].
 pub async fn drive_ledger<K: RuntimeKind, E: RuntimeEvent>(
     ctx: &AgencyCtx<E>,
     source: &impl LedgerSource,
-) -> Result<Outcome, StoreError> {
+) -> Result<Driven, StoreError> {
     let ledger = source.list(ctx).await?;
-    let mut cursor = source.cursor(ctx).await?;
+    let Some(mut cursor) = source.cursor(ctx).await? else {
+        return Ok(Driven::ConversationGone);
+    };
 
     let start = resume_at(&ledger, cursor);
 
@@ -450,12 +546,12 @@ pub async fn drive_ledger<K: RuntimeKind, E: RuntimeEvent>(
         .and_then(|block| K::from_block(block).awaiting());
     let owes_turn = !parked && frontier.as_ref().is_some_and(frontier_owes_turn::<K>);
 
-    Ok(Outcome {
+    Ok(Driven::Ran(Outcome {
         cursor,
         owes_turn,
         parked,
         awaiting,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -600,13 +696,18 @@ pub(crate) mod oracle {
         }
 
         pub async fn drive(&self) -> Outcome {
-            let outcome = super::drive::<BlockKind, _>(&self.ctx).await.unwrap();
+            let outcome = super::drive::<BlockKind, _>(&self.ctx)
+                .await
+                .unwrap()
+                .outcome()
+                .expect("the conversation exists");
             let persisted = self
                 .ctx
                 .store
                 .cursor(self.ctx.conversation_id)
                 .await
-                .unwrap();
+                .unwrap()
+                .expect("the conversation exists");
             assert_eq!(
                 outcome.cursor, persisted,
                 "the outcome mirrors the persisted cursor"
@@ -632,6 +733,7 @@ pub(crate) mod oracle {
                 .cursor(self.ctx.conversation_id)
                 .await
                 .unwrap()
+                .expect("the conversation exists")
         }
 
         pub async fn ledger_ids(&self) -> Vec<i64> {

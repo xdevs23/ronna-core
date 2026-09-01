@@ -34,6 +34,7 @@ mod conversations;
 mod date_markers;
 mod descriptors;
 mod drafts;
+mod integrity;
 mod messages;
 mod metadata;
 mod migrations;
@@ -44,7 +45,7 @@ mod tool_calls;
 use std::path::Path;
 use std::sync::Arc;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::reactivity::ChangeLog;
@@ -62,7 +63,8 @@ pub use descriptors::{
     concat_descriptors, descriptor_count,
 };
 pub use drafts::DraftBlock;
-pub use messages::{BlockDestination, ToolCallInsert};
+pub use integrity::IntegrityCheck;
+pub use messages::{BlockDestination, JoinedBlock, ToolCallInsert};
 pub use models::ModelEntry;
 pub use providers::ProviderInstance;
 
@@ -146,10 +148,17 @@ pub enum StoreError {
 /// An operation sent to the store's actor thread. Constructed by
 /// [`domain_run`] and [`domain_migrate`]; it travels the channel [`StoreTx`]
 /// names, which is why it is public at all.
+///
+/// Both variants are `non_exhaustive` (2026-09-01) so that stays true from
+/// outside this library as well: a hand-rolled `Query` could hold a closure
+/// that ignores the [`IntegrityCheck`] it is handed, and the guarantee that
+/// every answer is judged would then rest on a convention a consumer cannot
+/// see. Construction through the two doors is the guarantee.
 pub enum StoreOp {
     /// A domain submits its migrations. The actor runs them and signals
     /// completion through `done`. Every query for that domain waits until it
     /// fires.
+    #[non_exhaustive]
     Migration {
         /// The domain whose schema this advances.
         domain: &'static str,
@@ -161,6 +170,7 @@ pub enum StoreOp {
     /// A domain's query. Runs immediately if that domain's migrations have
     /// completed, is deferred until they do, and is refused outright if they
     /// failed.
+    #[non_exhaustive]
     Query {
         /// The domain whose tables it reads or writes.
         domain: &'static str,
@@ -175,7 +185,14 @@ pub enum StoreOp {
 /// [`StoreError::MigrationFailed`] instead when that domain's migrations
 /// failed: a query whose tables may not exist is answered, never run and never
 /// left parked.
-pub type QueryFn = Box<dyn FnOnce(Result<&mut Connection, StoreError>) + Send>;
+///
+/// The second argument is the actor thread's [`IntegrityCheck`] (2026-09-01).
+/// Every answer passes through it here, where the error is still a typed
+/// `rusqlite` failure and still on this thread, so a database in a state the
+/// design forbids takes the process down before its answer can be acted on.
+/// [`domain_run`] does this for every query the library and its consumers
+/// send.
+pub type QueryFn = Box<dyn FnOnce(Result<&mut Connection, StoreError>, &IntegrityCheck) + Send>;
 
 /// A handle on the store actor's channel. A consumer's own tables hold one of
 /// these to send closures to the same actor thread — one writer, whoever is
@@ -379,7 +396,20 @@ impl Store {
         let gate = DomainGate::default();
         let actor_gate = gate.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        std::thread::spawn(move || Self::actor(rx, conn, premigrated, &actor_gate));
+        // A panic on this thread is the same fact the integrity check acts on:
+        // the one writer is gone and nothing it was in the middle of is
+        // known to have finished. Letting the thread die would merely close
+        // the channel, and every caller would read `ActorStopped` — an
+        // ordinary-looking error for a process that can no longer write
+        // anything. Abort instead (2026-09-01).
+        std::thread::spawn(move || {
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                Self::actor(rx, conn, premigrated, &actor_gate);
+            }));
+            if run.is_err() {
+                integrity::abort_on_impossible_state("the store's actor thread panicked");
+            }
+        });
 
         Ok(Self {
             tx,
@@ -407,6 +437,9 @@ impl Store {
 
         let mut migrated: HashSet<&'static str> = premigrated;
         let mut deferred: HashMap<&'static str, VecDeque<QueryFn>> = HashMap::new();
+        // The right to judge an answer lives here and nowhere else: one
+        // thread, one check, under every caller.
+        let integrity = IntegrityCheck::new();
 
         while let Some(op) = rx.blocking_recv() {
             match op {
@@ -422,7 +455,7 @@ impl Store {
                             let _ = done.send(Ok(()));
                             // Drain whatever queued up while this domain waited.
                             for f in deferred.remove(domain).unwrap_or_default() {
-                                f(Ok(&mut conn));
+                                f(Ok(&mut conn), &integrity);
                             }
                         }
                         Err(failure) => {
@@ -432,7 +465,7 @@ impl Store {
                             // queries loose on a schema whose state is unknown,
                             // and dropping it would park its caller forever.
                             for f in deferred.remove(domain).unwrap_or_default() {
-                                f(Err(failure.error(domain)));
+                                f(Err(failure.error(domain)), &integrity);
                             }
                             gate.record(domain, failure);
                         }
@@ -440,9 +473,9 @@ impl Store {
                 }
                 StoreOp::Query { domain, f } => {
                     if let Some(refusal) = gate.failure(domain) {
-                        f(Err(refusal));
+                        f(Err(refusal), &integrity);
                     } else if migrated.contains(domain) {
-                        f(Ok(&mut conn));
+                        f(Ok(&mut conn), &integrity);
                     } else {
                         deferred.entry(domain).or_default().push_back(f);
                     }
@@ -630,7 +663,8 @@ fn run_domain_migrations(
 }
 
 /// The version `domain_migrations` carries for a domain, creating that table on
-/// first use. An unknown domain is at version 0.
+/// first use. An unknown domain is at version 0 — a legal absence, written as
+/// the `Option` the read answers.
 fn domain_version(conn: &Connection, domain: &'static str) -> rusqlite::Result<i64> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS domain_migrations (
@@ -639,15 +673,14 @@ fn domain_version(conn: &Connection, domain: &'static str) -> rusqlite::Result<i
         );",
     )?;
 
-    match conn.query_row(
-        "SELECT version FROM domain_migrations WHERE domain = ?1",
-        [domain],
-        |row| row.get(0),
-    ) {
-        Ok(v) => Ok(v),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
-        Err(e) => Err(e),
-    }
+    Ok(conn
+        .query_row(
+            "SELECT version FROM domain_migrations WHERE domain = ?1",
+            [domain],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
 }
 
 /// One migration step and its version bump, in one transaction.
@@ -706,6 +739,14 @@ where
 /// Whatever the closure returns, [`StoreError::MigrationFailed`] if this
 /// domain's migrations failed, or [`StoreError::ActorStopped`] if the actor
 /// thread is gone.
+///
+/// # Aborts
+///
+/// The answer is judged on the actor thread before it travels back
+/// (2026-09-01): a database in a state the design forbids — a violated
+/// constraint, a corrupt or misused file, a missing row a query guarantees —
+/// ends the process here. See [`IntegrityCheck`]. This is why no caller of
+/// this function classifies a database error, and why none can.
 pub async fn domain_run<F, R>(tx: &StoreTx, domain: &'static str, f: F) -> Result<R, StoreError>
 where
     F: FnOnce(&mut Connection) -> Result<R, StoreError> + Send + 'static,
@@ -714,11 +755,15 @@ where
     let (resp_tx, resp_rx) = oneshot::channel();
     tx.send(StoreOp::Query {
         domain,
-        f: Box::new(move |target| {
-            let _ = resp_tx.send(match target {
+        f: Box::new(move |target, integrity| {
+            let answer = match target {
                 Ok(conn) => f(conn),
                 Err(migration_failure) => Err(migration_failure),
-            });
+            };
+            // Before the answer leaves this thread, and so before anything
+            // can act on it.
+            integrity.judge(&answer);
+            let _ = resp_tx.send(answer);
         }),
     })
     .map_err(|_| StoreError::ActorStopped)?;
@@ -1367,6 +1412,80 @@ mod tests {
         assert_eq!(fork_blocks[1].id, b2);
 
         assert_eq!(s.list_blocks(c1).await.unwrap().len(), 3);
+    }
+
+    /// A fork whose source was deleted under it is REFUSED, never an abort
+    /// (2026-09-01). The compaction races exactly this: the cut is taken, the
+    /// source is deleted, and the fork arrives after it. The source id is the
+    /// caller's, so its absence is an answer the caller reads — the integrity
+    /// check must never meet it as a missing guaranteed row.
+    #[tokio::test]
+    async fn forking_a_conversation_that_is_gone_is_refused() {
+        let s = store();
+        let c1 = make_conv(&s, "p1", "gpt-4").await;
+        // A conversation written AFTER the source and outliving it, so the id
+        // SQLite hands the fork is a fresh one. Were the source's row the
+        // highest, deleting it would hand its own id straight back to the
+        // fork, whose `parent_id` would then point at itself and satisfy the
+        // foreign key this check stands in front of.
+        let sibling = make_conv(&s, "p0", "gpt-4").await;
+        assert!(c1 < sibling, "the source must not hold the highest id");
+        let b1 = s
+            .insert_text_block(c1, Role::User, "hello".into())
+            .await
+            .unwrap();
+        s.delete_conversation(c1).await.unwrap();
+
+        // The inheriting shape: nothing overridden, so the model and the
+        // reasoning are read off the source's own row.
+        let inherited = s
+            .fork_conversation(c1, b1, ModelOverride::default())
+            .await
+            .expect_err("a fork of a deleted conversation must answer an error");
+        assert!(
+            matches!(&inherited, StoreError::Other(reason) if reason.contains("does not exist")),
+            "{inherited:?}"
+        );
+
+        // The overriding shape: every setting comes from the caller, so
+        // nothing reads the source row and the door's own check is the only
+        // thing between this call and a foreign key on the fork's parent.
+        let overridden = s
+            .fork_conversation(
+                c1,
+                b1,
+                ModelOverride {
+                    provider_id: Some("p1".into()),
+                    external_id: Some("gpt-4".into()),
+                    display_name: Some("gpt-4".into()),
+                    vendor: Some("openai".into()),
+                    reasoning: Some("high".into()),
+                },
+            )
+            .await
+            .expect_err("a fork of a deleted conversation must answer an error");
+        assert!(
+            matches!(&overridden, StoreError::Other(reason) if reason.contains("does not exist")),
+            "{overridden:?}"
+        );
+
+        // And the other caller mistake the same door answers: a live source,
+        // a block that belongs to someone else. The junction cutoff finds
+        // nothing, which is an argument, not a corrupted database.
+        let other = make_conv(&s, "p2", "gpt-4").await;
+        let stranger = s
+            .insert_text_block(other, Role::User, "elsewhere".into())
+            .await
+            .unwrap();
+        let host = make_conv(&s, "p3", "gpt-4").await;
+        let foreign_block = s
+            .fork_conversation(host, stranger, ModelOverride::default())
+            .await
+            .expect_err("a block from another conversation must answer an error");
+        assert!(
+            matches!(&foreign_block, StoreError::Other(reason) if reason.contains("is not in conversation")),
+            "{foreign_block:?}"
+        );
     }
 
     #[tokio::test]
@@ -2687,14 +2806,18 @@ mod tests {
             "this"
         );
 
-        assert_eq!(s.cursor(conv).await.unwrap(), 0, "nothing is confirmed yet");
+        assert_eq!(
+            s.cursor(conv).await.unwrap(),
+            Some(0),
+            "nothing is confirmed yet"
+        );
         s.update_cursor(conv, second).await.unwrap();
-        assert_eq!(s.cursor(conv).await.unwrap(), second);
+        assert_eq!(s.cursor(conv).await.unwrap(), Some(second));
 
         // The cursor survives a re-read of the conversation, because it is a
         // stored fact and not an in-memory one.
         s.update_cursor(conv, third).await.unwrap();
-        assert_eq!(s.cursor(conv).await.unwrap(), third);
+        assert_eq!(s.cursor(conv).await.unwrap(), Some(third));
     }
 
     /// The store and the scheduler's heartbeat are connected: a write to a

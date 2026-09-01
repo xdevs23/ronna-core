@@ -97,16 +97,24 @@ impl Store {
     /// cursors that never interact. 0 means nothing confirmed: the drive
     /// re-derives from the start.
     ///
+    /// `None` means the conversation is GONE, exactly as it does for
+    /// [`Store::cursor`](Store::cursor): both cursors live on the
+    /// conversation's own row, so both answer the same absence, and the
+    /// metadata drive ends its side of the actor set on it the way the turn
+    /// drive ends its own.
+    ///
     /// # Errors
     ///
-    /// If the conversation does not exist, or the store's actor has stopped.
-    pub async fn metadata_cursor(&self, conversation_id: i64) -> Result<i64, StoreError> {
+    /// If the read fails or the store's actor has stopped. A missing
+    /// conversation is NOT an error: it is the `None` above.
+    pub async fn metadata_cursor(&self, conversation_id: i64) -> Result<Option<i64>, StoreError> {
         self.run(move |conn| {
             conn.query_row(
                 "SELECT last_processed_metadata_id FROM conversations WHERE id = ?1",
                 [conversation_id],
                 |row| row.get(0),
             )
+            .optional()
             .map_err(Into::into)
         })
         .await
@@ -307,12 +315,12 @@ mod tests {
         let conversation = store.find_conversation(conv).await.unwrap().unwrap();
         assert_eq!(conversation.title.as_deref(), Some("A title"));
 
-        assert_eq!(store.metadata_cursor(conv).await.unwrap(), 0);
+        assert_eq!(store.metadata_cursor(conv).await.unwrap(), Some(0));
         store.update_metadata_cursor(conv, response).await.unwrap();
-        assert_eq!(store.metadata_cursor(conv).await.unwrap(), response);
+        assert_eq!(store.metadata_cursor(conv).await.unwrap(), Some(response));
         assert_eq!(
             store.cursor(conv).await.unwrap(),
-            0,
+            Some(0),
             "the block cursor is untouched by the metadata one"
         );
     }

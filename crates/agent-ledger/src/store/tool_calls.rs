@@ -3,6 +3,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::agency::Refusal;
 use crate::block::ToolCallResult;
 
 use super::messages::{BlockDestination, anchor_of, insert_block};
@@ -138,6 +139,12 @@ impl Store {
     /// keyed the same way, and this is the only door an error takes into the
     /// ledger.
     ///
+    /// The failure it writes is NOT a refusal: it records that something was
+    /// attempted and went wrong, which is what a failure arriving from outside
+    /// the runner means. A refusal — a call declined before it ran — reaches
+    /// the ledger through the marked variant this method delegates to, because
+    /// only the pass that made the decision knows it was one.
+    ///
     /// # Errors
     ///
     /// If the insert fails or the store's actor has stopped.
@@ -148,6 +155,42 @@ impl Store {
         error: String,
         source_block_id: i64,
     ) -> Result<Option<i64>, StoreError> {
+        self.fail_tool_call_block_marked(
+            conversation_id,
+            tool_call_id,
+            error,
+            source_block_id,
+            Refusal::Failed,
+        )
+        .await
+    }
+
+    /// The failure write itself, with the refusal fact the caller decided
+    /// (2026-09-01) — ONE implementation, two doors, the resolution path's own
+    /// shape.
+    ///
+    /// [`Refusal::Refused`] says the model spent a round and was handed only
+    /// the reason, which is what the forced turn end counts a run of. Recorded
+    /// on the row at the one moment it is known — the pass that refused —
+    /// so every reader answers from the row and no reader parses the sentence
+    /// the model reads.
+    ///
+    /// Crate-private on purpose: a consumer's own decline arrives through
+    /// [`ToolOutcome::Refused`](crate::ToolOutcome::Refused), the typed
+    /// surface, and the runner sets the fact from it. A public parameter would
+    /// be a second place to decide the same thing.
+    ///
+    /// # Errors
+    ///
+    /// If the insert fails or the store's actor has stopped.
+    pub(crate) async fn fail_tool_call_block_marked(
+        &self,
+        conversation_id: i64,
+        tool_call_id: String,
+        error: String,
+        source_block_id: i64,
+        refusal: Refusal,
+    ) -> Result<Option<i64>, StoreError> {
         self.run(move |conn| {
             transact(conn, |tx| {
                 if call_resolution_exists(tx, conversation_id, source_block_id)? {
@@ -157,8 +200,8 @@ impl Store {
                 let anchor = anchor_of(tx, source_block_id)?;
                 let block_id = insert_block(tx, BlockDestination::anchored(conversation_id, anchor), "tool_error")?;
                 tx.execute(
-                    "INSERT INTO block_tool_error (block_id, tool_call_id, error, source_block_id) VALUES (?1, ?2, ?3, ?4)",
-                    params![block_id, tool_call_id, error, source_block_id],
+                    "INSERT INTO block_tool_error (block_id, tool_call_id, error, source_block_id, refusal) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![block_id, tool_call_id, error, source_block_id, i64::from(refusal.is_refusal())],
                 )?;
                 Ok(Some(block_id))
             })
