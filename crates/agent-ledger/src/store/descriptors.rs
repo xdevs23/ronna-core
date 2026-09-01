@@ -250,6 +250,13 @@ pub struct StoreConfig {
     /// so the withdrawal is a schema change with a record of itself rather
     /// than a permanent exception carried in code.
     ///
+    /// The consumer's migration does the dropping and the clearing; the store
+    /// verifies it, after the migrations run. A table named here that is still
+    /// in the schema fails the open, and so does a registry row still standing
+    /// for one — a declared withdrawal whose migration was never written would
+    /// otherwise open onto a table no descriptor covers, reading its blocks
+    /// back as empty content.
+    ///
     /// A table named here and declared by a descriptor at the same time is
     /// refused at open: the two statements contradict each other, and
     /// accepting both would make the withdrawal a silent no-op.
@@ -921,6 +928,57 @@ pub(super) fn check_registry(
     } else {
         Err(StoreError::MissingDescriptors { tables })
     }
+}
+
+/// Check that each withdrawal actually happened. Runs at open AFTER the
+/// consumer's migrations, so it reads the schema those migrations produced.
+///
+/// The contract splits the work in two, and this is the second half: the
+/// consumer's domain migration drops the table and clears its registry row,
+/// and the store verifies that both are true before serving anything. Either
+/// one still standing fails the open, naming the table.
+///
+/// Without this the exemption in [`check_registry`] would be the whole
+/// mechanism, and a consumer that declared the withdrawal but forgot the DROP
+/// would open onto a table no descriptor covers any more — whose blocks read
+/// back as empty core content and whose references abort collection, which is
+/// the exact misread the registry exists to refuse. A withdrawal is a schema
+/// change, and a schema change nobody made is a defect, not a state to serve.
+///
+/// A withdrawal over a database that never had the table passes untouched:
+/// there is no table and no row, which is what lets a consumer keep the
+/// declaration through the deployments that never carried the kind, and
+/// through every reopen after the one that dropped it.
+pub(super) fn check_withdrawals(
+    conn: &Connection,
+    withdrawn: &[&'static str],
+) -> Result<(), StoreError> {
+    for table in withdrawn {
+        let fail = |reason: &str| {
+            Err(StoreError::InvalidDescriptor {
+                table: (*table).to_owned(),
+                reason: reason.to_owned(),
+            })
+        };
+        if table_exists(conn, table)? {
+            return fail(
+                "the table is withdrawn and still in the schema — the domain migration \
+                 that withdraws a kind is what drops its table, and nothing else does",
+            );
+        }
+        let registered: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM content_descriptors WHERE table_name = ?1",
+            [*table],
+            |row| row.get(0),
+        )?;
+        if registered > 0 {
+            return fail(
+                "the table is withdrawn and its content_descriptors row still stands — \
+                 the migration that drops the table clears the row in the same step",
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Record every descriptor's table and kinds durably, making the registry the
@@ -2392,6 +2450,72 @@ mod tests {
                 if table == "block_keyword" && reason.contains("withdrawn")),
             "{error:?}"
         );
+    }
+
+    /// A withdrawal migration that drops the table and leaves the registry row
+    /// behind — the half-done form of [`KEYWORD_WITHDRAWAL`].
+    const KEYWORD_DROP_ONLY: &str = "DROP TABLE block_keyword;";
+
+    /// A database that registered the keyword table, with one conversation in
+    /// it, at the path a withdrawal is then attempted over.
+    async fn keyword_database(label: &str) -> std::path::PathBuf {
+        let dir = temp_dir(label);
+        let path = dir.join("ledger.sqlite3");
+        let s = Store::open_with(
+            &path,
+            keyword_config(KEYWORD_DESCRIPTORS, &[], vec![KEYWORD_SCHEMA]),
+        )
+        .unwrap();
+        make_conv(&s).await;
+        path
+    }
+
+    /// A declared withdrawal whose migration never dropped the table fails the
+    /// open, naming it. The declaration alone stops `check_registry` asking for
+    /// the descriptor, so without this check the open would succeed onto a
+    /// table no descriptor covers any more and read its blocks back as empty
+    /// core content — silently, which is the one outcome the registry exists to
+    /// refuse.
+    #[tokio::test]
+    async fn a_withdrawn_table_still_in_the_schema_fails_the_open() {
+        let path = keyword_database("descriptor-withdrawal-no-drop").await;
+        let error = Store::open_with(
+            &path,
+            keyword_config(&[], &["block_keyword"], vec![KEYWORD_SCHEMA]),
+        )
+        .err()
+        .expect("a withdrawal whose table still stands is refused");
+        assert!(
+            matches!(error, StoreError::InvalidDescriptor { ref table, ref reason }
+                if table == "block_keyword" && reason.contains("still in the schema")),
+            "{error:?}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The other half of the same contract: the table is gone and its registry
+    /// row is not. The row is what a later open reads to decide which
+    /// descriptors a database needs, so leaving it standing hands the next
+    /// consumer a requirement for a table that no longer exists.
+    #[tokio::test]
+    async fn a_withdrawn_tables_registry_row_must_go_with_it() {
+        let path = keyword_database("descriptor-withdrawal-row-left").await;
+        let error = Store::open_with(
+            &path,
+            keyword_config(
+                &[],
+                &["block_keyword"],
+                vec![KEYWORD_SCHEMA, KEYWORD_DROP_ONLY],
+            ),
+        )
+        .err()
+        .expect("a withdrawal whose registry row still stands is refused");
+        assert!(
+            matches!(error, StoreError::InvalidDescriptor { ref table, ref reason }
+                if table == "block_keyword" && reason.contains("row still stands")),
+            "{error:?}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     /// Forked: a new thread deep-copies a consumer block generically from its

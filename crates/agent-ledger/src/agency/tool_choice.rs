@@ -52,14 +52,18 @@ impl ToolChoice {
 impl super::LeafKind for ToolChoice {
     const KINDS: &'static [&'static str] = &["tool_choice"];
 
-    /// The names the store's read already decoded into a list of strings.
+    /// The names, read the library's usual way: total, lenient, and falling
+    /// back to the empty list, like every other kind's parse.
     ///
-    /// Nothing else can arrive here: the stored column is read through one
-    /// decoding (`store::tool_choice::decode_tool_names`), which refuses a
-    /// column holding anything but that list instead of handing a shortened
-    /// one on. So the empty list this falls back to means a block carrying no
-    /// names, never a name dropped on the way in — and those two mean opposite
-    /// things to the resolution.
+    /// The strictness sits at the store's read instead, which is where loaded
+    /// blocks come from. The stored column goes through one decoding
+    /// (`store::tool_choice::decode_tool_names`), which refuses a column
+    /// holding anything but a list of strings instead of handing a shortened
+    /// one on — so for a block that came out of a ledger, the empty list means
+    /// a record carrying no names and never a name dropped on the way in, and
+    /// those two mean opposite things to the resolution. A block assembled in
+    /// memory answers to whoever assembled it; this reads what it finds and
+    /// claims nothing about where it came from.
     fn parse(block: &Block) -> Self {
         Self {
             names: block

@@ -132,7 +132,7 @@ async fn single_call_parks_then_fires_on_its_result() {
 #[tokio::test]
 async fn a_tool_choice_over_an_unanswered_message_leaves_the_message_owed() {
     let o = Oracle::new().await;
-    let said = o.user_text("answer me").await;
+    o.user_text("answer me").await;
     assert!(o.drive().await.owes_turn, "the message owes a turn");
 
     o.ctx
@@ -153,7 +153,6 @@ async fn a_tool_choice_over_an_unanswered_message_leaves_the_message_owed() {
 
     // And it is the MESSAGE that is still owed, not the record: answering the
     // message rests the frontier even with the record standing behind it.
-    let _ = said;
     o.assistant_text("here you are").await;
     assert!(
         !o.drive().await.owes_turn,

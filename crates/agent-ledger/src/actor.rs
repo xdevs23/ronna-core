@@ -1283,8 +1283,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         // the very same function on its own snapshot, so what the model is
         // shown and what a call resolves against can never disagree — and
         // this site still names no kind and branches on no type string.
-        let registry = self.ctx.runner.registry();
-        let tool_defs = ResolvedTools::of(&blocks, registry).definitions(registry);
+        let tool_defs = ResolvedTools::of(&blocks, self.ctx.runner.registry()).definitions();
         // The stored form is the level's canonical key; a key this build does
         // not know defers to the provider's own default rather than failing
         // the turn.

@@ -128,7 +128,9 @@ pub enum StoreError {
     /// missing, a declared column is missing or collides with a reserved name,
     /// or its table or a kind collides with another descriptor or the library's
     /// own set. The open fails loudly instead of leaving a kind that would load
-    /// empty payloads silently.
+    /// empty payloads silently. A withdrawal answers here too, for the same
+    /// reason: a table declared and withdrawn at once, or withdrawn and still
+    /// in the schema, is a declaration the database contradicts.
     #[error("descriptor for table '{table}' is invalid: {reason}")]
     InvalidDescriptor {
         /// The table the failing descriptor names.
@@ -385,6 +387,13 @@ impl Store {
         }
 
         descriptors::validate(&conn, descriptors, withdrawn_tables, &core_tables)?;
+
+        // The withdrawal's other half, checked now that the migrations have
+        // run: the consumer's migration drops the table and clears its
+        // registry row, and a withdrawal whose schema change never happened
+        // fails the open instead of serving a table no descriptor covers.
+        descriptors::check_withdrawals(&conn, withdrawn_tables)?;
+
         descriptors::record_registry(&conn, descriptors)?;
 
         // A descriptor's domain is ready the moment its schema validated: its

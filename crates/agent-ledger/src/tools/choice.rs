@@ -11,7 +11,7 @@ use crate::agency::ToolChoice;
 use crate::block::Block;
 use crate::providers::types::ToolDefinition;
 
-use super::ToolRegistry;
+use super::{ToolHandler, ToolRegistry};
 
 /// The tools one conversation has: its newest recorded choice intersected with
 /// the registry this process loaded.
@@ -34,14 +34,19 @@ use super::ToolRegistry;
 /// The names come out in the registry's own sorted order, whatever order they
 /// were recorded in, so the schema list a turn is offered never reorders
 /// between processes.
-pub(crate) struct ResolvedTools {
+///
+/// The registry the set was resolved from is held here, and no accessor takes
+/// one: a set is a projection OF one registry, and a second registry offered to
+/// an accessor would answer for tools this set never intersected.
+pub(crate) struct ResolvedTools<'r, E> {
+    registry: &'r ToolRegistry<E>,
     names: Vec<String>,
 }
 
-impl ResolvedTools {
+impl<'r, E> ResolvedTools<'r, E> {
     /// Resolve a conversation's tools from the ledger snapshot the caller
     /// already holds. Both callers hold one; neither reads a second.
-    pub(crate) fn of<E>(ledger: &[Block], registry: &ToolRegistry<E>) -> Self {
+    pub(crate) fn of(ledger: &[Block], registry: &'r ToolRegistry<E>) -> Self {
         let recorded = ToolChoice::newest_in(ledger);
         let names = registry
             .names()
@@ -52,12 +57,17 @@ impl ResolvedTools {
             })
             .map(str::to_owned)
             .collect();
-        Self { names }
+        Self { registry, names }
     }
 
-    /// Whether this conversation has the named tool — the runner's question.
-    pub(crate) fn holds(&self, name: &str) -> bool {
-        self.names.iter().any(|held| held == name)
+    /// The handler a call name resolves to for this conversation — the
+    /// runner's question. A name the set does not carry answers `None` even
+    /// when the registry holds it, so the handler is reached through the set
+    /// and never beside it.
+    pub(crate) fn handler(&self, name: &str) -> Option<&dyn ToolHandler<E>> {
+        self.registry
+            .get(name)
+            .filter(|_| self.names.iter().any(|held| held == name))
     }
 
     /// The tools this conversation has, in sorted order — what an unresolved
@@ -68,11 +78,11 @@ impl ResolvedTools {
 
     /// The model-facing definitions of exactly these tools — the dispatch's
     /// question. An empty set offers nothing.
-    pub(crate) fn definitions<E>(&self, registry: &ToolRegistry<E>) -> Vec<ToolDefinition> {
+    pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
         self.names
             .iter()
-            .filter_map(|name| registry.get(name))
-            .map(super::ToolHandler::definition)
+            .filter_map(|name| self.registry.get(name))
+            .map(ToolHandler::definition)
             .collect()
     }
 }

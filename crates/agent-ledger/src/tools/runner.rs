@@ -504,11 +504,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
         // rule the dispatch offered its definitions by — so a name the model
         // was shown resolves here, and a name it was not shown cannot.
         let resolved = ResolvedTools::of(&ledger, &self.registry);
-        let Some(handler) = self
-            .registry
-            .get(&call.name)
-            .filter(|_| resolved.holds(&call.name))
-        else {
+        let Some(handler) = resolved.handler(&call.name) else {
             // The model-facing sentence must not tell the two cases apart —
             // naming a registered-but-excluded tool would disclose the
             // registry — but the log serves the operator, and to them the
