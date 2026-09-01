@@ -521,6 +521,70 @@ async fn a_compacted_thread_carries_the_sources_newest_tool_choice() {
     );
 }
 
+/// AC14, the overlap it leaves open — a source whose newest record lies PAST
+/// the cut hands that record across twice: once written by the opening, once
+/// inherited with the second half, which carries the source's rows verbatim.
+///
+/// Both name the same tools, and a later record superseding an earlier one is
+/// the kind's own rule, so the copy IS the same decision stated twice and both
+/// readers of the thread answer exactly what the source said. Suppressing the
+/// second one costs more than it saves: the junction copy is general and
+/// carries every kind alike, and teaching it about this one would put the
+/// kind's name inside a mechanism that must not know it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_past_the_cut_rides_across_twice_and_answers_the_same() {
+    let (ctx, _offered) = consumer_runtime().await;
+    let store = ctx.store();
+    let source = conversation(&ctx).await;
+    let cut = store
+        .compaction_cut(source)
+        .await
+        .unwrap()
+        .expect("the ledger splits");
+    // Recorded after the cut was taken, so the record sits in the half that
+    // rides across verbatim.
+    store
+        .append_tool_choice(source, vec!["lookup".into()])
+        .await
+        .unwrap();
+
+    let thread = store
+        .open_compacted_thread(
+            source,
+            cut.first_half_ends,
+            CompactedThread {
+                ancestor_conversation_id: source,
+                system_prompt: None,
+                compaction_message: SUMMARY.into(),
+                model: ModelOverride::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let blocks = store.list_blocks(thread).await.unwrap();
+    assert_eq!(
+        blocks
+            .iter()
+            .filter(|block| block.block_type == ToolChoice::KINDS[0])
+            .count(),
+        2,
+        "the written record and the inherited one both land"
+    );
+    assert_eq!(
+        store.newest_tool_choice(thread).await.unwrap(),
+        Some(vec!["lookup".to_owned()]),
+        "the statement reads the source's tools and no shortened list"
+    );
+    assert_eq!(
+        ToolChoice::newest_in(&blocks)
+            .expect("the thread carries the record")
+            .names,
+        vec!["lookup".to_owned()],
+        "and the ledger fold agrees with it"
+    );
+}
+
 /// AC14's other half — a source that recorded no choice hands none on.
 /// Inventing one here would decide for a consumer that has not decided, and
 /// the two answers are different: no record is every registered tool, an

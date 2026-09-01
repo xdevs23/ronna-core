@@ -509,8 +509,15 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
             .get(&call.name)
             .filter(|_| resolved.holds(&call.name))
         else {
+            // The model-facing sentence must not tell the two cases apart —
+            // naming a registered-but-excluded tool would disclose the
+            // registry — but the log serves the operator, and to them the
+            // cases are opposites: an unregistered name in a call is a
+            // deployment defect, an excluded one is the conversation's own
+            // recorded decision working.
             warn!(
                 name = call.name,
+                registered = self.registry.get(&call.name).is_some(),
                 "tool runner: the conversation has no such tool"
             );
             // The two sentences differ in what a next round can do, and the
@@ -594,7 +601,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
     /// an interactive call, whose admission belongs to the human, are no more
     /// refusable by a tool's window than by the conversation's. The human's
     /// standing arrives from the caller, folded once on the snapshot this
-    /// skip and the gate's own admit below both read.
+    /// skip and the human's own [`cleared`](Self::cleared) below both read.
     ///
     /// The GLOBAL window speaks FIRST and a tool's own second (2026-08-30).
     /// The order is observable only in which text lands, and the

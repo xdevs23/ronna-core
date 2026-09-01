@@ -65,8 +65,9 @@ impl Store {
 /// Append one tool choice block. Called inside a transaction, so its header,
 /// junction and content rows land together — the fork doors reach it directly.
 ///
-/// The names are serialized in ONE place, here, and parsed in one place, the
-/// block query's own read, so no second encoding of the list exists.
+/// The names are serialized in ONE place, here, and read back in one,
+/// [`decode_tool_names`], so no second encoding and no second reading of the
+/// stored list exists.
 pub(super) fn insert_tool_choice_block(
     conn: &Connection,
     conversation_id: i64,
@@ -104,13 +105,26 @@ pub(super) fn newest_tool_choice(
     let Some(stored) = stored else {
         return Ok(None);
     };
-    let names: Vec<String> = serde_json::from_str(&stored).map_err(|error| {
+    let names = decode_tool_names(&stored).map_err(|error| {
         StoreError::Other(format!(
             "conversation {conversation_id} records a tool choice whose names do not \
              parse: {error}"
         ))
     })?;
     Ok(Some(names))
+}
+
+/// Read the stored column back into the list [`insert_tool_choice_block`]
+/// wrote — the ONE decoding of that form, called by both readers of a stored
+/// row: the statement above, and the block query's own read.
+///
+/// The strictness is the point of sharing it. A list of anything but strings
+/// is a corrupt row, and it has to be corrupt to BOTH readers: a column
+/// holding `[1, 2]` decoded leniently would hand the resolution an empty list,
+/// which reads as the opposite decision — this conversation has no tools —
+/// while the other reader refused the same row. One decoding, one answer.
+pub(super) fn decode_tool_names(stored: &str) -> Result<Vec<String>, serde_json::Error> {
+    serde_json::from_str(stored)
 }
 
 #[cfg(test)]
@@ -196,6 +210,42 @@ mod tests {
                 .names,
             Vec::<String>::new()
         );
+    }
+
+    /// A column holding a list of anything but strings is corrupt to BOTH
+    /// readers of a stored row, and to neither of them a conversation that
+    /// chose no tools — the answer a lenient decoding would have produced
+    /// through the block query while the statement refused the same row.
+    #[tokio::test]
+    async fn a_column_that_is_not_a_list_of_names_is_refused_by_both_readers() {
+        let store = Store::in_memory().unwrap();
+        let conv = conversation(&store).await;
+        let block_id = store
+            .append_tool_choice(conv, vec!["read".into()])
+            .await
+            .unwrap();
+
+        for corrupt in ["[1, 2]", "{}", "not json"] {
+            store
+                .run(move |conn| {
+                    conn.execute(
+                        "UPDATE block_tool_choice SET names = ?1 WHERE block_id = ?2",
+                        params![corrupt, block_id],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                store.newest_tool_choice(conv).await.is_err(),
+                "the statement refuses {corrupt}"
+            );
+            assert!(
+                store.list_blocks(conv).await.is_err(),
+                "the block query refuses {corrupt} too, instead of reading it as no tools"
+            );
+        }
     }
 
     /// AC1 — the record projects nothing, awaits nobody, and the two readers

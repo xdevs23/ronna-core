@@ -39,7 +39,10 @@ use rusqlite::Connection;
 /// becomes `user_version` `i + 1`.
 ///
 /// Design rules the schema holds to:
-///   - No JSON blobs. Every datum has its own column.
+///   - No JSON blobs. Every datum has its own column. One recorded exception
+///     (2026-09-01): the tool choice's names in v7, a list that is one
+///     decision's content, where a row per name would make the block query
+///     return several rows for one block — see the v7 entry.
 ///   - Blocks are the primary conversational unit, each carrying its own role.
 ///   - Content lives in typed block content tables, one per block type.
 ///   - The junction table (`conversation_blocks`) enables forking at block

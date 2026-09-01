@@ -52,6 +52,14 @@ impl ToolChoice {
 impl super::LeafKind for ToolChoice {
     const KINDS: &'static [&'static str] = &["tool_choice"];
 
+    /// The names the store's read already decoded into a list of strings.
+    ///
+    /// Nothing else can arrive here: the stored column is read through one
+    /// decoding (`store::tool_choice::decode_tool_names`), which refuses a
+    /// column holding anything but that list instead of handing a shortened
+    /// one on. So the empty list this falls back to means a block carrying no
+    /// names, never a name dropped on the way in — and those two mean opposite
+    /// things to the resolution.
     fn parse(block: &Block) -> Self {
         Self {
             names: block

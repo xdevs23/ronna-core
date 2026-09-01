@@ -8,6 +8,7 @@ use crate::block::{Block, OpaquePayload, ReasoningDetailEntry, Role};
 
 use super::block_content::parse_role;
 use super::descriptors::{ContentDescriptor, overlay_consumer_content, read_quoted_text};
+use super::tool_choice::decode_tool_names;
 use super::{DomainGate, StoreError};
 
 /// One statement joining every LIBRARY content table by name — the core kinds'
@@ -430,24 +431,24 @@ fn structural_payload(
             );
         }
         // Roleless in the row, and carrying the one list this schema holds in
-        // a column: the tool names, serialized. Parsed HERE, at the read, so
-        // the kind is handed the names and no second place ever parses the
-        // stored form. A column that does not parse is a corrupt row, not an
-        // empty choice — the two mean opposite things to the resolution — so
-        // it is reported instead of resolving to nothing.
+        // a column: the tool names, serialized. Read back through the one
+        // decoding of that form, the writer's own `decode_tool_names`, so the
+        // kind is handed a list of strings and the other reader of a stored
+        // row cannot answer differently. A column that does not hold
+        // that list is a corrupt row, not an empty choice — the two mean
+        // opposite things to the resolution — so it is reported instead of
+        // resolving to nothing.
         "tool_choice" => {
             let stored = required_str(row, "btch_names", block_id, block_type)?;
-            let names: Value = serde_json::from_str(&stored).map_err(|error| {
+            let names = decode_tool_names(&stored).map_err(|error| {
                 StoreError::Other(format!(
                     "block {block_id} records a tool choice whose names do not parse: {error}"
                 ))
             })?;
-            if !names.is_array() {
-                return Err(StoreError::Other(format!(
-                    "block {block_id} records a tool choice whose names are not a list"
-                )));
-            }
-            fields.insert("names".into(), names);
+            fields.insert(
+                "names".into(),
+                Value::Array(names.into_iter().map(Value::String).collect()),
+            );
         }
         // Roleless in the row — its grouping under the harness's voice is the
         // KIND's projection fact, not a stored column.
