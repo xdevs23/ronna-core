@@ -1250,14 +1250,10 @@ mod tests {
         o.ctx
             .store
             .run(|conn| {
-                // An OPERATIONAL failure (2026-09-01): the trigger reaches
-                // for a table that does not exist, so the persist fails
-                // without claiming the database is in a state the design
-                // forbids — which a `RAISE(ABORT)` would, and which now ends
-                // the process.
+                // Every metadata persist is refused from here on.
                 conn.execute(
                     "CREATE TRIGGER injected_metadata_failure BEFORE INSERT ON metadata \
-                     BEGIN INSERT INTO no_such_table_for_the_injected_failure VALUES (1); END",
+                     BEGIN SELECT RAISE(ABORT, 'injected metadata failure'); END",
                     [],
                 )
                 .map(|_| ())

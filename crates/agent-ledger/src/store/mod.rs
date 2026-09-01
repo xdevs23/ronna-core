@@ -29,12 +29,12 @@ mod attachments;
 mod block_cloner;
 mod block_content;
 mod blocks;
+mod classify;
 mod compaction;
 mod conversations;
 mod date_markers;
 mod descriptors;
 mod drafts;
-mod integrity;
 mod messages;
 mod metadata;
 mod migrations;
@@ -63,19 +63,43 @@ pub use descriptors::{
     concat_descriptors, descriptor_count,
 };
 pub use drafts::DraftBlock;
-pub use integrity::IntegrityCheck;
 pub use messages::{BlockDestination, JoinedBlock, ToolCallInsert};
 pub use models::ModelEntry;
 pub use providers::ProviderInstance;
 
 /// Everything that can go wrong reaching the store.
+///
+/// The first four hold what the database said, sorted into the classes that
+/// decide who can act on one. The sorting happens in the conversion from the
+/// database library's error into this one, so it happens once for every `?` in
+/// this library and in a consumer's own tables. The store
+/// itself acts on none of them: it wraps the error and hands it back, and the
+/// code above, which knows how far the failure reaches, chooses what to do.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    /// The database refused the statement.
+    /// The write contradicts the schema: a foreign key with no parent, a row
+    /// that is already there, a CHECK that said no. The statement did not run
+    /// and the database is intact. An expectable error — the code that made the
+    /// write is the code that knows what its refusal means.
+    #[error("database refused the statement: {0}")]
+    Rejected(rusqlite::Error),
+    /// Another writer held what this statement needed. Nothing happened, and
+    /// running it again may well succeed. Only the caller knows whether a retry
+    /// makes sense for what it was doing.
+    #[error("database is contended: {0}")]
+    Contended(rusqlite::Error),
+    /// The file is damaged, is not a database, or this code called the library
+    /// in a way its contract forbids. Nothing above can repair it and every
+    /// later statement on this connection is in the same doubt.
+    #[error("database is unusable: {0}")]
+    Unusable(rusqlite::Error),
+    /// The database refused the statement for an ordinary reason: out of space,
+    /// an I/O error, a value past a limit, a statement that would not compile.
     #[error("database error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(rusqlite::Error),
     /// The actor thread is gone, so nothing can be run against the connection
-    /// any more.
+    /// any more. Its one writer ended — by a panic in a statement, or with the
+    /// store dropped — and no write submitted from here on will happen.
     #[error("store actor stopped")]
     ActorStopped,
     /// A block header exists with no row in the content table its kind stores
@@ -149,11 +173,9 @@ pub enum StoreError {
 /// [`domain_run`] and [`domain_migrate`]; it travels the channel [`StoreTx`]
 /// names, which is why it is public at all.
 ///
-/// Both variants are `non_exhaustive` (2026-09-01) so that stays true from
-/// outside this library as well: a hand-rolled `Query` could hold a closure
-/// that ignores the [`IntegrityCheck`] it is handed, and the guarantee that
-/// every answer is judged would then rest on a convention a consumer cannot
-/// see. Construction through the two doors is the guarantee.
+/// Both variants are `non_exhaustive` so a field added here does not break a
+/// consumer, which is the ordinary reason: the two doors above stay the way one
+/// is built.
 pub enum StoreOp {
     /// A domain submits its migrations. The actor runs them and signals
     /// completion through `done`. Every query for that domain waits until it
@@ -186,13 +208,10 @@ pub enum StoreOp {
 /// failed: a query whose tables may not exist is answered, never run and never
 /// left parked.
 ///
-/// The second argument is the actor thread's [`IntegrityCheck`] (2026-09-01).
-/// Every answer passes through it here, where the error is still a typed
-/// `rusqlite` failure and still on this thread, so a database in a state the
-/// design forbids takes the process down before its answer can be acted on.
-/// [`domain_run`] does this for every query the library and its consumers
-/// send.
-pub type QueryFn = Box<dyn FnOnce(Result<&mut Connection, StoreError>, &IntegrityCheck) + Send>;
+/// Whatever it answers travels back untouched. This thread reads no result
+/// code and reacts to nothing (2026-09-01): the error arrives at the caller
+/// already carrying its class — see [`StoreError`] — and the caller decides.
+pub type QueryFn = Box<dyn FnOnce(Result<&mut Connection, StoreError>) + Send>;
 
 /// A handle on the store actor's channel. A consumer's own tables hold one of
 /// these to send closures to the same actor thread — one writer, whoever is
@@ -396,18 +415,21 @@ impl Store {
         let gate = DomainGate::default();
         let actor_gate = gate.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        // A panic on this thread is the same fact the integrity check acts on:
-        // the one writer is gone and nothing it was in the middle of is
-        // known to have finished. Letting the thread die would merely close
-        // the channel, and every caller would read `ActorStopped` — an
-        // ordinary-looking error for a process that can no longer write
-        // anything. Abort instead (2026-09-01).
+        // A panic on this thread ends the one writer. Catching it here is for
+        // the log line alone — what the panic said would otherwise be the only
+        // record of why writes stopped. The unwind is not resumed and the
+        // process is not ended: the thread finishes, its channel closes, and
+        // every caller from then on reads `StoreError::ActorStopped`, which is
+        // this fact stated as an error the code above can act on (2026-09-01).
         std::thread::spawn(move || {
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 Self::actor(rx, conn, premigrated, &actor_gate);
             }));
             if run.is_err() {
-                integrity::abort_on_impossible_state("the store's actor thread panicked");
+                tracing::error!(
+                    "store: the actor thread panicked — its connection is gone and every later \
+                     call answers ActorStopped"
+                );
             }
         });
 
@@ -437,10 +459,6 @@ impl Store {
 
         let mut migrated: HashSet<&'static str> = premigrated;
         let mut deferred: HashMap<&'static str, VecDeque<QueryFn>> = HashMap::new();
-        // The right to judge an answer lives here and nowhere else: one
-        // thread, one check, under every caller.
-        let integrity = IntegrityCheck::new();
-
         while let Some(op) = rx.blocking_recv() {
             match op {
                 StoreOp::Migration { domain, sqls, done } => {
@@ -455,7 +473,7 @@ impl Store {
                             let _ = done.send(Ok(()));
                             // Drain whatever queued up while this domain waited.
                             for f in deferred.remove(domain).unwrap_or_default() {
-                                f(Ok(&mut conn), &integrity);
+                                f(Ok(&mut conn));
                             }
                         }
                         Err(failure) => {
@@ -465,7 +483,7 @@ impl Store {
                             // queries loose on a schema whose state is unknown,
                             // and dropping it would park its caller forever.
                             for f in deferred.remove(domain).unwrap_or_default() {
-                                f(Err(failure.error(domain)), &integrity);
+                                f(Err(failure.error(domain)));
                             }
                             gate.record(domain, failure);
                         }
@@ -473,9 +491,9 @@ impl Store {
                 }
                 StoreOp::Query { domain, f } => {
                     if let Some(refusal) = gate.failure(domain) {
-                        f(Err(refusal), &integrity);
+                        f(Err(refusal));
                     } else if migrated.contains(domain) {
-                        f(Ok(&mut conn), &integrity);
+                        f(Ok(&mut conn));
                     } else {
                         deferred.entry(domain).or_default().push_back(f);
                     }
@@ -740,13 +758,11 @@ where
 /// domain's migrations failed, or [`StoreError::ActorStopped`] if the actor
 /// thread is gone.
 ///
-/// # Aborts
-///
-/// The answer is judged on the actor thread before it travels back
-/// (2026-09-01): a database in a state the design forbids — a violated
-/// constraint, a corrupt or misused file, a missing row a query guarantees —
-/// ends the process here. See [`IntegrityCheck`]. This is why no caller of
-/// this function classifies a database error, and why none can.
+/// A database error the closure returns arrives already sorted into its class —
+/// refused, contended, unusable, or ordinary — because the conversion into
+/// [`StoreError`] does that once for every `?`. Nothing here reacts to it: the
+/// error is the caller's to act on, and only the caller knows how far its
+/// failure reaches (2026-09-01).
 pub async fn domain_run<F, R>(tx: &StoreTx, domain: &'static str, f: F) -> Result<R, StoreError>
 where
     F: FnOnce(&mut Connection) -> Result<R, StoreError> + Send + 'static,
@@ -755,14 +771,11 @@ where
     let (resp_tx, resp_rx) = oneshot::channel();
     tx.send(StoreOp::Query {
         domain,
-        f: Box::new(move |target, integrity| {
+        f: Box::new(move |target| {
             let answer = match target {
                 Ok(conn) => f(conn),
                 Err(migration_failure) => Err(migration_failure),
             };
-            // Before the answer leaves this thread, and so before anything
-            // can act on it.
-            integrity.judge(&answer);
             let _ = resp_tx.send(answer);
         }),
     })
@@ -1414,11 +1427,11 @@ mod tests {
         assert_eq!(s.list_blocks(c1).await.unwrap().len(), 3);
     }
 
-    /// A fork whose source was deleted under it is REFUSED, never an abort
-    /// (2026-09-01). The compaction races exactly this: the cut is taken, the
-    /// source is deleted, and the fork arrives after it. The source id is the
-    /// caller's, so its absence is an answer the caller reads — the integrity
-    /// check must never meet it as a missing guaranteed row.
+    /// A fork whose source was deleted under it is REFUSED, and the refusal is
+    /// an answer the caller reads (2026-09-01). The compaction races exactly
+    /// this: the cut is taken, the source is deleted, and the fork arrives
+    /// after it. The source id is the caller's, so its absence is a fact about
+    /// the caller's request, checked here and named.
     #[tokio::test]
     async fn forking_a_conversation_that_is_gone_is_refused() {
         let s = store();

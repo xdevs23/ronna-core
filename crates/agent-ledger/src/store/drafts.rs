@@ -210,9 +210,9 @@ impl Store {
 
             // A conversation with nothing drafted is an ordinary answer, not a
             // broken database, so it is reported as this library's own refusal
-            // (2026-09-01). Written as a missing row it would read as a query
-            // the design guarantees, and the integrity check would take the
-            // process down for a caller that simply promoted an empty draft.
+            // (2026-09-01). Legal absence is written as `Option` — `.optional()`
+            // here — never as the database library's missing-row error, which
+            // reads as a query that was supposed to answer.
             let draft_id: i64 = tx
                 .prepare("SELECT id FROM drafts WHERE conversation_id = ?1")?
                 .query_row([conversation_id], |row| row.get(0))
