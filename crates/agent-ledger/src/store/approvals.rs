@@ -6,7 +6,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::types::{ApprovalChoice, denial_error_text};
 
 use super::messages::{BlockDestination, anchor_of, insert_block};
-use super::tool_calls::call_resolution_exists;
+use super::tool_calls::{call_resolution_exists, provider_id_of_call};
 use super::{Store, StoreError, transact};
 
 impl Store {
@@ -36,20 +36,10 @@ impl Store {
     ) -> Result<Option<i64>, StoreError> {
         self.run(move |conn| {
             transact(conn, |tx| {
-                let covers_a_call: bool = tx.query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM block_tool_call btc
-                         JOIN conversation_blocks cb ON cb.block_id = btc.block_id
-                         WHERE btc.block_id = ?1 AND cb.conversation_id = ?2)",
-                    params![for_block_id, conversation_id],
-                    |row| row.get(0),
-                )?;
-                if !covers_a_call {
-                    return Err(StoreError::Other(format!(
-                        "block {for_block_id} is not a tool call in conversation \
-                         {conversation_id}: an approval request can only cover a call"
-                    )));
-                }
+                // A request can only cover a call, and that is the question the
+                // resolution door's reader already answers, with its sentence.
+                // The provider id it reads back is nothing this write needs.
+                provider_id_of_call(tx, conversation_id, for_block_id)?;
                 let already_covered: bool = tx.query_row(
                     "SELECT EXISTS(
                          SELECT 1 FROM block_approval_request bar
@@ -558,7 +548,7 @@ mod tests {
             match refused {
                 Err(crate::store::StoreError::Other(message)) => {
                     assert!(
-                        message.contains(&bogus.to_string()) && message.contains("not a tool call"),
+                        message.contains(&bogus.to_string()) && message.contains("no tool call"),
                         "the refusal names the block: {message}"
                     );
                 }

@@ -48,8 +48,8 @@ pub mod stream_status {
     /// non-empty text delta.
     pub const RESPONDING: &str = "responding";
     /// One tool call began streaming: raised once per call, at the moment the
-    /// model starts composing that call's arguments. The tool's registered
-    /// name travels in the status subtitle.
+    /// model starts composing that call's arguments. The name the model called
+    /// the tool by travels in the status subtitle, as the provider sent it.
     pub const STARTING_TOOL_CALL: &str = "starting_tool_call";
 }
 
@@ -111,11 +111,14 @@ pub enum CoreEvent {
     /// - `waiting_for_response` — the stream is open, no content yet.
     /// - `starting_tool_call` — one tool call began streaming: raised once per
     ///   call, at the moment the model starts composing that call's arguments,
-    ///   and never for text or for thinking. `subtitle` carries the tool's
-    ///   registered name, so a consumer can light a cue for the tool being
-    ///   called before its arguments have finished arriving. Distinct from
-    ///   `running_tools`, which is one signal for the whole turn and means
-    ///   execution began.
+    ///   and never for text or for thinking. `subtitle` carries the name the
+    ///   model called the tool by, verbatim from the provider: the registry is
+    ///   consulted only when the call executes, so a name registered nowhere
+    ///   reaches this status unchanged and a consumer matching its own tool
+    ///   names simply matches none of them. With that, a consumer can light a
+    ///   cue for the tool being called before its arguments have finished
+    ///   arriving. Distinct from `running_tools`, which is one signal for the
+    ///   whole turn and means execution began.
     /// - `running_tools` — the turn stopped for tool use and the calls are
     ///   executing.
     /// - `responding` — user-visible text is flowing: raised once per turn at
@@ -130,8 +133,9 @@ pub enum CoreEvent {
         /// Stable machine key from the vocabulary above, empty to clear.
         label: String,
         /// The detail its own label documents above, when that label has one:
-        /// the provider's status line under `sending`, the tool's registered
-        /// name under `starting_tool_call`. `None` everywhere else.
+        /// the provider's status line under `sending`, the name the model
+        /// called the tool by under `starting_tool_call`. `None` everywhere
+        /// else.
         subtitle: Option<String>,
     },
     /// A turn's stream finished.

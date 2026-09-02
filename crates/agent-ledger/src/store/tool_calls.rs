@@ -38,6 +38,36 @@ pub(super) fn call_resolution_exists(
     )
 }
 
+/// The provider's `tool_call_id` on a recorded call, answering the
+/// conversation-scoped question "is this block a tool call of this
+/// conversation" along the way: the id when it is one, the refusal sentence
+/// when it is not. Joined through the junction, so a fork answers off its own
+/// ledger.
+///
+/// The join and the sentence live here once. [`Store::resolve_tool_call`]
+/// needs the id, [`Store::insert_approval_request_block`] needs only that the
+/// block is a call and discards the id, and neither carries a copy of the
+/// question that could drift from this one.
+pub(super) fn provider_id_of_call(
+    conn: &Connection,
+    conversation_id: i64,
+    call_block_id: i64,
+) -> Result<String, StoreError> {
+    conn.query_row(
+        "SELECT btc.tool_call_id FROM block_tool_call btc
+         JOIN conversation_blocks cb ON cb.block_id = btc.block_id
+         WHERE btc.block_id = ?1 AND cb.conversation_id = ?2",
+        params![call_block_id, conversation_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .ok_or_else(|| {
+        StoreError::Other(format!(
+            "block {call_block_id} is no tool call of conversation {conversation_id}"
+        ))
+    })
+}
+
 /// How a call settled outside the runner, for
 /// [`Store::resolve_tool_call`].
 ///
@@ -229,33 +259,6 @@ impl Store {
         .await
     }
 
-    /// Read the provider's id off a recorded call, so a resolution never has
-    /// to be handed the echo it must carry. Answers `Other` when the block is
-    /// no tool call of this conversation, which is the only way the id can be
-    /// missing.
-    async fn provider_id_of_call(
-        &self,
-        conversation_id: i64,
-        call_block_id: i64,
-    ) -> Result<String, StoreError> {
-        self.run(move |conn| {
-            conn.query_row(
-                "SELECT btc.tool_call_id FROM block_tool_call btc
-                 JOIN conversation_blocks cb ON cb.block_id = btc.block_id
-                 WHERE btc.block_id = ?1 AND cb.conversation_id = ?2",
-                params![call_block_id, conversation_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                StoreError::Other(format!(
-                    "block {call_block_id} is no tool call of conversation {conversation_id}"
-                ))
-            })
-        })
-        .await
-    }
-
     /// Resolve a pending tool call from outside the runner, naming the call by
     /// its BLOCK id: the identity the ledger keys a resolution on, and the one
     /// a deferring body was handed
@@ -305,7 +308,7 @@ impl Store {
         resolution: CallResolution,
     ) -> Result<Option<i64>, StoreError> {
         let tool_call_id = self
-            .provider_id_of_call(conversation_id, call_block_id)
+            .run(move |conn| provider_id_of_call(conn, conversation_id, call_block_id))
             .await?;
         match resolution {
             CallResolution::Completed(result) => {
