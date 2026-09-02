@@ -195,8 +195,14 @@ pub struct ReasoningDetailEntry {
     pub signature: Option<String>,
 }
 
-/// The outcome of a tool call, as stored in the ledger.
-#[derive(Debug, Clone, Serialize)]
+/// The outcome of a tool call: what the ledger stores, what a read of a
+/// resolved call answers, and what a backing system supplies when it settles a
+/// deferred call through
+/// [`Store::resolve_tool_call`](crate::store::Store::resolve_tool_call). One
+/// vocabulary for one fact — which way the work came out, and the text the
+/// model reads. The facts a resolver may NOT choose (the turn-ending stamp and
+/// whether a failure was a refusal) are not here: the writes decide those.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ToolCallResult {
     /// The call ran and produced output.

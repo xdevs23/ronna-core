@@ -90,10 +90,10 @@ pub enum ToolOutcome {
     /// instead — the distinction is what the count means.
     Refused(String),
     /// The body handed the work to a backing system that will resolve the call
-    /// itself, later, through the conditional resolution write
-    /// ([`Store::resolve_tool_call`](crate::store::Store::resolve_tool_call),
+    /// itself, later, through the one door for that:
+    /// [`Store::resolve_tool_call`](crate::store::Store::resolve_tool_call),
     /// which carries either outcome and reads the provider's id off the call
-    /// row). The backing system must keep the call's BLOCK id
+    /// row. The backing system must keep the call's BLOCK id
     /// ([`ToolContext::block_id`]) — that id keys the write, because a model's
     /// `tool_call_id` can repeat and the block id is the call's one identity.
     ///

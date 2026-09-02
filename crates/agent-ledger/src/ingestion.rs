@@ -1126,12 +1126,15 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
             .await
         {
             Ok(block_id) => {
-                // The per-call moment (2026-09-02): this call is being
-                // composed, and the status names WHICH tool. Raised per
-                // Start, so parallel siblings each raise their own, and
-                // raised nowhere else — text and thinking take the other
-                // labels. `running_tools` still speaks for the whole turn at
-                // the stop, and means execution began, not composition.
+                // The per-call moment (2026-09-02): the call is recorded, and
+                // the status names WHICH tool. Inside the success arm, so the
+                // status answers for a call the ledger holds and never for a
+                // write that failed. Raised per Start, so parallel siblings
+                // each raise their own, and raised nowhere else — text and
+                // thinking take the other labels. How early the Start itself
+                // arrives is the wire's to decide; `running_tools` still
+                // speaks for the whole turn at the stop, and means execution
+                // began.
                 self.ctx.bus.emit(CoreEvent::StreamStatus {
                     conversation_id: conv_id,
                     label: stream_status::STARTING_TOOL_CALL.into(),
@@ -2443,11 +2446,18 @@ mod tests {
         );
     }
 
-    /// The call-start status (2026-09-02): once per streamed call, carrying
+    /// The call-start status (2026-09-02): once per recorded call, carrying
     /// that call's own tool name, and raised by nothing else in the turn. Two
     /// parallel siblings therefore raise two, each naming its own tool, while
     /// the text and thinking deltas around them raise their own labels and
-    /// never this one.
+    /// never this one — the stream carries both, and both are covered by there
+    /// being exactly one status per CALL.
+    ///
+    /// The clears are not asserted: how many times flowing content clears the
+    /// label is that mechanism's business, and freezing the count here would
+    /// fail this test for a change it says nothing about. What is asserted is
+    /// the named statuses, and that of the labelled ones `responding` is the
+    /// only other — no stop for tool use arrived, so execution never began.
     #[tokio::test]
     async fn a_call_start_raises_one_status_per_call_naming_its_tool() {
         let (ctx, mut rx) = fixture().await;
@@ -2490,7 +2500,7 @@ mod tests {
             {
                 if label == stream_status::STARTING_TOOL_CALL {
                     named.push(subtitle);
-                } else {
+                } else if !label.is_empty() {
                     other.push(label);
                 }
             }
@@ -2498,18 +2508,14 @@ mod tests {
         assert_eq!(
             named,
             vec![Some("read_file".to_string()), Some("list_dir".to_string())],
-            "one status per call, in call order, each naming its own tool"
+            "one status per call, in call order, each naming its own tool — and \
+             none for the text and thinking this same stream carried"
         );
         assert_eq!(
             other,
-            vec![
-                String::new(),
-                String::new(),
-                stream_status::RESPONDING.to_string()
-            ],
-            "content flowing clears the label as it always did, the text keeps \
-             `responding` to itself, and no stop for tool use arrived so \
-             execution never began"
+            vec![stream_status::RESPONDING.to_string()],
+            "the text keeps `responding` to itself, and no stop for tool use \
+             arrived so execution never began"
         );
     }
 

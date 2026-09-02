@@ -533,8 +533,10 @@ mod tests {
     }
 
     /// A request can only cover a tool call: a text block and a missing id are
-    /// both refused at insert, with the block named — not accepted here to
-    /// surface later as a bare no-rows error on the denial path.
+    /// both refused at insert, through the typed
+    /// [`NoSuchToolCall`](crate::store::StoreError::NoSuchToolCall) naming the
+    /// block — not accepted here to surface later as a bare no-rows error on
+    /// the denial path.
     #[tokio::test]
     async fn a_request_over_a_non_call_is_refused_at_insert() {
         let (store, conv, _call) = fixture().await;
@@ -543,14 +545,15 @@ mod tests {
             .await
             .unwrap();
 
-        for bogus in [text, 999_999] {
+        for bogus in [text, i64::MAX] {
             let refused = store.insert_approval_request_block(conv, bogus).await;
             match refused {
-                Err(crate::store::StoreError::Other(message)) => {
-                    assert!(
-                        message.contains(&bogus.to_string()) && message.contains("no tool call"),
-                        "the refusal names the block: {message}"
-                    );
+                Err(crate::store::StoreError::NoSuchToolCall {
+                    block_id,
+                    conversation_id,
+                }) => {
+                    assert_eq!(block_id, bogus, "the refusal names the block");
+                    assert_eq!(conversation_id, conv, "and the ledger it was sought in");
                 }
                 other => panic!("expected the named refusal, got {other:?}"),
             }
