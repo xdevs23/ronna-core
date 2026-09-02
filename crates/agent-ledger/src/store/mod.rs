@@ -67,6 +67,7 @@ pub use drafts::DraftBlock;
 pub use messages::{BlockDestination, JoinedBlock, ToolCallInsert};
 pub use models::ModelEntry;
 pub use providers::ProviderInstance;
+pub use tool_calls::CallResolution;
 
 /// Everything that can go wrong reaching the store.
 ///

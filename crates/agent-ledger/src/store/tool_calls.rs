@@ -38,6 +38,22 @@ pub(super) fn call_resolution_exists(
     )
 }
 
+/// How a call settled outside the runner, for
+/// [`Store::resolve_tool_call`].
+///
+/// One type with two arms, because a backing system reporting back has one
+/// thing to say — which way the work came out — and the call it closes is the
+/// same call either way. The arm decides which of the two resolution writes
+/// runs; everything else about the write is identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallResolution {
+    /// The work finished. The text is the call's result, as the model reads it.
+    Completed(String),
+    /// The work was attempted and went wrong. The text is the reason, as the
+    /// model reads it.
+    Failed(String),
+}
+
 impl Store {
     /// Insert a `tool_result` block for a completed tool call — conditionally,
     /// in its own transaction, the same shape as the decision write: the insert
@@ -52,9 +68,11 @@ impl Store {
     /// `source_block_id` is the block id of the `tool_call` block this answers,
     /// and it is the identity the condition is keyed on: a model's
     /// `tool_call_id` can repeat, the block id cannot, so two calls sharing one
-    /// provider id resolve independently. This is the only PUBLIC door a result
-    /// takes into the ledger — a backing system resolving deferred work calls
-    /// it with the call block id it kept.
+    /// provider id resolve independently. A backing system resolving deferred
+    /// work calls this with the call block id it kept and the provider's id it
+    /// echoes; one holding the block id alone takes
+    /// [`resolve_tool_call`](Self::resolve_tool_call), which reads that echo
+    /// off the call row and reaches the same write.
     ///
     /// The result it writes is UNSTAMPED: it asks the model for its
     /// continuation, which is what every out-of-band resolution means. The
@@ -85,7 +103,8 @@ impl Store {
     }
 
     /// The resolution write itself, with the turn-ending stamp the caller
-    /// decided (2026-08-30) — ONE implementation, two doors.
+    /// decided (2026-08-30) — ONE implementation under every door that
+    /// completes a call.
     ///
     /// `ends_turn` is [`ToolHandler::ends_turn`](crate::ToolHandler::ends_turn)
     /// as the handler answered it at execution time. A stamped resolution asks
@@ -95,9 +114,9 @@ impl Store {
     /// moment it is known, on the row that must answer for it — the
     /// `dispatch_anchor` precedent class.
     ///
-    /// Crate-private on purpose: the public door above holds no handler and
-    /// must never invent the stamp, and a public parameter would offer every
-    /// caller a second place to decide what only the registry knows.
+    /// Crate-private on purpose: the public doors hold no handler and must
+    /// never invent the stamp, and a public parameter would offer every caller
+    /// a second place to decide what only the registry knows.
     ///
     /// # Errors
     ///
@@ -136,8 +155,9 @@ impl Store {
     /// call, `None` when a resolution already existed and nothing was written.
     ///
     /// `source_block_id` is the block id of the `tool_call` block this answers,
-    /// keyed the same way, and this is the only door an error takes into the
-    /// ledger.
+    /// keyed the same way, and
+    /// [`resolve_tool_call`](Self::resolve_tool_call) is its counterpart for a
+    /// caller holding the block id alone.
     ///
     /// The failure it writes is NOT a refusal: it records that something was
     /// attempted and went wrong, which is what a failure arriving from outside
@@ -166,8 +186,8 @@ impl Store {
     }
 
     /// The failure write itself, with the refusal fact the caller decided
-    /// (2026-09-01) — ONE implementation, two doors, the resolution path's own
-    /// shape.
+    /// (2026-09-01) — ONE implementation under every door that fails a call,
+    /// the resolution path's own shape.
     ///
     /// [`Refusal::Refused`] says the model spent a round and was handed only
     /// the reason, which is what the forced turn end counts a run of. Recorded
@@ -207,6 +227,108 @@ impl Store {
             })
         })
         .await
+    }
+
+    /// Read the provider's id off a recorded call, so a resolution never has
+    /// to be handed the echo it must carry. Answers `Other` when the block is
+    /// no tool call of this conversation, which is the only way the id can be
+    /// missing.
+    async fn provider_id_of_call(
+        &self,
+        conversation_id: i64,
+        call_block_id: i64,
+    ) -> Result<String, StoreError> {
+        self.run(move |conn| {
+            conn.query_row(
+                "SELECT btc.tool_call_id FROM block_tool_call btc
+                 JOIN conversation_blocks cb ON cb.block_id = btc.block_id
+                 WHERE btc.block_id = ?1 AND cb.conversation_id = ?2",
+                params![call_block_id, conversation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::Other(format!(
+                    "block {call_block_id} is no tool call of conversation {conversation_id}"
+                ))
+            })
+        })
+        .await
+    }
+
+    /// Resolve a pending tool call from outside the runner, naming the call by
+    /// its BLOCK id: the identity the ledger keys a resolution on, and the one
+    /// a deferring body was handed
+    /// ([`ToolContext::block_id`](crate::ToolContext::block_id)). This is the
+    /// door a backing system settling a [`Pending`](crate::ToolOutcome::Pending)
+    /// call takes, whichever way the work came out.
+    ///
+    /// The conversation scopes the call, because a fork shares its junction
+    /// rows: one call block can hang in several conversations and each resolves
+    /// on its own ledger.
+    ///
+    /// The provider's `tool_call_id` is READ off the call row, never supplied.
+    /// It is an echo the model pairs its call with, the row already
+    /// carries it, and a caller passing it could pass a different one — the
+    /// result would then answer a call the model never made.
+    ///
+    /// Answers `Some(block_id)` when this write resolved the call and `None`
+    /// when an outcome was already recorded: a settled call is left exactly as
+    /// it stands and nothing is appended, so a repeated report is a no-op
+    /// instead of a second outcome.
+    ///
+    /// The resolution carries the same two facts the runner's own resolution
+    /// carries, through those same writes:
+    ///
+    /// - the turn-ending stamp
+    ///   ([`ToolHandler::ends_turn`](crate::ToolHandler::ends_turn)), written
+    ///   unstamped. That is the handler's own answer for every call this door
+    ///   can reach: a handler that ends the turn cannot defer — the runner
+    ///   refuses a pending outcome from one — and cannot be interactive, so no
+    ///   call settled here belongs to a handler that answers otherwise. The
+    ///   stamp is not a caller's to supply; a parameter would be a second place
+    ///   to decide what only the registry knows.
+    /// - the refusal fact ([`Refusal`]), written [`Failed`](Refusal::Failed).
+    ///   A failure arriving from outside the runner records that something was
+    ///   attempted and went wrong. A decline before the work ran is a
+    ///   [`Refused`](Refusal::Refused) outcome from the body itself, where the
+    ///   runner sets the fact.
+    ///
+    /// # Errors
+    ///
+    /// If `call_block_id` is no tool call of this conversation, if the write
+    /// fails, or if the store's actor has stopped.
+    pub async fn resolve_tool_call(
+        &self,
+        conversation_id: i64,
+        call_block_id: i64,
+        resolution: CallResolution,
+    ) -> Result<Option<i64>, StoreError> {
+        let tool_call_id = self
+            .provider_id_of_call(conversation_id, call_block_id)
+            .await?;
+        match resolution {
+            CallResolution::Completed(result) => {
+                self.complete_tool_call_block_stamped(
+                    conversation_id,
+                    tool_call_id,
+                    result,
+                    call_block_id,
+                    false,
+                )
+                .await
+            }
+            CallResolution::Failed(error) => {
+                self.fail_tool_call_block_marked(
+                    conversation_id,
+                    tool_call_id,
+                    error,
+                    call_block_id,
+                    Refusal::Failed,
+                )
+                .await
+            }
+        }
     }
 
     /// Look up a completed tool call by its block id — the row id the change
@@ -274,7 +396,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use crate::block::{Role, ToolCallResult};
-    use crate::store::{BlockDestination, Store, ToolCallInsert};
+    use crate::store::{BlockDestination, CallResolution, Store, ToolCallInsert};
 
     async fn call_block(store: &Store, conv: i64, tool_call_id: &str) -> i64 {
         store
@@ -546,5 +668,169 @@ mod tests {
             .filter(|b| b.block_type == "tool_result")
             .collect();
         assert_eq!(results.len(), 2, "one result per call, two calls");
+    }
+
+    /// The out-of-band door (2026-09-02), both outcomes: named by the call's
+    /// BLOCK id alone, it records the result or the error, echoes the
+    /// provider's id it read off the call row, and carries the two facts the
+    /// runner's own resolution carries — the turn-ending stamp, unstamped for
+    /// a deferred call, and a failure that is not a refusal.
+    #[tokio::test]
+    async fn an_out_of_band_resolution_records_a_result_and_an_error() {
+        let store = Store::in_memory().unwrap();
+        let conv = store
+            .create_conversation("p".into(), "m".into(), "m".into(), String::new())
+            .await
+            .unwrap();
+        let settled = call_block(&store, conv, "call_1").await;
+        let broken = call_block(&store, conv, "call_2").await;
+
+        let result = store
+            .resolve_tool_call(conv, settled, CallResolution::Completed("posted".into()))
+            .await
+            .unwrap()
+            .expect("a pending call takes its result");
+        let error = store
+            .resolve_tool_call(
+                conv,
+                broken,
+                CallResolution::Failed("the send failed".into()),
+            )
+            .await
+            .unwrap()
+            .expect("a pending call takes its error");
+
+        match store.lookup_tool_completion(result).await.unwrap() {
+            Some((conversation, id, ToolCallResult::Success { content })) => {
+                assert_eq!(conversation, conv);
+                assert_eq!(id, "call_1", "the echo comes off the call row");
+                assert_eq!(content, "posted");
+            }
+            other => panic!("expected a success, got {other:?}"),
+        }
+        match store.lookup_tool_completion(error).await.unwrap() {
+            Some((_, id, ToolCallResult::Error { error })) => {
+                assert_eq!(id, "call_2", "the echo comes off the call row");
+                assert_eq!(error, "the send failed");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+
+        let blocks = store.list_blocks(conv).await.unwrap();
+        let flag = |id: i64, field: &str| {
+            blocks
+                .iter()
+                .find(|b| b.id == id)
+                .unwrap()
+                .fields
+                .get(field)
+                .and_then(serde_json::Value::as_bool)
+        };
+        assert_eq!(
+            flag(result, "ends_turn"),
+            Some(false),
+            "a deferred call's handler never ends the turn, and the row says so"
+        );
+        assert_eq!(
+            flag(error, "refusal"),
+            Some(false),
+            "a failure from outside the runner is not a refusal"
+        );
+    }
+
+    /// A call that already carries an outcome is left as it stands: either arm
+    /// of the door answers `None` and appends nothing, so a backing system
+    /// reporting the same settlement twice cannot write a second outcome.
+    #[tokio::test]
+    async fn a_settled_call_takes_no_second_out_of_band_resolution() {
+        let store = Store::in_memory().unwrap();
+        let conv = store
+            .create_conversation("p".into(), "m".into(), "m".into(), String::new())
+            .await
+            .unwrap();
+        let call = call_block(&store, conv, "call_1").await;
+
+        store
+            .resolve_tool_call(conv, call, CallResolution::Completed("first".into()))
+            .await
+            .unwrap()
+            .expect("the first resolution writes");
+        let before = store.list_blocks(conv).await.unwrap().len();
+
+        assert!(
+            store
+                .resolve_tool_call(conv, call, CallResolution::Completed("second".into()))
+                .await
+                .unwrap()
+                .is_none(),
+            "a second result is a no-op"
+        );
+        assert!(
+            store
+                .resolve_tool_call(conv, call, CallResolution::Failed("late".into()))
+                .await
+                .unwrap()
+                .is_none(),
+            "a late failure is a no-op"
+        );
+
+        let blocks = store.list_blocks(conv).await.unwrap();
+        assert_eq!(blocks.len(), before, "the losing reports append nothing");
+        let result = blocks
+            .iter()
+            .find(|b| b.block_type == "tool_result")
+            .expect("the one result stands");
+        assert_eq!(
+            result.fields.get("content").and_then(|v| v.as_str()),
+            Some("first"),
+            "the recorded outcome is the one that won"
+        );
+        assert!(blocks.iter().all(|b| b.block_type != "tool_error"));
+    }
+
+    /// The door refuses a block that is no call of this conversation — a block
+    /// of another kind, a call belonging to another ledger, an id that names
+    /// nothing. Each would otherwise write an outcome under an echo the store
+    /// could not read.
+    #[tokio::test]
+    async fn a_block_that_is_no_call_here_is_refused() {
+        let store = Store::in_memory().unwrap();
+        let conv = store
+            .create_conversation("p".into(), "m".into(), "m".into(), String::new())
+            .await
+            .unwrap();
+        let elsewhere = store
+            .create_conversation("p".into(), "m".into(), "m".into(), String::new())
+            .await
+            .unwrap();
+        let prose = store
+            .insert_text_block(conv, Role::Assistant, "notes".into())
+            .await
+            .unwrap();
+        let foreign = call_block(&store, elsewhere, "call_1").await;
+
+        for (block, what) in [
+            (prose, "a text block"),
+            (foreign, "a call of another conversation"),
+            (prose + 10_000, "an id that names nothing"),
+        ] {
+            let refused = store
+                .resolve_tool_call(conv, block, CallResolution::Completed("done".into()))
+                .await;
+            assert!(
+                matches!(refused, Err(crate::store::StoreError::Other(ref reason))
+                    if reason.contains("is no tool call")),
+                "{what} is refused, got {refused:?}"
+            );
+        }
+        assert!(
+            store
+                .list_blocks(conv)
+                .await
+                .unwrap()
+                .iter()
+                .all(|b| b.block_type != "tool_result"),
+            "a refused resolution appends nothing"
+        );
     }
 }
