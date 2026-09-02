@@ -414,6 +414,28 @@ const MIGRATIONS: &[&str] = &[
         names    TEXT NOT NULL
     );
     ",
+    // v8 (2026-09-02): the system prompt is the head of its conversation or
+    // it is refused. v1's rule counts prompts and says nothing about where
+    // one sits, so a prompt appended behind a thousand blocks was accepted —
+    // and a ledger in that shape cannot be compacted, because the thread the
+    // compaction opens appends its own prompt and then inherits the late one.
+    // The rule is positional here: a system_prompt joins a conversation that
+    // holds no row yet, and anywhere else the statement is refused. The
+    // counting rule stays beside it, so a conversation that somehow holds a
+    // prompt and nothing else still takes no second one. A step, not an edit
+    // to v1's CREATE TRIGGER, for the reason v3 records.
+    "
+    CREATE TRIGGER IF NOT EXISTS trg_system_prompt_is_the_head
+         BEFORE INSERT ON conversation_blocks
+         WHEN (SELECT block_type FROM blocks WHERE id = NEW.block_id) = 'system_prompt'
+     BEGIN
+         SELECT RAISE(ABORT, 'a system prompt joins an empty conversation only')
+         WHERE EXISTS (
+             SELECT 1 FROM conversation_blocks cb
+             WHERE cb.conversation_id = NEW.conversation_id
+         );
+     END;
+    ",
 ];
 
 /// Apply every unapplied step, advancing `user_version` as each lands.

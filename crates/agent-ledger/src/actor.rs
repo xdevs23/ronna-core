@@ -45,7 +45,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::agency::{AgencyCtx, RuntimeKind, ToolCall, ratchet, redispatch};
+use crate::agency::{
+    AgencyCtx, LeafKind, RuntimeKind, SystemPrompt, ToolCall, ratchet, redispatch,
+};
 use crate::block::Block;
 use crate::bus::{EventBus, RuntimeEvent};
 use crate::dispatch::TurnAnchor;
@@ -1209,6 +1211,12 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             );
             return;
         }
+        // The prompt is the head or the turn is refused, on the same
+        // snapshot the request would be built from.
+        if self.refuse_unless_the_prompt_heads_the_ledger(&blocks) {
+            return;
+        }
+
         // The turn's identity (amended 2026-08-22; ledger-first 2026-08-23,
         // the verified seventh break): a dispatch while a turn is open is
         // that turn's continuation and reuses the held anchor whatever the
@@ -1339,6 +1347,47 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         self.open_turn = Some(anchor);
 
         tracing::info!(conversation_id = self.id, "sent stream request to provider");
+    }
+
+    /// Refuse the turn when the ledger does not open with a system prompt
+    /// (2026-09-02) — a question and, on a `true`, the refusal itself, which
+    /// is the caller's instruction to stand its dispatch down.
+    ///
+    /// The store takes a system prompt only into an EMPTY conversation, so a
+    /// ledger whose first row is not one either holds its instructions where
+    /// the model is never told to read them first, or holds none at all.
+    /// Either way the request would run a conversation that is quietly not
+    /// the conversation it is meant to be, and a degraded answer nobody can
+    /// trace back is the failure that must never be papered over. So nothing
+    /// is sent and nothing is written down: the refusal rides the error edge
+    /// every store failure of this actor rides, which latches the
+    /// conversation instead of retrying a request that fails identically
+    /// every time. Repairing a ledger in that shape is the consumer's, and
+    /// it repairs it the one way a ledger changes shape — a fresh
+    /// conversation whose prompt is its first block, with the history cloned
+    /// behind it.
+    fn refuse_unless_the_prompt_heads_the_ledger(&self, blocks: &[Block]) -> bool {
+        if blocks
+            .first()
+            .is_some_and(|head| head.block_type == SystemPrompt::KINDS[0])
+        {
+            return false;
+        }
+        tracing::error!(
+            conversation_id = self.id,
+            "handle_blocks_ready: the ledger's first block is no system prompt — \
+             refusing the turn"
+        );
+        self.ctx.bus.emit(CoreEvent::StreamError {
+            conversation_id: self.id,
+            error: format!(
+                "conversation {} does not open with a system prompt, so no turn can \
+                 be dispatched for it",
+                self.id
+            ),
+            generation: None,
+        });
+        true
     }
 
     /// End the turn that is looping on a spent tool-call window — the
@@ -4572,6 +4621,12 @@ mod tests {
     /// cannot be reopened. Each call creates a conversation of its own, so a
     /// reopen names the conversation it kept from before rather than the one
     /// this returns.
+    ///
+    /// The conversation opens with a system prompt because the dispatch
+    /// refuses a ledger that does not (2026-09-02): every test here that
+    /// dispatches a turn needs a conversation a turn can be dispatched for,
+    /// and the prompt is that. It is the ledger's first block everywhere, so
+    /// a test's own appends start at index one.
     async fn scripted_context_over(
         store: Store,
         script: Script,
@@ -4591,6 +4646,10 @@ mod tests {
                 "Model X".into(),
                 "scripted".into(),
             )
+            .await
+            .unwrap();
+        store
+            .insert_system_prompt(conv, "answer the member".into())
             .await
             .unwrap();
 
@@ -4701,25 +4760,33 @@ mod tests {
         });
 
         let blocks = await_ledger(&ctx, conv, "the two-turn ledger", |blocks| {
-            blocks.len() == 5 && blocks.last().is_some_and(|b| b.block_type == "text")
+            blocks.len() == 6 && blocks.last().is_some_and(|b| b.block_type == "text")
         })
         .await;
 
-        // Block by block: the date marker the append stamped, the user's
-        // message, the scripted call, the executed result, the closing prose.
+        // Block by block: the conversation's prompt, the date marker the
+        // append stamped, the user's message, the scripted call, the executed
+        // result, the closing prose.
         let shape: Vec<&str> = blocks.iter().map(|b| b.block_type.as_str()).collect();
         assert_eq!(
             shape,
-            vec!["date_marker", "text", "tool_call", "tool_result", "text"]
+            vec![
+                "system_prompt",
+                "date_marker",
+                "text",
+                "tool_call",
+                "tool_result",
+                "text"
+            ]
         );
-        assert_eq!(blocks[1].role, Some(crate::block::Role::User));
-        assert_eq!(blocks[1].fields["content"], json!("hi"));
-        assert_eq!(blocks[2].fields["name"], json!("echo"));
-        assert_eq!(blocks[2].fields["input"], json!("{}"));
-        assert_eq!(blocks[3].fields["content"], json!("echoed"));
-        assert_eq!(blocks[3].fields["tool_call_id"], json!("call-1"));
-        assert_eq!(blocks[4].role, Some(crate::block::Role::Assistant));
-        assert_eq!(blocks[4].fields["content"], json!("done"));
+        assert_eq!(blocks[2].role, Some(crate::block::Role::User));
+        assert_eq!(blocks[2].fields["content"], json!("hi"));
+        assert_eq!(blocks[3].fields["name"], json!("echo"));
+        assert_eq!(blocks[3].fields["input"], json!("{}"));
+        assert_eq!(blocks[4].fields["content"], json!("echoed"));
+        assert_eq!(blocks[4].fields["tool_call_id"], json!("call-1"));
+        assert_eq!(blocks[5].role, Some(crate::block::Role::Assistant));
+        assert_eq!(blocks[5].fields["content"], json!("done"));
 
         assert_eq!(
             probe.requests.load(Ordering::SeqCst),
@@ -5658,7 +5725,7 @@ mod tests {
     fn assert_anchors(blocks: &[Block], summoner: i64) {
         for block in blocks {
             let is_turn_product = match block.block_type.as_str() {
-                "date_marker" => false,
+                "date_marker" | "system_prompt" => false,
                 "text" => block.role == Some(crate::block::Role::Assistant),
                 _ => true,
             };
@@ -5730,6 +5797,7 @@ mod tests {
         assert_eq!(
             shape,
             vec![
+                "system_prompt",
                 "date_marker",
                 "text",
                 "text",
@@ -7370,6 +7438,76 @@ mod tests {
         }
     }
 
+    // ─── The prompt is the head or the turn is refused (2026-09-02) ──────
+
+    /// AC4 — a ledger whose first row is no system prompt buys no request:
+    /// the turn fails on the bus, naming the conversation, and the provider
+    /// never hears about it. The shape is a damaged ledger — the store takes
+    /// a prompt only into an empty conversation — so it is built here by
+    /// taking the prompt back out of one.
+    #[tokio::test]
+    async fn a_ledger_that_does_not_open_with_a_prompt_dispatches_nothing() {
+        let (ctx, conv, probe) = scripted_context(Script::Prose).await;
+        let head = ctx.store.list_blocks(conv).await.unwrap()[0].id;
+        ctx.store.detach_block(conv, head).await.unwrap();
+        ctx.store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        let mut events = ctx.bus.subscribe();
+
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+
+        assert!(!actor.streaming, "nothing was dispatched");
+        assert_eq!(
+            probe.requests.load(Ordering::SeqCst),
+            0,
+            "the refusal spent nothing"
+        );
+        let error = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(CoreEvent::StreamError {
+                    conversation_id,
+                    error,
+                    ..
+                }) = events.recv().await
+                    && conversation_id == conv
+                {
+                    return error;
+                }
+            }
+        })
+        .await
+        .expect("the refusal reaches the bus");
+        assert!(
+            error.contains(&conv.to_string()),
+            "the error names the conversation: {error}"
+        );
+    }
+
+    /// AC4, the other side: a ledger that opens with its prompt dispatches
+    /// exactly as it did before the rule existed.
+    #[tokio::test]
+    async fn a_ledger_that_opens_with_its_prompt_dispatches_as_before() {
+        let (ctx, conv, probe) = scripted_context(Script::CountOnly).await;
+        assert_eq!(
+            ctx.store.list_blocks(conv).await.unwrap()[0].block_type,
+            "system_prompt",
+            "the harness conversation opens with its prompt"
+        );
+
+        assert_eq!(
+            offered_by_one_dispatch(&ctx, conv, &probe).await,
+            ctx.runner()
+                .registry()
+                .names()
+                .map(str::to_owned)
+                .collect::<Vec<String>>(),
+            "one request went out, carrying what a request carries"
+        );
+    }
+
     /// AC3 — the dispatch offers exactly the definitions the conversation's
     /// newest recorded choice names, and nothing else the registry holds.
     #[tokio::test]
@@ -7681,7 +7819,13 @@ mod tests {
         let shape: Vec<&str> = blocks.iter().map(|b| b.block_type.as_str()).collect();
         assert_eq!(
             shape,
-            vec!["date_marker", "text", "tool_call", "tool_result"],
+            vec![
+                "system_prompt",
+                "date_marker",
+                "text",
+                "tool_call",
+                "tool_result"
+            ],
             "the turn ends on its resolution, with no marker beside it"
         );
         assert_eq!(

@@ -359,10 +359,22 @@ impl Store {
     /// one — a caller meant to receive a refusal should not have to read the
     /// database's constraint message to learn what it did.
     ///
+    /// **The prompt is the head of the ledger** (2026-09-02): a conversation
+    /// that already holds ANY block takes no prompt at all, and the schema is
+    /// what refuses it — [`StoreError::Rejected`], carrying the rule the
+    /// trigger states. The database holds the position, not this door,
+    /// because a prompt reaches a conversation through the
+    /// junction from several directions (a fork copying its source's rows
+    /// among them) and a check in front of one door leaves the others open.
+    /// A caller replacing a conversation's prompt therefore appends the new
+    /// one to a fresh conversation and clones the history behind it — see
+    /// [`clone_join_rows_after`](Store::clone_join_rows_after).
+    ///
     /// # Errors
     ///
     /// If the insert fails, if the conversation already carries a system
-    /// prompt, or if the store's actor has stopped.
+    /// prompt, if it holds any block at all, or if the store's actor has
+    /// stopped.
     pub async fn insert_system_prompt(
         &self,
         conversation_id: i64,
