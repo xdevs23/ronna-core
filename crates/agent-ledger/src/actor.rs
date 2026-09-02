@@ -7442,14 +7442,24 @@ mod tests {
 
     /// AC4 — a ledger whose first row is no system prompt buys no request:
     /// the turn fails on the bus, naming the conversation, and the provider
-    /// never hears about it. The shape is a damaged ledger — the store takes
-    /// a prompt only into an empty conversation — so it is built here by
-    /// taking the prompt back out of one.
+    /// never hears about it. Only a foreign or damaged ledger has that shape,
+    /// since the store takes a prompt into an empty conversation and nowhere
+    /// else, so the head's junction row is deleted in SQL here.
     #[tokio::test]
     async fn a_ledger_that_does_not_open_with_a_prompt_dispatches_nothing() {
         let (ctx, conv, probe) = scripted_context(Script::Prose).await;
         let head = ctx.store.list_blocks(conv).await.unwrap()[0].id;
-        ctx.store.detach_block(conv, head).await.unwrap();
+        ctx.store
+            .run(move |conn| {
+                conn.execute(
+                    "DELETE FROM conversation_blocks
+                     WHERE conversation_id = ?1 AND block_id = ?2",
+                    rusqlite::params![conv, head],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
         ctx.store
             .insert_text_block(conv, crate::block::Role::User, "summons".into())
             .await

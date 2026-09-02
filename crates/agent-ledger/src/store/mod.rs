@@ -2550,11 +2550,11 @@ mod tests {
         assert_eq!(s.list_blocks(c1).await.unwrap().len(), 1);
     }
 
-    /// The prompt is the head of the ledger or it is refused — through the
-    /// exact door the first consumer replaced a prompt with: fork the
-    /// history, detach the inherited prompt, append the current one. The
-    /// third step used to be accepted and left the prompt behind a whole
-    /// conversation, which is a shape no reader of the ledger can act on.
+    /// The prompt is the head of the ledger or it is refused. The schema
+    /// refuses a prompt appended behind a history, a shape no reader of the
+    /// ledger can act on, and this walks the three steps a consumer replaces
+    /// a prompt with: fork the history, detach the inherited prompt, append
+    /// the current one.
     #[tokio::test]
     async fn a_prompt_appended_behind_a_history_is_refused() {
         let s = store();
