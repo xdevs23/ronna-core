@@ -67,6 +67,16 @@ pub(super) fn provider_id_of_call(
     })
 }
 
+/// The same question as a predicate, for a caller that needs only that the
+/// block is a call of this conversation and has no use for the echo.
+pub(super) fn ensure_call_of_conversation(
+    conn: &Connection,
+    conversation_id: i64,
+    call_block_id: i64,
+) -> Result<(), StoreError> {
+    provider_id_of_call(conn, conversation_id, call_block_id).map(|_| ())
+}
+
 impl Store {
     /// Insert a `tool_result` block for a completed tool call — conditionally,
     /// in its own transaction, the same shape as the decision write: the insert
@@ -300,8 +310,8 @@ impl Store {
     /// # Errors
     ///
     /// [`StoreError::NoSuchToolCall`] if `call_block_id` is no tool call of
-    /// this conversation, or if the write fails or the store's actor has
-    /// stopped.
+    /// this conversation; otherwise whatever the delegated write answers when
+    /// it fails or the store's actor has stopped.
     pub async fn resolve_tool_call(
         &self,
         conversation_id: i64,

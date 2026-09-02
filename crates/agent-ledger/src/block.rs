@@ -202,7 +202,7 @@ pub struct ReasoningDetailEntry {
 /// vocabulary for one fact — which way the work came out, and the text the
 /// model reads. The facts a resolver may NOT choose (the turn-ending stamp and
 /// whether a failure was a refusal) are not here: the writes decide those.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ToolCallResult {
     /// The call ran and produced output.

@@ -6,7 +6,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::types::{ApprovalChoice, denial_error_text};
 
 use super::messages::{BlockDestination, anchor_of, insert_block};
-use super::tool_calls::{call_resolution_exists, provider_id_of_call};
+use super::tool_calls::{call_resolution_exists, ensure_call_of_conversation};
 use super::{Store, StoreError, transact};
 
 impl Store {
@@ -36,10 +36,10 @@ impl Store {
     ) -> Result<Option<i64>, StoreError> {
         self.run(move |conn| {
             transact(conn, |tx| {
-                // A request can only cover a call, and that is the question the
-                // resolution door's reader already answers, with its sentence.
-                // The provider id it reads back is nothing this write needs.
-                provider_id_of_call(tx, conversation_id, for_block_id)?;
+                // A request can only cover a call of this conversation, and the
+                // resolution door's reader is the one place that question and
+                // its refusal live.
+                ensure_call_of_conversation(tx, conversation_id, for_block_id)?;
                 let already_covered: bool = tx.query_row(
                     "SELECT EXISTS(
                          SELECT 1 FROM block_approval_request bar
