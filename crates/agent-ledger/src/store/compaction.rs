@@ -66,12 +66,12 @@
 
 use rusqlite::params;
 
-use crate::agency::{BlockKind, FromBlock, HarnessMessage, LeafKind, Text};
+use crate::agency::{BlockKind, FromBlock, HarnessMessage, LeafKind, SystemPrompt, Text};
 use crate::block::{Block, Role};
 
 use super::conversations::{
-    ForkSettings, confirm_inherited_history, copy_junction_after_without_prompt,
-    insert_conversation, insert_system_prompt_block, resolve_fork_settings, role_run,
+    ForkSettings, confirm_inherited_history, insert_conversation, insert_system_prompt_block,
+    junction_cutoff, resolve_fork_settings, role_run,
 };
 use super::messages::insert_block;
 use super::tool_choice::{insert_tool_choice_block, newest_tool_choice};
@@ -238,10 +238,10 @@ impl Store {
     /// itself owe a turn, is never the frontier of a thread that has not got
     /// its digest yet.
     ///
-    /// The thread's prompt is its own. Everything past the cut comes across
-    /// except a `system_prompt` row: a source written before the head rule
-    /// can hold its prompt past the cut, and a thread that inherited it
-    /// would carry two.
+    /// The thread's prompt is its own, and everything past the cut comes
+    /// across except a prompt of the source's, under the rule
+    /// [`Store::insert_system_prompt`](crate::Store::insert_system_prompt)
+    /// states in full.
     ///
     /// The thread has NO `parent_id`. It is not a fork of anything: it opens
     /// with a summary of a history it does not hold. Where it came from is
@@ -285,9 +285,7 @@ impl Store {
                     insert_tool_choice_block(tx, new_id, &names)?;
                 }
                 // The thread's prompt is the one it appended above, and the
-                // source's own stays where it was written: a source from
-                // before the head rule can carry its prompt past the cut,
-                // and inheriting it would give this thread two.
+                // source's own stays where it was written.
                 copy_junction_after_without_prompt(tx, source_id, new_id, after_block_id)?;
                 // The inherited rows are confirmed exactly as far as the
                 // source confirmed them, so the outbound edge is born
@@ -390,6 +388,58 @@ fn cut_extended_from(blocks: &[Block], mut end: usize) -> Option<LedgerCut> {
         first_half_ends: blocks[end].id,
         second_half_begins: blocks[end + 1].id,
     })
+}
+
+/// Copy the source's junction rows from past `last_block_id` into the thread,
+/// leaving a system prompt of the source behind.
+///
+/// The one copy in this library that reads a kind, and it reads exactly one:
+/// the thread appends its OWN prompt before it inherits its source's second
+/// half, and a source whose prompt sits past the cut would hand it a second
+/// one, which the schema's rule refuses (the rule in full:
+/// [`Store::insert_system_prompt`](crate::Store::insert_system_prompt)). The
+/// thread's prompt is the thread's own and the source's stays in the source.
+/// The filter lives here, beside the one caller that appends a prompt in front
+/// of what it inherits;
+/// [`copy_junction_after`](super::conversations::copy_junction_after) is the
+/// kind-blind copy and stays that way.
+///
+/// A row the filter leaves behind is reported at `warn`: only a ledger written
+/// before the rule holds a prompt past a cut, so an operator seeing this line
+/// is seeing a legacy shape being repaired around, in a conversation the line
+/// names.
+fn copy_junction_after_without_prompt(
+    conn: &rusqlite::Connection,
+    source_id: i64,
+    dst_id: i64,
+    last_block_id: i64,
+) -> Result<(), StoreError> {
+    let cutoff = junction_cutoff(conn, source_id, last_block_id)?;
+    let carried = conn.execute(
+        "INSERT INTO conversation_blocks (conversation_id, block_id)
+         SELECT ?1, cb.block_id FROM conversation_blocks cb
+         JOIN blocks b ON b.id = cb.block_id
+         WHERE cb.conversation_id = ?2 AND cb.id > ?3 AND b.block_type != ?4
+         ORDER BY cb.id",
+        params![dst_id, source_id, cutoff, SystemPrompt::KINDS[0]],
+    )?;
+    let past_the_cut: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM conversation_blocks
+         WHERE conversation_id = ?1 AND id > ?2",
+        params![source_id, cutoff],
+        |row| row.get(0),
+    )?;
+    let left_behind = past_the_cut.saturating_sub(i64::try_from(carried).unwrap_or(i64::MAX));
+    if left_behind > 0 {
+        tracing::warn!(
+            source_conversation_id = source_id,
+            thread_conversation_id = dst_id,
+            left_behind,
+            "compaction: the source carries a system prompt past the cut — the thread \
+             keeps its own and inherits the rest"
+        );
+    }
+    Ok(())
 }
 
 /// Append the block that records where a thread came from. Called inside the

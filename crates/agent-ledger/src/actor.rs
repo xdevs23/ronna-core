@@ -45,9 +45,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::agency::{
-    AgencyCtx, LeafKind, RuntimeKind, SystemPrompt, ToolCall, ratchet, redispatch,
-};
+use crate::agency::{AgencyCtx, RuntimeKind, ToolCall, ratchet, redispatch};
 use crate::block::Block;
 use crate::bus::{EventBus, RuntimeEvent};
 use crate::dispatch::TurnAnchor;
@@ -1213,7 +1211,8 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         }
         // The prompt is the head or the turn is refused, on the same
         // snapshot the request would be built from.
-        if self.refuse_unless_the_prompt_heads_the_ledger(&blocks) {
+        if !Self::does_the_ledger_open_with_its_head_kind(&blocks) {
+            self.refuse_the_turn_over_a_headless_ledger();
             return;
         }
 
@@ -1349,30 +1348,37 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         tracing::info!(conversation_id = self.id, "sent stream request to provider");
     }
 
-    /// Refuse the turn when the ledger does not open with a system prompt
-    /// (2026-09-02) — a question and, on a `true`, the refusal itself, which
-    /// is the caller's instruction to stand its dispatch down.
+    /// Does this ledger open with a block whose kind says a conversation
+    /// opens with it (2026-09-02)?
     ///
-    /// The store takes a system prompt only into an EMPTY conversation, so a
-    /// ledger whose first row is not one either holds its instructions where
-    /// the model is never told to read them first, or holds none at all.
-    /// Either way the request would run a conversation that is quietly not
-    /// the conversation it is meant to be, and a degraded answer nobody can
-    /// trace back is the failure that must never be papered over. So nothing
-    /// is sent and nothing is written down: the refusal rides the error edge
-    /// every store failure of this actor rides, which latches the
-    /// conversation instead of retrying a request that fails identically
-    /// every time. Repairing a ledger in that shape is the consumer's, and
-    /// it repairs it the one way a ledger changes shape — a fresh
-    /// conversation whose prompt is its first block, with the history cloned
-    /// behind it.
-    fn refuse_unless_the_prompt_heads_the_ledger(&self, blocks: &[Block]) -> bool {
-        if blocks
+    /// The first row is read through the kind's own answer
+    /// ([`Agency::heads_the_ledger`](crate::agency::Agency::heads_the_ledger)),
+    /// so this site reads one hook and never learns which kind answered it.
+    /// The store holds the same rule at the write — see
+    /// [`Store::insert_system_prompt`] for the whole of it — and this is its
+    /// second reading, at the one place a wrong shape costs a paid turn. An
+    /// empty ledger answers `false`, like any other ledger with no head.
+    fn does_the_ledger_open_with_its_head_kind(blocks: &[Block]) -> bool {
+        blocks
             .first()
-            .is_some_and(|head| head.block_type == SystemPrompt::KINDS[0])
-        {
-            return false;
-        }
+            .is_some_and(|head| K::from_block(head).heads_the_ledger())
+    }
+
+    /// Refuse the turn a ledger that does not open with its prompt asks for.
+    ///
+    /// Such a ledger either holds its instructions where the model is never
+    /// told to read them first, or holds none at all, and either way the
+    /// request would run a conversation that is quietly not the conversation
+    /// it is meant to be — a degraded answer nobody can trace back, the
+    /// failure that must never be papered over. So the provider hears nothing:
+    /// the refusal is a `StreamError` of this actor's own, unstamped like
+    /// every store failure it emits, and the dispatch closes through the error
+    /// edge exactly as a failed stream does, latching the conversation instead
+    /// of retrying a request that fails identically every time. Repairing a
+    /// ledger in that shape is the consumer's, and it repairs it the one way a
+    /// ledger changes shape: a fresh conversation whose prompt is its first
+    /// block, with the history cloned behind it.
+    fn refuse_the_turn_over_a_headless_ledger(&self) {
         tracing::error!(
             conversation_id = self.id,
             "handle_blocks_ready: the ledger's first block is no system prompt — \
@@ -1380,14 +1386,11 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         );
         self.ctx.bus.emit(CoreEvent::StreamError {
             conversation_id: self.id,
-            error: format!(
-                "conversation {} does not open with a system prompt, so no turn can \
-                 be dispatched for it",
-                self.id
-            ),
+            error: "the ledger does not open with a system prompt, so no turn is \
+                    dispatched for it"
+                .to_owned(),
             generation: None,
         });
-        true
     }
 
     /// End the turn that is looping on a spent tool-call window — the
@@ -7475,6 +7478,9 @@ mod tests {
             0,
             "the refusal spent nothing"
         );
+        // The event names the conversation in its own typed field, which is
+        // where every reader of the bus reads it; the prose says what went
+        // wrong and repeats nothing the event already carries.
         let error = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Ok(CoreEvent::StreamError {
@@ -7491,8 +7497,8 @@ mod tests {
         .await
         .expect("the refusal reaches the bus");
         assert!(
-            error.contains(&conv.to_string()),
-            "the error names the conversation: {error}"
+            error.contains("does not open with a system prompt"),
+            "the error says what the ledger's shape is: {error}"
         );
     }
 
