@@ -2550,6 +2550,187 @@ mod tests {
         assert_eq!(s.list_blocks(c1).await.unwrap().len(), 1);
     }
 
+    /// The prompt is the head of the ledger or it is refused. The schema
+    /// refuses a prompt appended behind a history, a shape no reader of the
+    /// ledger can act on, and this walks the three steps a consumer replaces
+    /// a prompt with: fork the history, detach the inherited prompt, append
+    /// the current one.
+    #[tokio::test]
+    async fn a_prompt_appended_behind_a_history_is_refused() {
+        let s = store();
+        let source = make_conv(&s, "p1", "model").await;
+        let inherited = s
+            .insert_system_prompt(source, "the previous instructions".into())
+            .await
+            .unwrap();
+        let said = s
+            .insert_text_block(source, Role::User, "something said".into())
+            .await
+            .unwrap();
+        let fork = s
+            .fork_conversation(source, said, ModelOverride::default())
+            .await
+            .unwrap();
+        s.detach_block(fork, inherited).await.unwrap();
+
+        let refused = s
+            .insert_system_prompt(fork, "the current instructions".into())
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::Rejected(_))),
+            "the schema refuses a prompt behind a history, got {refused:?}"
+        );
+        assert_eq!(
+            s.list_blocks(fork)
+                .await
+                .unwrap()
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<i64>>(),
+            vec![said],
+            "the refused write left the fork exactly as it was"
+        );
+    }
+
+    /// The other two readings of the same rule: an empty conversation takes
+    /// its prompt, and having taken one it takes no second.
+    #[tokio::test]
+    async fn an_empty_conversation_takes_one_prompt_and_no_second() {
+        let s = store();
+        let c1 = make_conv(&s, "p1", "model").await;
+        let prompt = s
+            .insert_system_prompt(c1, "the instructions".into())
+            .await
+            .unwrap();
+
+        let blocks = s.list_blocks(c1).await.unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].id, prompt);
+        assert_eq!(blocks[0].block_type, "system_prompt");
+
+        assert!(
+            s.insert_system_prompt(c1, "a second set".into())
+                .await
+                .is_err(),
+            "a conversation takes one system prompt"
+        );
+    }
+
+    /// The prompt replacement, composed out of the plain clones and nothing
+    /// else: open an empty successor, append the fresh prompt — which the
+    /// store takes only into an empty conversation — then clone the source's
+    /// join rows from past the old prompt. The successor reads as its own
+    /// prompt in front of the source's history, and every inherited row is
+    /// the source's own block, shared through the junction.
+    #[tokio::test]
+    async fn a_prompt_replacement_composes_out_of_the_plain_clones() {
+        let s = store();
+        let source = make_conv(&s, "p1", "model").await;
+        let old_prompt = s
+            .insert_system_prompt(source, "the previous instructions".into())
+            .await
+            .unwrap();
+        let mut history = Vec::new();
+        for said in ["one", "two", "three"] {
+            history.push(
+                s.insert_text_block(source, Role::User, said.into())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let (blocks_before, _, _) = row_counts(&s).await;
+
+        let successor = s
+            .fork_empty(source, ModelOverride::default())
+            .await
+            .unwrap();
+        assert!(
+            s.list_blocks(successor).await.unwrap().is_empty(),
+            "the shell holds nothing yet"
+        );
+        let new_prompt = s
+            .insert_system_prompt(successor, "the current instructions".into())
+            .await
+            .unwrap();
+        s.clone_join_rows_after(source, successor, old_prompt)
+            .await
+            .unwrap();
+
+        let mut expected = vec![new_prompt];
+        expected.extend(history.iter().copied());
+        assert_eq!(
+            s.list_blocks(successor)
+                .await
+                .unwrap()
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<i64>>(),
+            expected,
+            "the fresh prompt heads the successor and the source's history follows in order"
+        );
+        let (blocks_after, _, _) = row_counts(&s).await;
+        assert_eq!(
+            blocks_after,
+            blocks_before + 1,
+            "only the prompt is a new block: the history is shared, never copied"
+        );
+        assert_eq!(
+            s.find_conversation(successor)
+                .await
+                .unwrap()
+                .expect("the successor exists")
+                .parent_id,
+            Some(source),
+            "the successor is the source's fork"
+        );
+    }
+
+    /// The other clone, the range the other way: everything up to and
+    /// including a named row, shared the same way, and reading no kind on the
+    /// way — the source's own prompt rides across as one row of the range,
+    /// and lands where the store's rule wants it because the destination is
+    /// empty.
+    #[tokio::test]
+    async fn the_up_to_clone_carries_the_range_it_names_and_nothing_after() {
+        let s = store();
+        let source = make_conv(&s, "p1", "model").await;
+        let prompt = s
+            .insert_system_prompt(source, "the instructions".into())
+            .await
+            .unwrap();
+        let first = s
+            .insert_text_block(source, Role::User, "one".into())
+            .await
+            .unwrap();
+        let second = s
+            .insert_text_block(source, Role::User, "two".into())
+            .await
+            .unwrap();
+        s.insert_text_block(source, Role::User, "three".into())
+            .await
+            .unwrap();
+
+        let successor = s
+            .fork_empty(source, ModelOverride::default())
+            .await
+            .unwrap();
+        s.clone_join_rows_up_to(source, successor, second)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s.list_blocks(successor)
+                .await
+                .unwrap()
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<i64>>(),
+            vec![prompt, first, second],
+            "the range stops where it was told to, and the source's own prompt is \
+             simply one row of it"
+        );
+    }
+
     /// The three row counts a block write touches.
     async fn row_counts(s: &Store) -> (i64, i64, i64) {
         s.run(|conn| {

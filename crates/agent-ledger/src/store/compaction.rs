@@ -70,8 +70,8 @@ use crate::agency::{BlockKind, FromBlock, HarnessMessage, LeafKind, Text};
 use crate::block::{Block, Role};
 
 use super::conversations::{
-    ForkSettings, confirm_inherited_history, copy_junction_after, insert_conversation,
-    insert_system_prompt_block, resolve_fork_settings, role_run,
+    ForkSettings, confirm_inherited_history, copy_junction_after_without_prompt,
+    insert_conversation, insert_system_prompt_block, resolve_fork_settings, role_run,
 };
 use super::messages::insert_block;
 use super::tool_choice::{insert_tool_choice_block, newest_tool_choice};
@@ -136,9 +136,10 @@ pub struct CompactedThread {
     /// while inheriting from the thread being replaced.
     pub ancestor_conversation_id: i64,
     /// The thread's system prompt, appended ahead of everything else.
-    /// `None` opens the thread without one. A prompt is a consumer's own
-    /// words, so it arrives here exactly as it does at every other fork
-    /// door.
+    /// `None` opens the thread without one, and a thread without one takes
+    /// no model turn: the dispatch refuses a ledger that opens with anything
+    /// else. A prompt is a consumer's own words, so it arrives here exactly
+    /// as it does at every other fork door.
     pub system_prompt: Option<String>,
     /// The compaction message's text — the captured summary of the
     /// summarized half. Appended in the system voice, as ordinary prose that
@@ -237,6 +238,11 @@ impl Store {
     /// itself owe a turn, is never the frontier of a thread that has not got
     /// its digest yet.
     ///
+    /// The thread's prompt is its own. Everything past the cut comes across
+    /// except a `system_prompt` row: a source written before the head rule
+    /// can hold its prompt past the cut, and a thread that inherited it
+    /// would carry two.
+    ///
     /// The thread has NO `parent_id`. It is not a fork of anything: it opens
     /// with a summary of a history it does not hold. Where it came from is
     /// the ancestor-reference block's own column, which is the fact the
@@ -278,7 +284,11 @@ impl Store {
                 if let Some(names) = newest_tool_choice(tx, source_id)? {
                     insert_tool_choice_block(tx, new_id, &names)?;
                 }
-                copy_junction_after(tx, source_id, new_id, after_block_id)?;
+                // The thread's prompt is the one it appended above, and the
+                // source's own stays where it was written: a source from
+                // before the head rule can carry its prompt past the cut,
+                // and inheriting it would give this thread two.
+                copy_junction_after_without_prompt(tx, source_id, new_id, after_block_id)?;
                 // The inherited rows are confirmed exactly as far as the
                 // source confirmed them, so the outbound edge is born
                 // delivered over history it is inheriting rather than

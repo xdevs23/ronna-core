@@ -92,7 +92,9 @@ pub enum Continuation {
     /// source conversation cannot orphan the quotes.
     NewThread {
         /// The new thread's system prompt, appended ahead of everything else.
-        /// `None` starts the thread without one.
+        /// `None` starts the thread without one — and a thread without one
+        /// takes no model turn, because the dispatch refuses a ledger that
+        /// opens with anything else.
         ///
         /// It is a parameter because a prompt is a consumer's own words: the
         /// code this was extracted from read a constant here, and that constant
@@ -345,6 +347,103 @@ impl Store {
             confirm_inherited_history(&tx, source_id, fork_id)?;
             tx.commit()?;
             Ok(fork_id)
+        })
+        .await
+    }
+
+    /// Open a fork that holds nothing yet: a conversation whose parent is
+    /// `source_id`, under the model and reasoning `model` resolves against
+    /// the source, with no join row at all.
+    ///
+    /// The front half of [`fork_conversation`](Store::fork_conversation)
+    /// without its copy. A caller that composes a successor out of its own
+    /// appends AND a chosen stretch of the source's history opens it here
+    /// and then clones the rows it wants
+    /// ([`clone_join_rows_after`](Store::clone_join_rows_after),
+    /// [`clone_join_rows_up_to`](Store::clone_join_rows_up_to)). Replacing a
+    /// conversation's system prompt is exactly that composition, and it is
+    /// the caller's to compose: the prompt goes in first, because the store
+    /// takes a prompt only into an empty conversation, and the source's rows
+    /// from past the old prompt follow it. Nothing here knows what a prompt
+    /// is.
+    ///
+    /// # Errors
+    ///
+    /// If the source does not exist, if the insert fails, or if the store's
+    /// actor has stopped.
+    pub async fn fork_empty(
+        &self,
+        source_id: i64,
+        model: ModelOverride,
+    ) -> Result<i64, StoreError> {
+        self.run(move |conn| {
+            let settings = resolve_fork_settings(conn, source_id, &model)?;
+            transact(conn, |tx| {
+                insert_conversation(
+                    tx,
+                    Some(source_id),
+                    settings.model_id,
+                    settings.reasoning.as_deref(),
+                )
+            })
+        })
+        .await
+    }
+
+    /// Clone the source's join rows from past `after_block_id` into `dst_id`,
+    /// in the source's own order.
+    ///
+    /// The blocks are SHARED, never copied: only the junction table gains
+    /// rows, each pointing at the block the source already holds, so the
+    /// destination reads the same history and neither conversation can edit
+    /// the other's. Kind-blind — every row in the range comes across,
+    /// whatever it holds.
+    ///
+    /// The destination's processed cursor is confirmed exactly as far as the
+    /// source confirmed it, the way a fork's is, so inherited history is not
+    /// re-announced.
+    ///
+    /// # Errors
+    ///
+    /// If `after_block_id` is not a block of the source, if a write fails, or
+    /// if the store's actor has stopped.
+    pub async fn clone_join_rows_after(
+        &self,
+        source_id: i64,
+        dst_id: i64,
+        after_block_id: i64,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            transact(conn, |tx| {
+                copy_junction_after(tx, source_id, dst_id, after_block_id)?;
+                confirm_inherited_history(tx, source_id, dst_id)
+            })
+        })
+        .await
+    }
+
+    /// Clone the source's join rows up to and including `last_block_id` into
+    /// `dst_id`, in the source's own order.
+    ///
+    /// The mirror of [`clone_join_rows_after`](Store::clone_join_rows_after)
+    /// and its complement, under every word that door states: shared blocks,
+    /// no kind read, the cursor confirmed as far as the source confirmed it.
+    ///
+    /// # Errors
+    ///
+    /// If `last_block_id` is not a block of the source, if a write fails, or
+    /// if the store's actor has stopped.
+    pub async fn clone_join_rows_up_to(
+        &self,
+        source_id: i64,
+        dst_id: i64,
+        last_block_id: i64,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            transact(conn, |tx| {
+                copy_junction_up_to(tx, source_id, dst_id, last_block_id)?;
+                confirm_inherited_history(tx, source_id, dst_id)
+            })
         })
         .await
     }
@@ -880,6 +979,39 @@ pub(super) fn copy_junction_after(
          SELECT ?1, block_id FROM conversation_blocks
          WHERE conversation_id = ?2 AND id > ?3
          ORDER BY id",
+        (dst_id, source_id, cutoff),
+    )?;
+    Ok(())
+}
+
+/// Copy source junction rows strictly AFTER `last_block_id`, leaving a
+/// `system_prompt` row of the source behind.
+///
+/// The one copy in this library that reads a kind, and it reads exactly one
+/// (2026-09-02). A compacted thread appends its OWN prompt before it inherits
+/// the second half of its source, and since 2026-09-02 the schema holds a
+/// prompt to the head of its conversation — so a source written before that
+/// rule, carrying its prompt behind its history, would hand a second prompt
+/// to a thread that already has one and the whole compaction would be
+/// refused. The thread's prompt is the thread's own, and the source's stays
+/// in the source.
+///
+/// [`copy_junction_after`] is the kind-blind copy and stays that way: the
+/// filter belongs to the compaction, which is the one caller that appends a
+/// prompt of its own in front of what it inherits.
+pub(super) fn copy_junction_after_without_prompt(
+    conn: &rusqlite::Connection,
+    source_id: i64,
+    dst_id: i64,
+    last_block_id: i64,
+) -> Result<(), StoreError> {
+    let cutoff = junction_cutoff(conn, source_id, last_block_id)?;
+    conn.execute(
+        "INSERT INTO conversation_blocks (conversation_id, block_id)
+         SELECT ?1, cb.block_id FROM conversation_blocks cb
+         JOIN blocks b ON b.id = cb.block_id
+         WHERE cb.conversation_id = ?2 AND cb.id > ?3 AND b.block_type != 'system_prompt'
+         ORDER BY cb.id",
         (dst_id, source_id, cutoff),
     )?;
     Ok(())

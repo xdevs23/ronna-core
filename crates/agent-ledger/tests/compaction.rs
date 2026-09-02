@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_ledger::agency::{
-    Agency, AncestorReference, Awaiting, FromBlock, HarnessMessage, LeafKind, Text, ToolChoice,
+    Agency, AncestorReference, Awaiting, FromBlock, HarnessMessage, LeafKind, SystemPrompt, Text,
+    ToolChoice,
 };
 use agent_ledger::providers::{
     BoxFuture, LlmError, ModelInfo, ProviderModule, ProviderRequest, ProviderResponse, ProviderRx,
@@ -33,6 +34,10 @@ const INSTRUCTIONS: &str = "Summarize the conversation above. Write prose and no
 
 /// What the scripted model answers the harness with.
 const SUMMARY: &str = "They talked about the release, then about the schedule.";
+
+/// The prompt a compacted thread is opened with, told apart from whatever its
+/// source carries.
+const THREAD_PROMPT: &str = "You are the consumer's assistant, opening a thread.";
 
 /// A tool the consumer registered — present in the registry, so a turn that
 /// is offered nothing is offered nothing DESPITE it.
@@ -455,6 +460,102 @@ async fn a_consumer_opens_the_thread_the_summary_carries() {
         AncestorReference::parse(&blocks[1]).conversation_id,
         source,
         "the record survives the conversation it names"
+    );
+}
+
+/// A source carrying its system prompt PAST the cut still compacts. That
+/// shape is what a database written before the prompt became the head of its
+/// ledger holds, and every one of them is deployed: the thread opens with its
+/// OWN prompt, inherits every other post-cut block in order, and the source's
+/// late prompt stays in the source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_source_whose_prompt_sits_past_the_cut_still_compacts() {
+    let (ctx, _offered) = consumer_runtime().await;
+    let store = ctx.store();
+    let source = conversation(&ctx).await;
+
+    // The forbidden shape, built the only way it can still be built: the
+    // block joins the ledger as system-voiced prose — the very header,
+    // junction and text rows a prompt is made of — and is then stamped with
+    // the prompt's kind. The rule stands on the junction insert, which is
+    // exactly where a database written before it never met one.
+    let late = store
+        .insert_text_block(source, Role::System, "the redeployed instructions".into())
+        .await
+        .unwrap();
+    store
+        .run(move |conn| {
+            conn.execute(
+                "UPDATE blocks SET block_type = 'system_prompt' WHERE id = ?1",
+                [late],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let source_ids = ledger_ids(&ctx, source).await;
+    assert_eq!(
+        source_ids.last(),
+        Some(&late),
+        "the source's prompt is its newest block"
+    );
+    let cut = store
+        .compaction_cut(source)
+        .await
+        .unwrap()
+        .expect("the ledger splits");
+    let at = source_ids
+        .iter()
+        .position(|id| *id == cut.first_half_ends)
+        .expect("the cut names a block of the ledger");
+
+    let thread = store
+        .open_compacted_thread(
+            source,
+            cut.first_half_ends,
+            CompactedThread {
+                ancestor_conversation_id: source,
+                system_prompt: Some(THREAD_PROMPT.into()),
+                compaction_message: SUMMARY.into(),
+                model: ModelOverride::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let blocks = store.list_blocks(thread).await.unwrap();
+    assert_eq!(
+        blocks
+            .iter()
+            .filter(|block| block.block_type == "system_prompt")
+            .count(),
+        1,
+        "the thread has one prompt"
+    );
+    assert_eq!(blocks[0].block_type, "system_prompt");
+    assert_eq!(
+        SystemPrompt::parse(&blocks[0]).content,
+        THREAD_PROMPT,
+        "and it is the thread's own"
+    );
+    assert_eq!(
+        blocks[3..]
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<i64>>(),
+        source_ids[at + 1..]
+            .iter()
+            .copied()
+            .filter(|id| *id != late)
+            .collect::<Vec<i64>>(),
+        "every other post-cut block rides across, in order"
+    );
+
+    assert_eq!(
+        ledger_ids(&ctx, source).await,
+        source_ids,
+        "the source keeps the prompt it was written with"
     );
 }
 
