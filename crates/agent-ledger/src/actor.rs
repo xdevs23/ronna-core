@@ -1381,12 +1381,12 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     fn refuse_the_turn_over_a_headless_ledger(&self) {
         tracing::error!(
             conversation_id = self.id,
-            "handle_blocks_ready: the ledger's first block is no system prompt — \
+            "handle_blocks_ready: the ledger does not open with its head kind — \
              refusing the turn"
         );
         self.ctx.bus.emit(CoreEvent::StreamError {
             conversation_id: self.id,
-            error: "the ledger does not open with a system prompt, so no turn is \
+            error: "the ledger does not open with its head kind, so no turn is \
                     dispatched for it"
                 .to_owned(),
             generation: None,
@@ -7497,7 +7497,7 @@ mod tests {
         .await
         .expect("the refusal reaches the bus");
         assert!(
-            error.contains("does not open with a system prompt"),
+            error.contains("does not open with its head kind"),
             "the error says what the ledger's shape is: {error}"
         );
     }

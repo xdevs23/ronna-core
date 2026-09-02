@@ -415,7 +415,7 @@ fn copy_junction_after_without_prompt(
     last_block_id: i64,
 ) -> Result<(), StoreError> {
     let cutoff = junction_cutoff(conn, source_id, last_block_id)?;
-    let carried = conn.execute(
+    conn.execute(
         "INSERT INTO conversation_blocks (conversation_id, block_id)
          SELECT ?1, cb.block_id FROM conversation_blocks cb
          JOIN blocks b ON b.id = cb.block_id
@@ -423,13 +423,13 @@ fn copy_junction_after_without_prompt(
          ORDER BY cb.id",
         params![dst_id, source_id, cutoff, SystemPrompt::KINDS[0]],
     )?;
-    let past_the_cut: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM conversation_blocks
-         WHERE conversation_id = ?1 AND id > ?2",
-        params![source_id, cutoff],
+    let left_behind: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM conversation_blocks cb
+         JOIN blocks b ON b.id = cb.block_id
+         WHERE cb.conversation_id = ?1 AND cb.id > ?2 AND b.block_type = ?3",
+        params![source_id, cutoff, SystemPrompt::KINDS[0]],
         |row| row.get(0),
     )?;
-    let left_behind = past_the_cut.saturating_sub(i64::try_from(carried).unwrap_or(i64::MAX));
     if left_behind > 0 {
         tracing::warn!(
             source_conversation_id = source_id,

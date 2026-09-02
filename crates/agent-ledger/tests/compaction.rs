@@ -546,7 +546,7 @@ async fn a_source_whose_prompt_sits_past_the_cut_still_compacts() {
             .iter()
             .map(|block| block.block_type.as_str())
             .collect::<Vec<&str>>(),
-        vec!["system_prompt", "ancestor_reference", "text"],
+        vec![SystemPrompt::KINDS[0], "ancestor_reference", "text"],
         "the thread opens with its prompt, where the history came from, and what \
          it said"
     );
