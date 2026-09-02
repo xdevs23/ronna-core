@@ -3,6 +3,7 @@
 use rusqlite::{OptionalExtension, params};
 use tracing::warn;
 
+use crate::agency::{LeafKind, SystemPrompt};
 use crate::block::Block;
 use crate::types::InputBlock;
 
@@ -361,11 +362,11 @@ impl Store {
     /// and then clones the rows it wants
     /// ([`clone_join_rows_after`](Store::clone_join_rows_after),
     /// [`clone_join_rows_up_to`](Store::clone_join_rows_up_to)). Replacing a
-    /// conversation's system prompt is exactly that composition, and it is
-    /// the caller's to compose: the prompt goes in first, because the store
-    /// takes a prompt only into an empty conversation, and the source's rows
-    /// from past the old prompt follow it. Nothing here knows what a prompt
-    /// is.
+    /// conversation's system prompt is exactly that composition, and it is the
+    /// caller's to compose: the prompt goes in first, under the rule
+    /// [`insert_system_prompt`](Store::insert_system_prompt) states, and the
+    /// source's rows from past the old prompt follow it. Nothing here knows
+    /// what a prompt is.
     ///
     /// # Errors
     ///
@@ -920,12 +921,13 @@ pub(super) fn confirm_inherited_history(
 }
 
 /// The source's junction rowid for `block_id` — the cutoff a half-copy is
-/// taken at, and the ONE place the three copies below ask for it.
+/// taken at, and the ONE place every copy of a range asks for it, the
+/// compaction's own included.
 ///
 /// Absent means the caller named a block the source conversation does not
 /// hold, a source that is itself gone included: its own refusal, for the
 /// reason [`no_such_source`] states.
-fn junction_cutoff(
+pub(super) fn junction_cutoff(
     conn: &rusqlite::Connection,
     source_id: i64,
     block_id: i64,
@@ -979,39 +981,6 @@ pub(super) fn copy_junction_after(
          SELECT ?1, block_id FROM conversation_blocks
          WHERE conversation_id = ?2 AND id > ?3
          ORDER BY id",
-        (dst_id, source_id, cutoff),
-    )?;
-    Ok(())
-}
-
-/// Copy source junction rows strictly AFTER `last_block_id`, leaving a
-/// `system_prompt` row of the source behind.
-///
-/// The one copy in this library that reads a kind, and it reads exactly one
-/// (2026-09-02). A compacted thread appends its OWN prompt before it inherits
-/// the second half of its source, and since 2026-09-02 the schema holds a
-/// prompt to the head of its conversation — so a source written before that
-/// rule, carrying its prompt behind its history, would hand a second prompt
-/// to a thread that already has one and the whole compaction would be
-/// refused. The thread's prompt is the thread's own, and the source's stays
-/// in the source.
-///
-/// [`copy_junction_after`] is the kind-blind copy and stays that way: the
-/// filter belongs to the compaction, which is the one caller that appends a
-/// prompt of its own in front of what it inherits.
-pub(super) fn copy_junction_after_without_prompt(
-    conn: &rusqlite::Connection,
-    source_id: i64,
-    dst_id: i64,
-    last_block_id: i64,
-) -> Result<(), StoreError> {
-    let cutoff = junction_cutoff(conn, source_id, last_block_id)?;
-    conn.execute(
-        "INSERT INTO conversation_blocks (conversation_id, block_id)
-         SELECT ?1, cb.block_id FROM conversation_blocks cb
-         JOIN blocks b ON b.id = cb.block_id
-         WHERE cb.conversation_id = ?2 AND cb.id > ?3 AND b.block_type != 'system_prompt'
-         ORDER BY cb.id",
         (dst_id, source_id, cutoff),
     )?;
     Ok(())
@@ -1077,7 +1046,7 @@ pub(super) fn insert_system_prompt_block(
     conversation_id: i64,
     prompt: &str,
 ) -> Result<(), StoreError> {
-    let id = insert_block(conn, conversation_id, "system_prompt")?;
+    let id = insert_block(conn, conversation_id, SystemPrompt::KINDS[0])?;
     conn.execute(
         "INSERT INTO block_text (block_id, role, content) VALUES (?1, 'system', ?2)",
         params![id, prompt],

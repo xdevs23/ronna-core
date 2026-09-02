@@ -31,7 +31,14 @@ impl super::LeafKind for SystemPrompt {
     }
 }
 
-impl Agency for SystemPrompt {}
+impl Agency for SystemPrompt {
+    /// The one kind a conversation opens with. The rule is the store's — a
+    /// prompt joins a conversation that holds no row yet — and this is the
+    /// same rule stated where a reader of the ledger can ask it.
+    fn heads_the_ledger(&self) -> bool {
+        true
+    }
+}
 
 impl Projection for SystemPrompt {
     fn group_role(&self) -> Option<Role> {

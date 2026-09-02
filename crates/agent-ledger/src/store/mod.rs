@@ -2608,11 +2608,58 @@ mod tests {
         assert_eq!(blocks[0].id, prompt);
         assert_eq!(blocks[0].block_type, "system_prompt");
 
+        let refused = s.insert_system_prompt(c1, "a second set".into()).await;
         assert!(
-            s.insert_system_prompt(c1, "a second set".into())
+            matches!(refused, Err(StoreError::Rejected(_))),
+            "a conversation takes one system prompt, and the schema is what says \
+             so: {refused:?}"
+        );
+    }
+
+    /// The two range clones are complements: everything up to a row and
+    /// everything after it, into one destination, is the source's ledger
+    /// exactly once and in order. A row copied twice or dropped between the
+    /// ranges would show here and nowhere else, because each clone on its own
+    /// only ever states what it carried.
+    #[tokio::test]
+    async fn the_two_range_clones_cover_the_source_exactly_once() {
+        let s = store();
+        let source = make_conv(&s, "p1", "model").await;
+        let mut written = vec![
+            s.insert_system_prompt(source, "the instructions".into())
                 .await
-                .is_err(),
-            "a conversation takes one system prompt"
+                .unwrap(),
+        ];
+        for said in ["one", "two", "three", "four"] {
+            written.push(
+                s.insert_text_block(source, Role::User, said.into())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let split = written[2];
+
+        let destination = s
+            .fork_empty(source, ModelOverride::default())
+            .await
+            .unwrap();
+        s.clone_join_rows_up_to(source, destination, split)
+            .await
+            .unwrap();
+        s.clone_join_rows_after(source, destination, split)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s.list_blocks(destination)
+                .await
+                .unwrap()
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<i64>>(),
+            written,
+            "the two ranges meet at the row they name, with no row twice and none \
+             missing"
         );
     }
 

@@ -5,6 +5,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::agency::{LeafKind, SystemPrompt};
 use crate::block::{Block, OpaquePayload, Role};
 use crate::types::InputBlock;
 
@@ -352,29 +353,29 @@ impl Store {
     /// Append the conversation's system prompt block. The content is the
     /// caller's: prompts are a consumer's own words, and this library has none.
     ///
-    /// A conversation takes ONE system prompt, and a second is refused in this
-    /// library's own words (2026-09-01). The schema's trigger still stands
-    /// behind the rule for whatever writes around this door, but the rule is
-    /// answered here, where the refusal can say which conversation already has
-    /// one — a caller meant to receive a refusal should not have to read the
-    /// database's constraint message to learn what it did.
+    /// **The prompt is the head of the ledger, or it is refused** (2026-09-02).
+    /// A system prompt joins a conversation that holds no row yet; a
+    /// conversation already holding any block takes none, and a conversation
+    /// already holding a prompt takes no second one. This is the whole
+    /// statement of the rule, and every other place that mentions it points
+    /// here.
     ///
-    /// **The prompt is the head of the ledger** (2026-09-02): a conversation
-    /// that already holds ANY block takes no prompt at all, and the schema is
-    /// what refuses it — [`StoreError::Rejected`], carrying the rule the
-    /// trigger states. The database holds the position, not this door,
-    /// because a prompt reaches a conversation through the
-    /// junction from several directions (a fork copying its source's rows
-    /// among them) and a check in front of one door leaves the others open.
-    /// A caller replacing a conversation's prompt therefore appends the new
-    /// one to a fresh conversation and clones the history behind it — see
+    /// The SCHEMA is what holds it, not this door, because a prompt reaches a
+    /// conversation through the junction from several directions — a fork
+    /// copying its source's rows among them — and a check in front of one door
+    /// leaves the others open. So the refusal is the database's own sentence,
+    /// carried to the caller typed as [`StoreError::Rejected`]: one rule, one
+    /// place it is stated, one class a caller acts on.
+    ///
+    /// A caller replacing a conversation's prompt appends the new one to a
+    /// fresh conversation and clones the history behind it — see
     /// [`clone_join_rows_after`](Store::clone_join_rows_after).
     ///
     /// # Errors
     ///
-    /// If the insert fails, if the conversation already carries a system
-    /// prompt, if it holds any block at all, or if the store's actor has
-    /// stopped.
+    /// [`StoreError::Rejected`] if the conversation holds any block already, a
+    /// system prompt among them; whatever the write fails with otherwise; or
+    /// [`StoreError::ActorStopped`] if the store's actor has stopped.
     pub async fn insert_system_prompt(
         &self,
         conversation_id: i64,
@@ -382,22 +383,7 @@ impl Store {
     ) -> Result<i64, StoreError> {
         self.run(move |conn| {
             transact(conn, |tx| {
-                let taken: bool = tx.query_row(
-                    "SELECT EXISTS (
-                         SELECT 1 FROM conversation_blocks cb
-                         JOIN blocks b ON b.id = cb.block_id
-                         WHERE cb.conversation_id = ?1
-                           AND b.block_type = 'system_prompt'
-                     )",
-                    [conversation_id],
-                    |row| row.get(0),
-                )?;
-                if taken {
-                    return Err(StoreError::Other(format!(
-                        "conversation {conversation_id} already has a system prompt"
-                    )));
-                }
-                let block_id = insert_block(tx, conversation_id, "system_prompt")?;
+                let block_id = insert_block(tx, conversation_id, SystemPrompt::KINDS[0])?;
                 tx.execute(
                     "INSERT INTO block_text (block_id, role, content) VALUES (?1, 'system', ?2)",
                     params![block_id, content],

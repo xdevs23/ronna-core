@@ -395,6 +395,26 @@ fn exactly_the_streaming_kinds_are_ephemeral() {
     }
 }
 
+/// Exactly one stored kind says a conversation opens with it, over every
+/// string this library claims. The dispatch refuses a ledger whose first row
+/// answers `false`, so a second kind answering `true` would let a headless
+/// ledger buy a turn, and the prompt answering `false` would refuse every
+/// conversation there is.
+#[test]
+fn exactly_the_system_prompt_heads_the_ledger() {
+    for stored in BlockKind::CLAIMED_KINDS
+        .iter()
+        .copied()
+        .chain([UNREGISTERED_TYPE])
+    {
+        assert_eq!(
+            kind(stored, None).heads_the_ledger(),
+            stored == SystemPrompt::KINDS[0],
+            "{stored} answers for itself whether a conversation opens with it"
+        );
+    }
+}
+
 // ─── tool_call run(): park, wakeup, settle ───────────────────────────────
 
 #[tokio::test]

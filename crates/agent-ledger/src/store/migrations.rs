@@ -414,16 +414,14 @@ const MIGRATIONS: &[&str] = &[
         names    TEXT NOT NULL
     );
     ",
-    // v8 (2026-09-02): the system prompt is the head of its conversation or
-    // it is refused. v1's rule counts prompts and says nothing about where
-    // one sits, so a prompt appended behind a thousand blocks was accepted —
-    // and a ledger in that shape cannot be compacted, because the thread the
-    // compaction opens appends its own prompt and then inherits the late one.
-    // The rule is positional here: a system_prompt joins a conversation that
-    // holds no row yet, and anywhere else the statement is refused. The
-    // counting rule stays beside it, so a conversation that somehow holds a
-    // prompt and nothing else still takes no second one. A step, not an edit
-    // to v1's CREATE TRIGGER, for the reason v3 records.
+    // v8 (2026-09-02): the positional half of the prompt rule, which
+    // `Store::insert_system_prompt` states in full — a system_prompt joins a
+    // conversation that holds no row yet, and anywhere else the statement is
+    // refused. v1's counting trigger stays beside it. A step, not an edit to
+    // v1's CREATE TRIGGER, for the reason v3 records.
+    //
+    // The kind name is a literal here because a shipped step is never edited,
+    // and a test holds it equal to the const the code reads.
     "
     CREATE TRIGGER IF NOT EXISTS trg_system_prompt_is_the_head
          BEFORE INSERT ON conversation_blocks
@@ -468,6 +466,8 @@ pub(super) fn run(conn: &Connection) -> rusqlite::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::agency::{LeafKind, SystemPrompt};
+
     use super::{Connection, MIGRATIONS, run};
 
     fn migrated() -> Connection {
@@ -894,6 +894,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(names, "[\"read\"]");
+    }
+
+    /// v8 names the same kind the code names. A shipped step keeps the literal
+    /// it was applied with — an edit would leave two databases with two
+    /// schemas — so the one declaration and the literal are held together by
+    /// this assertion instead of by a shared const.
+    #[test]
+    fn the_head_trigger_names_the_kind_the_code_reads() {
+        let step = MIGRATIONS[7];
+        assert!(
+            step.contains("trg_system_prompt_is_the_head"),
+            "v8 is the step that holds the prompt to the head"
+        );
+        assert!(
+            step.contains(&format!("= '{}'", SystemPrompt::KINDS[0])),
+            "v8 refuses on the kind `{}`, which is what every reader of a stored \
+             row resolves through",
+            SystemPrompt::KINDS[0]
+        );
     }
 
     /// The display-only summary channel sits beside content and the opaque

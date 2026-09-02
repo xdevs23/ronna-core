@@ -703,6 +703,13 @@ fn agency_impl(name: &Ident, composition: &Composition<'_>) -> proc_macro2::Toke
                 }
             }
 
+            fn heads_the_ledger(&self) -> bool {
+                match self {
+                    #( Self::#all_ident(kind) =>
+                        #krate::agency::Agency::heads_the_ledger(kind), )*
+                }
+            }
+
             async fn gate<__E: #krate::RuntimeEvent>(
                 &self,
                 ctx: &#krate::AgencyCtx<__E>,
@@ -814,17 +821,23 @@ mod tests {
     }
 
     /// Without an override, every generated path reaches `::agent_ledger`.
+    ///
+    /// Both assertions read a PATH — the crate name followed by the module the
+    /// generated code enters — and not the bare crate name: a hook name may
+    /// carry either crate name as a substring (`heads_the_ledger` carries the
+    /// override's), and a substring search would then answer about an
+    /// identifier while claiming to answer about a path.
     #[test]
     fn the_default_crate_path_is_the_library() {
         let generated = expand(&composed(false))
             .expect("a valid composition expands")
             .to_string();
         assert!(
-            generated.contains("agent_ledger"),
+            generated.contains("agent_ledger :: agency"),
             "the default path names the library: {generated}"
         );
         assert!(
-            !generated.contains("the_ledger"),
+            !generated.contains("the_ledger :: agency"),
             "no override path appears without the attribute: {generated}"
         );
     }
@@ -840,11 +853,11 @@ mod tests {
             .expect("a valid composition expands")
             .to_string();
         assert!(
-            !generated.contains("agent_ledger"),
+            !generated.contains("agent_ledger :: "),
             "a generated path escaped the crate override: {generated}"
         );
         assert!(
-            generated.contains("the_ledger"),
+            generated.contains("the_ledger :: agency"),
             "the override path is what the generated code resolves through: {generated}"
         );
     }

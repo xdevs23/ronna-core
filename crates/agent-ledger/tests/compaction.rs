@@ -533,11 +533,22 @@ async fn a_source_whose_prompt_sits_past_the_cut_still_compacts() {
         1,
         "the thread has one prompt"
     );
-    assert_eq!(blocks[0].block_type, "system_prompt");
     assert_eq!(
         SystemPrompt::parse(&blocks[0]).content,
         THREAD_PROMPT,
         "and it is the thread's own"
+    );
+    // What the thread writes before it inherits anything. Named here so the
+    // slice below cuts at a prefix this test has read, not at a remembered
+    // length.
+    assert_eq!(
+        blocks[..3]
+            .iter()
+            .map(|block| block.block_type.as_str())
+            .collect::<Vec<&str>>(),
+        vec![SystemPrompt::KINDS[0], "ancestor_reference", "text"],
+        "the thread opens with its prompt, where the history came from, and what \
+         it said"
     );
     assert_eq!(
         blocks[3..]

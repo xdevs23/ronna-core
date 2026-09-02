@@ -189,6 +189,21 @@ pub trait Agency {
         false
     }
 
+    /// Whether a conversation OPENS with this block: the ledger's first row
+    /// answers `true` or the ledger has no head this runtime can serve.
+    /// Default: `false` — an ordinary row says nothing about where it sits.
+    ///
+    /// The system prompt is the kind that answers `true`, and the store holds
+    /// the same rule at the write: a prompt joins a conversation that holds no
+    /// row yet, and any other position is refused. The dispatch reads this
+    /// hook on the first row before every request, so a ledger written around
+    /// the store — a foreign or damaged one — is refused before it buys a
+    /// turn, and the machinery reads one answer without learning which kind
+    /// gave it.
+    fn heads_the_ledger(&self) -> bool {
+        false
+    }
+
     /// Vet this block before [`run`](Self::run).
     ///
     /// [`Refuse`](GateDecision::Refuse) records an error block, skips `run()`
@@ -701,6 +716,10 @@ impl Agency for BlockKind {
 
     fn frontier_transparent(&self) -> bool {
         dispatch!(self, kind => kind.frontier_transparent())
+    }
+
+    fn heads_the_ledger(&self) -> bool {
+        dispatch!(self, kind => kind.heads_the_ledger())
     }
 
     async fn gate<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> GateDecision {
