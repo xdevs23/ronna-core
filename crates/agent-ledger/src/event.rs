@@ -47,6 +47,11 @@ pub mod stream_status {
     /// User-visible text is flowing: raised once per turn at the first
     /// non-empty text delta.
     pub const RESPONDING: &str = "responding";
+    /// A tool call started: raised once per RECORDED call, when the reader
+    /// records that start, which is as early as the wire allows. The name the
+    /// model called the tool by travels in the status subtitle, as the provider
+    /// sent it.
+    pub const STARTING_TOOL_CALL: &str = "starting_tool_call";
 }
 
 /// Every event the runtime broadcasts on the single ordered push bus.
@@ -105,6 +110,26 @@ pub enum CoreEvent {
     /// - `sending` — a request is on its way to the provider; `subtitle`
     ///   carries the provider's own status line when it gave one.
     /// - `waiting_for_response` — the stream is open, no content yet.
+    /// - `starting_tool_call` — a tool call started: raised once per RECORDED
+    ///   call, and never for text or for thinking. It fires where the call
+    ///   block is written down, in that write's success arm, so a call the
+    ///   store refused raises nothing and the count of these matches the count
+    ///   of calls the ledger holds.
+    ///
+    ///   WHEN it fires is when the reader learns of the call, which is as early
+    ///   as the wire allows and no earlier. On the chat-stream and Anthropic
+    ///   wires the calls are handed over as complete lifecycles at the end of
+    ///   the turn, so there the arguments have already arrived; a wire that
+    ///   announces a call before streaming its arguments raises it then. Either
+    ///   way it is the first moment the runtime knows which tool is coming, and
+    ///   it is always ahead of `running_tools`, which is one signal for the
+    ///   whole turn and means execution began.
+    ///
+    ///   `subtitle` carries the name the model called the tool by, verbatim
+    ///   from the provider: the registry is consulted only when the call
+    ///   executes, so a name registered nowhere reaches this status unchanged
+    ///   and a consumer matching its own tool names simply matches none of
+    ///   them.
     /// - `running_tools` — the turn stopped for tool use and the calls are
     ///   executing.
     /// - `responding` — user-visible text is flowing: raised once per turn at
@@ -118,7 +143,10 @@ pub enum CoreEvent {
         conversation_id: i64,
         /// Stable machine key from the vocabulary above, empty to clear.
         label: String,
-        /// Optional second line.
+        /// The detail its own label documents above, when that label has one:
+        /// the provider's status line under `sending`, the name the model
+        /// called the tool by under `starting_tool_call`. `None` everywhere
+        /// else.
         subtitle: Option<String>,
     },
     /// A turn's stream finished.

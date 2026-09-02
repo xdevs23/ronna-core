@@ -166,6 +166,22 @@ pub enum StoreError {
         /// What the database said.
         reason: String,
     },
+    /// The named block is no tool call of the named conversation: it is a block
+    /// of another kind, a call held by another ledger only, or an id that names
+    /// nothing at all.
+    ///
+    /// The caller can correct it: the identity a resolution and an approval
+    /// request are keyed on is the CALL BLOCK id, handed to a tool body as
+    /// [`ToolContext::block_id`](crate::ToolContext::block_id), and this says
+    /// the id reaching the store is not that. Nothing was written.
+    #[error("block {block_id} is no tool call of conversation {conversation_id}")]
+    NoSuchToolCall {
+        /// The block the caller named.
+        block_id: i64,
+        /// The conversation it was looked for in, which is what scopes the
+        /// question: a fork answers off its own ledger.
+        conversation_id: i64,
+    },
     /// A rule this library enforces above the schema — an already-decided
     /// approval, say — refused the write.
     #[error("{0}")]

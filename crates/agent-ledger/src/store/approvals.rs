@@ -6,7 +6,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::types::{ApprovalChoice, denial_error_text};
 
 use super::messages::{BlockDestination, anchor_of, insert_block};
-use super::tool_calls::call_resolution_exists;
+use super::tool_calls::{call_resolution_exists, ensure_call_of_conversation};
 use super::{Store, StoreError, transact};
 
 impl Store {
@@ -36,20 +36,10 @@ impl Store {
     ) -> Result<Option<i64>, StoreError> {
         self.run(move |conn| {
             transact(conn, |tx| {
-                let covers_a_call: bool = tx.query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM block_tool_call btc
-                         JOIN conversation_blocks cb ON cb.block_id = btc.block_id
-                         WHERE btc.block_id = ?1 AND cb.conversation_id = ?2)",
-                    params![for_block_id, conversation_id],
-                    |row| row.get(0),
-                )?;
-                if !covers_a_call {
-                    return Err(StoreError::Other(format!(
-                        "block {for_block_id} is not a tool call in conversation \
-                         {conversation_id}: an approval request can only cover a call"
-                    )));
-                }
+                // A request can only cover a call of this conversation, and the
+                // resolution door's reader is the one place that question and
+                // its refusal live.
+                ensure_call_of_conversation(tx, conversation_id, for_block_id)?;
                 let already_covered: bool = tx.query_row(
                     "SELECT EXISTS(
                          SELECT 1 FROM block_approval_request bar
@@ -543,8 +533,10 @@ mod tests {
     }
 
     /// A request can only cover a tool call: a text block and a missing id are
-    /// both refused at insert, with the block named — not accepted here to
-    /// surface later as a bare no-rows error on the denial path.
+    /// both refused at insert, through the typed
+    /// [`NoSuchToolCall`](crate::store::StoreError::NoSuchToolCall) naming the
+    /// block — not accepted here to surface later as a bare no-rows error on
+    /// the denial path.
     #[tokio::test]
     async fn a_request_over_a_non_call_is_refused_at_insert() {
         let (store, conv, _call) = fixture().await;
@@ -553,14 +545,15 @@ mod tests {
             .await
             .unwrap();
 
-        for bogus in [text, 999_999] {
+        for bogus in [text, i64::MAX] {
             let refused = store.insert_approval_request_block(conv, bogus).await;
             match refused {
-                Err(crate::store::StoreError::Other(message)) => {
-                    assert!(
-                        message.contains(&bogus.to_string()) && message.contains("not a tool call"),
-                        "the refusal names the block: {message}"
-                    );
+                Err(crate::store::StoreError::NoSuchToolCall {
+                    block_id,
+                    conversation_id,
+                }) => {
+                    assert_eq!(block_id, bogus, "the refusal names the block");
+                    assert_eq!(conversation_id, conv, "and the ledger it was sought in");
                 }
                 other => panic!("expected the named refusal, got {other:?}"),
             }

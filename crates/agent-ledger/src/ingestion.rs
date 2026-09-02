@@ -1126,6 +1126,20 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
             .await
         {
             Ok(block_id) => {
+                // The per-call moment (2026-09-02): the call is recorded, and
+                // the status names WHICH tool. Inside the success arm, so the
+                // status answers for a call the ledger holds and never for a
+                // write that failed. Raised per Start, so parallel siblings
+                // each raise their own, and raised nowhere else — text and
+                // thinking take the other labels. How early the Start itself
+                // arrives is the wire's to decide; `running_tools` still
+                // speaks for the whole turn at the stop, and means execution
+                // began.
+                self.ctx.bus.emit(CoreEvent::StreamStatus {
+                    conversation_id: conv_id,
+                    label: stream_status::STARTING_TOOL_CALL.into(),
+                    subtitle: Some(name.clone()),
+                });
                 self.trackers
                     .open_streaming_tool_calls
                     .push((block_id, id, name));
@@ -2368,9 +2382,12 @@ mod tests {
     /// The status plane speaks EXACTLY the documented machine keys — never
     /// prose. The vocabulary is the contract on [`CoreEvent::StreamStatus`]:
     /// `sending`, `waiting_for_response`, the empty clear, `responding`,
-    /// `running_tools`. A real text delta is driven so `responding` actually
-    /// fires — the closed set is checked against the keys as produced, not a
-    /// list that could silently omit a real member.
+    /// `starting_tool_call`, `running_tools`. A real text delta and a real
+    /// tool call are driven so `responding` and `starting_tool_call` actually
+    /// fire — the closed set is checked against the keys as produced, not a
+    /// list that could silently omit a real member. The two older keys are
+    /// asserted at the same points in the same stream they have always fired
+    /// at.
     #[tokio::test]
     async fn stream_status_labels_are_exactly_the_documented_machine_keys() {
         let (ctx, mut rx) = fixture().await;
@@ -2386,6 +2403,12 @@ mod tests {
                 StreamEvent::TextDelta {
                     text: "hello".into(),
                 },
+                StreamEvent::ToolUseStart {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                },
+                StreamEvent::ToolUseInputDelta { json: "{}".into() },
+                StreamEvent::ToolUseEnd,
                 StreamEvent::MessageEnd {
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
@@ -2413,9 +2436,86 @@ mod tests {
                 (stream_status::WAITING_FOR_RESPONSE.to_string(), None),
                 (String::new(), None),
                 (stream_status::RESPONDING.to_string(), None),
+                (
+                    stream_status::STARTING_TOOL_CALL.to_string(),
+                    Some("read_file".to_string())
+                ),
                 (stream_status::RUNNING_TOOLS.to_string(), None),
             ],
             "exactly the documented machine keys, in stream order"
+        );
+    }
+
+    /// The call-start status (2026-09-02): once per recorded call, carrying
+    /// that call's own tool name, and raised by nothing else in the turn. Two
+    /// parallel siblings therefore raise two, each naming its own tool, while
+    /// the text and thinking deltas around them raise their own labels and
+    /// never this one — the stream carries both, and both are covered by there
+    /// being exactly one status per CALL.
+    ///
+    /// The clears are not asserted: how many times flowing content clears the
+    /// label is that mechanism's business, and freezing the count here would
+    /// fail this test for a change it says nothing about. What is asserted is
+    /// the named statuses, and that of the labelled ones `responding` is the
+    /// only other — no stop for tool use arrived, so execution never began.
+    #[tokio::test]
+    async fn a_call_start_raises_one_status_per_call_naming_its_tool() {
+        let (ctx, mut rx) = fixture().await;
+        drive(
+            &ctx,
+            false,
+            vec![
+                StreamEvent::ThinkingStart,
+                StreamEvent::ThinkingDelta {
+                    text: "weighing it".into(),
+                },
+                StreamEvent::ThinkingEnd { opaque: None },
+                StreamEvent::TextBlockStart,
+                StreamEvent::TextDelta {
+                    text: "on it".into(),
+                },
+                StreamEvent::ToolUseStart {
+                    id: "sib-1".into(),
+                    name: "read_file".into(),
+                },
+                StreamEvent::ToolUseInputDelta {
+                    json: "{\"path\"".into(),
+                },
+                StreamEvent::ToolUseStart {
+                    id: "sib-2".into(),
+                    name: "list_dir".into(),
+                },
+                StreamEvent::ToolUseInputDelta { json: "{}".into() },
+                StreamEvent::ToolUseEnd,
+            ],
+        )
+        .await;
+
+        let mut named = Vec::new();
+        let mut other = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let CoreEvent::StreamStatus {
+                label, subtitle, ..
+            } = event
+            {
+                if label == stream_status::STARTING_TOOL_CALL {
+                    named.push(subtitle);
+                } else if !label.is_empty() {
+                    other.push(label);
+                }
+            }
+        }
+        assert_eq!(
+            named,
+            vec![Some("read_file".to_string()), Some("list_dir".to_string())],
+            "one status per call, in call order, each naming its own tool — and \
+             none for the text and thinking this same stream carried"
+        );
+        assert_eq!(
+            other,
+            vec![stream_status::RESPONDING.to_string()],
+            "the text keeps `responding` to itself, and no stop for tool use \
+             arrived so execution never began"
         );
     }
 
