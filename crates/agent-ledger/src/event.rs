@@ -47,6 +47,10 @@ pub mod stream_status {
     /// User-visible text is flowing: raised once per turn at the first
     /// non-empty text delta.
     pub const RESPONDING: &str = "responding";
+    /// One tool call began streaming: raised once per call, at the moment the
+    /// model starts composing that call's arguments. The tool's registered
+    /// name travels in the status subtitle.
+    pub const STARTING_TOOL_CALL: &str = "starting_tool_call";
 }
 
 /// Every event the runtime broadcasts on the single ordered push bus.
@@ -105,6 +109,13 @@ pub enum CoreEvent {
     /// - `sending` — a request is on its way to the provider; `subtitle`
     ///   carries the provider's own status line when it gave one.
     /// - `waiting_for_response` — the stream is open, no content yet.
+    /// - `starting_tool_call` — one tool call began streaming: raised once per
+    ///   call, at the moment the model starts composing that call's arguments,
+    ///   and never for text or for thinking. `subtitle` carries the tool's
+    ///   registered name, so a consumer can light a cue for the tool being
+    ///   called before its arguments have finished arriving. Distinct from
+    ///   `running_tools`, which is one signal for the whole turn and means
+    ///   execution began.
     /// - `running_tools` — the turn stopped for tool use and the calls are
     ///   executing.
     /// - `responding` — user-visible text is flowing: raised once per turn at
@@ -118,7 +129,9 @@ pub enum CoreEvent {
         conversation_id: i64,
         /// Stable machine key from the vocabulary above, empty to clear.
         label: String,
-        /// Optional second line.
+        /// The detail its own label documents above, when that label has one:
+        /// the provider's status line under `sending`, the tool's registered
+        /// name under `starting_tool_call`. `None` everywhere else.
         subtitle: Option<String>,
     },
     /// A turn's stream finished.
