@@ -150,11 +150,12 @@ pub struct ContentDescriptor {
     pub table: &'static str,
     /// The domain whose migrations create and advance this table — the same
     /// name the consumer's [`DomainMigrations`] carries. Descriptor reads and
-    /// writes run under this domain, so a failed migration for it answers
-    /// them with [`StoreError::MigrationFailed`] exactly as
-    /// [`domain_run`](super::domain_run) is answered, instead of running raw
-    /// against a schema in doubt. `"core"` is the library's own and is
-    /// refused.
+    /// writes run under this domain, so migrations for it that did not
+    /// complete answer them with [`StoreError::MigrationFailed`] for a failed
+    /// step or [`StoreError::DomainCounterUnreadable`] for a counter that
+    /// could not be read, exactly as [`domain_run`](super::domain_run) is
+    /// answered, instead of running raw against a schema in doubt. `"core"` is
+    /// the library's own and is refused.
     pub domain: &'static str,
     /// The stored type strings whose content rows live in that table.
     pub kinds: &'static [&'static str],
@@ -1257,9 +1258,11 @@ impl Store {
     /// promise. The delete is type-guarded: a committed block is unreachable
     /// through it.
     ///
-    /// The write runs under the descriptor's own domain, so a failed migration
-    /// for that domain answers it with [`StoreError::MigrationFailed`] exactly
-    /// as [`domain_run`](super::domain_run) is answered.
+    /// The write runs under the descriptor's own domain, so migrations for
+    /// that domain that did not complete answer it with
+    /// [`StoreError::MigrationFailed`] for a failed step or
+    /// [`StoreError::DomainCounterUnreadable`] for a counter that could not be
+    /// read, exactly as [`domain_run`](super::domain_run) is answered.
     ///
     /// The date-marker discipline runs here for a USER-VOICED append, and only
     /// for one: an append whose role is [`Role::User`] carries the marker's
@@ -1292,8 +1295,10 @@ impl Store {
     /// # Errors
     ///
     /// [`StoreError::UnsupportedBlockKind`] if no descriptor claims `kind`;
-    /// [`StoreError::MigrationFailed`] if the descriptor's domain is in a
-    /// failed-migration state; an error if a field names an undeclared column
+    /// [`StoreError::MigrationFailed`] if a step of the descriptor's domain
+    /// failed, or [`StoreError::DomainCounterUnreadable`] if that domain's
+    /// version counter could not be read; an error if a field names an
+    /// undeclared column
     /// or does not fit its declared type, if a role is given without a
     /// declared `role` column, if the transaction fails — a refused junction
     /// insert, or a refused marker, rolls back the header with it — or if the

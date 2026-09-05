@@ -509,9 +509,15 @@ const MIGRATIONS: &[&str] = &[
 ///
 /// # Errors
 ///
-/// [`StoreError::CoreMigrationFailed`] naming the step that failed and
-/// carrying its classified failure, or the database's error if the counter
-/// cannot be read at all.
+/// [`StoreError::CoreMigrationFailed`], naming the step that failed and
+/// carrying its classified failure. A counter this runner cannot read has no
+/// case of its own here — there is no domain to hold a failure against — and
+/// comes back as the read's own classified error, unwrapped.
+///
+/// What either failure means for a store is on
+/// [`StoreError::CoreMigrationFailed`]. This runner is called on a throwaway
+/// in-memory connection as well, for the core table snapshot, where no store
+/// is opening.
 pub(super) fn run(conn: &mut Connection) -> Result<(), StoreError> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     tracing::info!(
@@ -581,6 +587,38 @@ mod tests {
         i64::try_from(MIGRATIONS.len()).unwrap()
     }
 
+    /// The index in `MIGRATIONS` of the step that states the resolution rule:
+    /// a stored resolution names the call block it answers. Found by the
+    /// trigger that step creates, so a step inserted ahead of it moves every
+    /// test reading this along with it. The steps mentioning that trigger are
+    /// counted here, and exactly one may: a second mention would re-point
+    /// these tests at another step without a word.
+    fn resolution_rule_step() -> usize {
+        let steps: Vec<usize> = MIGRATIONS
+            .iter()
+            .enumerate()
+            .filter(|(_, sql)| sql.contains("trg_tool_result_names_its_call"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            steps.len(),
+            1,
+            "exactly one step states the resolution rule by creating its triggers, \
+             found the steps {steps:?}"
+        );
+        steps[0]
+    }
+
+    /// The one-based version the resolution-rule step carries.
+    fn resolution_rule_version() -> i64 {
+        i64::try_from(resolution_rule_step()).unwrap() + 1
+    }
+
+    /// The version a database sitting right before that step carries.
+    fn version_before_the_resolution_rule() -> i64 {
+        i64::try_from(resolution_rule_step()).unwrap()
+    }
+
     fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
         conn.prepare(&format!("PRAGMA table_info({table})"))
             .unwrap()
@@ -605,21 +643,27 @@ mod tests {
 
     /// A failed core step names the version that failed, the way a domain's
     /// failure names its own, and hands the failure up in the class this crate
-    /// sorted it into. A database whose counter claims eight steps ran while it
-    /// holds none of their tables fails on the ninth, and the error says nine
-    /// and carries a [`StoreError`], so a caller can still tell a contended
-    /// open from a step the database refused.
+    /// sorted it into. A database whose counter claims every step before the
+    /// resolution-rule step ran while it holds none of their tables fails on
+    /// that step, and the error names it and carries a [`StoreError`], so a
+    /// caller can still tell a contended open from a step the database
+    /// refused.
     #[test]
     fn a_failed_step_names_its_version() {
         let mut conn = Connection::open_in_memory().unwrap();
-        // The step exercised is MIGRATIONS[8], the v9 step: it reads
+        // The step exercised is the resolution-rule step: it reads
         // `block_tool_result`, which nothing has created on this connection.
-        conn.pragma_update(None, "user_version", 8).unwrap();
+        conn.pragma_update(None, "user_version", version_before_the_resolution_rule())
+            .unwrap();
 
         let Err(StoreError::CoreMigrationFailed { version, source }) = run(&mut conn) else {
-            panic!("the ninth step reads tables this database does not have");
+            panic!("the resolution-rule step reads tables this database does not have");
         };
-        assert_eq!(version, 9, "the error names the step that failed");
+        assert_eq!(
+            version,
+            resolution_rule_version(),
+            "the error names the step that failed"
+        );
         assert!(
             matches!(*source, StoreError::Sqlite(_)),
             "the classified error survives the wrapping, got {source:?}"
@@ -627,6 +671,25 @@ mod tests {
         assert!(
             source.to_string().contains("block_tool_result"),
             "and carries what the database said, got `{source}`"
+        );
+    }
+
+    /// A counter that cannot be read comes back in its own class, not as a
+    /// failed step. The runner never enters the list, so nothing it hands back
+    /// claims a migration failed, and a file that is not a database is what
+    /// the classifier calls unusable.
+    #[test]
+    fn an_unreadable_counter_is_not_a_migration_failure() {
+        let dir = crate::store::SelfRemovingDir::new("core-counter-unreadable");
+        let path = dir.path().join("not-a-database.sqlite");
+        std::fs::write(&path, b"this file is not a database, and never was").unwrap();
+        let mut conn = Connection::open(&path).unwrap();
+
+        let failure =
+            run(&mut conn).expect_err("the counter of a file that is not a database is unreadable");
+        assert!(
+            matches!(failure, StoreError::Unusable(_)),
+            "the read's own classified failure comes back as it is, got {failure:?}"
         );
     }
 
@@ -1086,10 +1149,11 @@ mod tests {
     fn a_populated_store_gains_the_rule_that_a_resolution_names_its_call() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        for sql in &MIGRATIONS[..8] {
+        for sql in &MIGRATIONS[..resolution_rule_step()] {
             conn.execute_batch(sql).unwrap();
         }
-        conn.pragma_update(None, "user_version", 8).unwrap();
+        conn.pragma_update(None, "user_version", version_before_the_resolution_rule())
+            .unwrap();
         conn.execute_batch(
             "INSERT INTO blocks (block_type) VALUES ('tool_call');
              INSERT INTO blocks (block_type) VALUES ('tool_result');
@@ -1146,10 +1210,11 @@ mod tests {
         ] {
             let mut conn = Connection::open_in_memory().unwrap();
             conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-            for sql in &MIGRATIONS[..8] {
+            for sql in &MIGRATIONS[..resolution_rule_step()] {
                 conn.execute_batch(sql).unwrap();
             }
-            conn.pragma_update(None, "user_version", 8).unwrap();
+            conn.pragma_update(None, "user_version", version_before_the_resolution_rule())
+                .unwrap();
             conn.execute_batch(&format!(
                 "INSERT INTO blocks (block_type) VALUES ('tool_call');
                  INSERT INTO blocks (block_type) VALUES ('{kind}');
@@ -1165,12 +1230,25 @@ mod tests {
             else {
                 panic!("the step reads what is stored");
             };
-            assert_eq!(failed, 9, "the failure names the step");
+            assert_eq!(
+                failed,
+                resolution_rule_version(),
+                "the failure names the step"
+            );
+            assert!(
+                matches!(*source, StoreError::Rejected(_)),
+                "the abort the trigger raises is a refusal the caller can correct, \
+                 got {source:?}"
+            );
             assert!(
                 source.to_string().contains("names no call block"),
                 "the failure names the case, got `{source}`"
             );
-            assert_eq!(version(&conn), 8, "the counter stays below the step");
+            assert_eq!(
+                version(&conn),
+                version_before_the_resolution_rule(),
+                "the counter stays below the step"
+            );
             let rule: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master

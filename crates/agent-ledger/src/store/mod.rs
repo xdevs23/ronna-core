@@ -153,16 +153,25 @@ pub enum StoreError {
         /// cover.
         tables: Vec<String>,
     },
-    /// A step of the library's own schema failed, so the store does not open
-    /// at all. A step and its version bump share one transaction, so nothing
-    /// of the named step is applied and the counter still says it has not run.
-    #[error("core migration {version} failed: {source}")]
+    /// A step of the library's own schema failed. A step and its version bump
+    /// share one transaction, so nothing of the named step is applied and the
+    /// counter still says it has not run. These steps ship with the library,
+    /// so there is no corrected migration a consumer could submit.
+    ///
+    /// This and a counter the core runner could not read both fail the open,
+    /// and there is no store to query in the meantime either way. The core
+    /// steps have no domain to hold a failure against, so an unreadable
+    /// counter has no error of its own here: the core runner hands it over in
+    /// the class the read was sorted into.
+    #[error("core migration failed at step {version}: {source}")]
     CoreMigrationFailed {
         /// The one-based step that failed.
         version: i64,
-        /// The step's failure in the class this crate sorted it into, so a
-        /// contended open still reads as contended and a damaged file as
-        /// unusable.
+        /// The failure in the class this crate sorted it into, so a contended
+        /// open still reads as contended and a damaged file as unusable. Boxed
+        /// and not shared: this failure is handed to its single caller once,
+        /// where the domain failure below is shared because every later query
+        /// for that domain is answered with the same one.
         source: Box<StoreError>,
     },
     /// A step of a consumer domain's migrations failed, so its tables are in
@@ -170,15 +179,44 @@ pub enum StoreError {
     /// instead of being run or parked. Naming the step that failed is the whole
     /// point: the domain stays refused until a corrected migration is submitted
     /// and succeeds.
-    #[error("domain '{domain}' migration {version} failed: {source}")]
+    ///
+    /// A counter that cannot be read is
+    /// [`StoreError::DomainCounterUnreadable`], not this.
+    #[error("domain '{domain}' migration failed at step {version}: {source}")]
     MigrationFailed {
         /// The domain whose schema is in doubt.
         domain: String,
         /// The one-based step that failed.
         version: i64,
-        /// The step's failure in the class this crate sorted it into, shared
-        /// because every later query for the domain is answered with this same
-        /// failure and a database error cannot be cloned.
+        /// The failure in the class this crate sorted it into, shared because
+        /// every later query for the domain is answered with this same failure
+        /// and a database error cannot be cloned.
+        source: Arc<StoreError>,
+    },
+    /// A domain's version counter could not be read, so the runner never
+    /// entered that domain's list and no step of it ran. The submission is
+    /// answered with this, every query already waiting for the domain is
+    /// answered with it too, and the domain is refused with it from then on
+    /// until a migration succeeds.
+    ///
+    /// # Why a domain that ran no step is refused
+    ///
+    /// No step ran, so the schema is exactly what it was before the
+    /// submission, and that is the reason a refusal is the honest answer: the
+    /// domain has no migrated schema to serve a query from, and a query parked
+    /// with nothing to wake it says less than a named refusal.
+    /// [`StoreError::MigrationFailed`] is the other shape, where a step ran and
+    /// failed and the schema's state stays unknown. Submitting the domain's
+    /// migrations again is supported, and one that succeeds clears this and
+    /// serves the queries that follow. An application meeting the refusal at
+    /// boot fails there, and its restart is the retry.
+    #[error("domain '{domain}' version counter could not be read: {source}")]
+    DomainCounterUnreadable {
+        /// The domain whose counter was read.
+        domain: String,
+        /// The read's failure in the class this crate sorted it into, shared
+        /// because the submitter and every waiting query are answered with
+        /// this same one and a database error cannot be cloned.
         source: Arc<StoreError>,
     },
     /// The named block is no tool call of the named conversation: it is a block
@@ -237,9 +275,11 @@ pub enum StoreOp {
 
 /// One piece of work for the actor.
 ///
-/// It is handed the connection when its domain is ready, and a
-/// [`StoreError::MigrationFailed`] instead when that domain's migrations
-/// failed: a query whose tables may not exist is answered, never run and never
+/// It is handed the connection when its domain is ready, and that domain's
+/// migration failure instead when its migrations did not complete
+/// ([`StoreError::MigrationFailed`], or
+/// [`StoreError::DomainCounterUnreadable`] when the counter could not be
+/// read): a query whose tables may not exist is answered, never run and never
 /// left parked.
 ///
 /// Whatever it answers travels back untouched. This thread reads no result
@@ -264,8 +304,8 @@ pub struct Store {
     /// The effective content-table list — see [`Store::content_tables`].
     content_tables: Arc<[&'static str]>,
     /// The consumer domains' health, shared with the actor: descriptor-path
-    /// reads and writes consult it so a failed consumer migration answers
-    /// them with [`StoreError::MigrationFailed`] instead of running raw.
+    /// reads and writes consult it so a consumer migration that did not
+    /// complete answers them with its own failure instead of running raw.
     gate: DomainGate,
     /// Fires whenever a relevant table changes, carrying the action, the table
     /// and the row id per change. Backed by the database's own row change hook.
@@ -302,8 +342,8 @@ impl Store {
     /// # Errors
     ///
     /// If the database cannot be opened, or
-    /// [`StoreError::CoreMigrationFailed`] if a step of the library's own
-    /// schema fails.
+    /// [`StoreError::CoreMigrationFailed`] if the library's own schema cannot
+    /// be brought up to date.
     pub fn open(db_path: &Path) -> Result<Self, StoreError> {
         Self::open_with(db_path, StoreConfig::default())
     }
@@ -323,8 +363,10 @@ impl Store {
     ///
     /// If the database cannot be opened, if any migrations fail
     /// ([`StoreError::CoreMigrationFailed`] for the library's own schema,
-    /// [`StoreError::MigrationFailed`] for a consumer domain), or if a
-    /// descriptor fails validation ([`StoreError::InvalidDescriptor`]).
+    /// [`StoreError::MigrationFailed`] for a step of a consumer domain,
+    /// [`StoreError::DomainCounterUnreadable`] if a consumer domain's version
+    /// counter cannot be read), or if a descriptor fails validation
+    /// ([`StoreError::InvalidDescriptor`]).
     pub fn open_with(db_path: &Path, config: StoreConfig) -> Result<Self, StoreError> {
         let conn = Connection::open(db_path)?;
         Self::init(conn, config)
@@ -336,8 +378,8 @@ impl Store {
     /// # Errors
     ///
     /// If the database cannot be created, or
-    /// [`StoreError::CoreMigrationFailed`] if a step of the library's own
-    /// schema fails.
+    /// [`StoreError::CoreMigrationFailed`] if the library's own schema cannot
+    /// be brought up to date.
     pub fn in_memory() -> Result<Self, StoreError> {
         Self::in_memory_with(StoreConfig::default())
     }
@@ -351,8 +393,10 @@ impl Store {
     ///
     /// If the database cannot be created, if any migrations fail
     /// ([`StoreError::CoreMigrationFailed`] for the library's own schema,
-    /// [`StoreError::MigrationFailed`] for a consumer domain), or if a
-    /// descriptor fails validation ([`StoreError::InvalidDescriptor`]).
+    /// [`StoreError::MigrationFailed`] for a step of a consumer domain,
+    /// [`StoreError::DomainCounterUnreadable`] if a consumer domain's version
+    /// counter cannot be read), or if a descriptor fails validation
+    /// ([`StoreError::InvalidDescriptor`]).
     pub fn in_memory_with(config: StoreConfig) -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
         Self::init(conn, config)
@@ -524,7 +568,8 @@ impl Store {
 
     /// The actor loop — owns the connection and executes operations
     /// sequentially. A domain's migrations run before any of its queries, and a
-    /// domain whose migrations failed answers every query with that failure.
+    /// domain whose migrations did not complete answers every query with that
+    /// failure until a later submission succeeds.
     ///
     /// `premigrated` names the domains `init` migrated before this thread
     /// started: always the library's own, plus every domain the configured
@@ -547,8 +592,10 @@ impl Store {
                     match result {
                         Ok(()) => {
                             migrated.insert(domain);
-                            // A corrected retry clears the refusal: the failure
-                            // is a state of the schema, not a life sentence.
+                            // A submission that gets through clears the
+                            // refusal, whichever failure the domain carried:
+                            // it is a state the next migration can leave, not
+                            // a life sentence.
                             gate.clear(domain);
                             let _ = done.send(Ok(()));
                             // Drain whatever queued up while this domain waited.
@@ -559,12 +606,17 @@ impl Store {
                         Err(failure) => {
                             let _ = done.send(Err(failure.error(domain)));
                             // Everything that queued behind the migration is
-                            // answered with the failure. Running it would let
-                            // queries loose on a schema whose state is unknown,
-                            // and dropping it would park its caller forever.
+                            // answered with the same failure. Running it would
+                            // let queries loose on a schema that did not get
+                            // the tables they name, and dropping it would park
+                            // its caller for the life of the store.
                             for f in deferred.remove(domain).unwrap_or_default() {
                                 f(Err(failure.error(domain)));
                             }
+                            // Held for every later query too, whichever of the
+                            // two failures it is; why a domain that ran no
+                            // step is refused as well is on
+                            // StoreError::DomainCounterUnreadable.
                             gate.record(domain, failure);
                         }
                     }
@@ -608,11 +660,9 @@ const CORE_DOMAIN: &str = "core";
 // same transaction, seeing the content only by the order the rows happen to be
 // written in — which is not a guarantee anything states.
 
-/// The migration step that failed for a domain, kept behind the
-/// [`DomainGate`] so every query for that domain can be answered with the
-/// same error.
-#[derive(Clone)]
+/// The step of a domain's list that failed, and what the database said.
 struct FailedMigration {
+    /// The one-based step that failed.
     version: i64,
     source: Arc<StoreError>,
 }
@@ -627,39 +677,67 @@ impl FailedMigration {
     }
 }
 
-/// The consumer domains' failed-migration state, shared between the actor —
-/// which records and clears it as migrations run — and the store's
-/// descriptor-path operations, which consult it before touching a
-/// descriptor's tables.
+/// Why a domain's migrations did not complete, in the two shapes the error
+/// tells apart. [`DomainGate`] holds either one and answers every query for
+/// the domain with it until a migration succeeds.
+enum DomainMigrationFailure {
+    /// A step failed. This becomes [`StoreError::MigrationFailed`].
+    Step(FailedMigration),
+    /// The domain's version counter could not be read, so the list was never
+    /// entered. This becomes [`StoreError::DomainCounterUnreadable`], where
+    /// the rule for refusing the domain on a step that never ran is written.
+    CounterUnreadable(Arc<StoreError>),
+}
+
+impl DomainMigrationFailure {
+    /// The error the submitter and every query waiting for the domain are
+    /// answered with.
+    fn error(&self, domain: &str) -> StoreError {
+        match self {
+            Self::Step(failure) => failure.error(domain),
+            Self::CounterUnreadable(source) => StoreError::DomainCounterUnreadable {
+                domain: domain.to_owned(),
+                source: Arc::clone(source),
+            },
+        }
+    }
+}
+
+/// The consumer domains' migration state, shared between the actor — which
+/// records and clears it as migrations run — and the store's descriptor-path
+/// operations, which consult it before touching a descriptor's tables.
 ///
 /// This is what routes descriptor reads and writes through the domain-aware
 /// discipline: the tables a descriptor drives are migrated under the
 /// consumer's domain, so a read or write of them while that domain's
-/// migrations are in a failed state answers with
-/// [`StoreError::MigrationFailed`] — the exact answer [`domain_run`] gives —
-/// instead of running raw against a schema in doubt. The checks run inside
-/// closures on the actor thread, which processes operations in order, so a
-/// failure recorded by an earlier migration op is always visible to a later
-/// query's check.
+/// migrations did not complete answers with [`StoreError::MigrationFailed`]
+/// or [`StoreError::DomainCounterUnreadable`] — the exact answer
+/// [`domain_run`] gives — instead of running raw against a schema in doubt.
+/// The checks run inside closures on the actor thread, which processes
+/// operations in order, so a failure recorded by an earlier migration op is
+/// always visible to a later query's check.
 #[derive(Clone, Default)]
 pub(crate) struct DomainGate {
-    failures: Arc<std::sync::Mutex<std::collections::HashMap<&'static str, FailedMigration>>>,
+    failures:
+        Arc<std::sync::Mutex<std::collections::HashMap<&'static str, DomainMigrationFailure>>>,
 }
 
 impl DomainGate {
     fn lock(
         &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<&'static str, FailedMigration>> {
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<&'static str, DomainMigrationFailure>>
+    {
         self.failures.lock().expect("domain gate lock poisoned")
     }
 
-    /// Record a domain's migration failure; queries for it are refused with it
-    /// until a corrected migration clears it.
-    fn record(&self, domain: &'static str, failure: FailedMigration) {
+    /// Record why a domain's migrations did not complete; queries for it are
+    /// refused with that until a migration succeeds and clears it.
+    fn record(&self, domain: &'static str, failure: DomainMigrationFailure) {
         self.lock().insert(domain, failure);
     }
 
-    /// A corrected migration lifts the refusal.
+    /// A migration that succeeds lifts the refusal, whichever of the two
+    /// failures the domain was carrying.
     fn clear(&self, domain: &'static str) {
         self.lock().remove(domain);
     }
@@ -669,7 +747,7 @@ impl DomainGate {
         self.lock().get(domain).map(|f| f.error(domain))
     }
 
-    /// Refuse when the domain is in a failed-migration state.
+    /// Refuse when the domain's migrations did not complete.
     pub(crate) fn ensure(&self, domain: &str) -> Result<(), StoreError> {
         match self.failure(domain) {
             Some(refusal) => Err(refusal),
@@ -677,7 +755,7 @@ impl DomainGate {
         }
     }
 
-    /// Refuse when any of the given domains is in a failed-migration state.
+    /// Refuse when any of the given domains' migrations did not complete.
     pub(crate) fn ensure_each<'d, I>(&self, domains: I) -> Result<(), StoreError>
     where
         I: IntoIterator<Item = &'d str>,
@@ -738,15 +816,16 @@ fn core_table_snapshot() -> Result<std::collections::HashSet<String>, StoreError
 /// multi-statement step whose earlier statements survived an unchanged version
 /// would leave the retry meeting the tables the first attempt created, a
 /// domain unable to migrate again.
+///
+/// Failing to read the domain's version counter is not a failed step. See
+/// [`StoreError::DomainCounterUnreadable`].
 fn run_domain_migrations(
     conn: &mut Connection,
     domain: &'static str,
     sqls: &[&'static str],
-) -> Result<(), FailedMigration> {
-    let current_version = domain_version(conn, domain).map_err(|e| FailedMigration {
-        version: 0,
-        source: Arc::new(e.into()),
-    })?;
+) -> Result<(), DomainMigrationFailure> {
+    let current_version = domain_version(conn, domain)
+        .map_err(|e| DomainMigrationFailure::CounterUnreadable(Arc::new(e.into())))?;
 
     for (i, sql) in sqls.iter().enumerate() {
         let version =
@@ -760,9 +839,11 @@ fn run_domain_migrations(
                 )
                 .map(|_| ())
             })
-            .map_err(|e| FailedMigration {
-                version,
-                source: Arc::new(e.into()),
+            .map_err(|e| {
+                DomainMigrationFailure::Step(FailedMigration {
+                    version,
+                    source: Arc::new(e.into()),
+                })
             })?;
             tracing::info!(domain, version, "applied domain migration");
         }
@@ -827,9 +908,12 @@ where
 ///
 /// # Errors
 ///
-/// Whatever the closure returns, [`StoreError::MigrationFailed`] if this
-/// domain's migrations failed, or [`StoreError::ActorStopped`] if the actor
-/// thread is gone.
+/// Whatever the closure returns, [`StoreError::MigrationFailed`] if a step of
+/// this domain's migrations failed, [`StoreError::DomainCounterUnreadable`] if
+/// a submission for this domain could not read its counter, or
+/// [`StoreError::ActorStopped`] if the actor thread is gone. Either migration
+/// failure is answered to this query whether it arrived before the submission
+/// or after it, until a migration for the domain succeeds.
 ///
 /// A database error the closure returns arrives already sorted into its class —
 /// refused, contended, unusable, or ordinary — because the conversion into
@@ -859,20 +943,29 @@ where
 /// Submit migrations for a domain. Returns once they have all executed on the
 /// actor thread.
 ///
-/// Queries for this domain submitted **before** this call wait for it; queries
-/// submitted after it proceed normally. The library's own schema advances on
-/// the database's `user_version`; a domain advances on its own row in
-/// `domain_migrations`, and neither counter can stall the other.
+/// Queries for this domain submitted **before** this call wait for it; once it
+/// succeeds, queries submitted after it proceed normally. The library's own
+/// schema advances on the database's `user_version`; a domain advances on its
+/// own row in `domain_migrations`, and neither counter can stall the other.
 ///
 /// A step that fails is rolled back whole, and from then on every query for
 /// that domain — the ones already waiting and the ones still to arrive — is
 /// answered with [`StoreError::MigrationFailed`]. Submitting corrected
 /// migrations that succeed lifts the refusal.
 ///
+/// A counter that cannot be read runs no step, and refuses the domain the same
+/// way with [`StoreError::DomainCounterUnreadable`], where the reason a domain
+/// that ran no step is refused as well is stated.
+///
 /// # Errors
 ///
-/// [`StoreError::MigrationFailed`] if a step fails, or
-/// [`StoreError::ActorStopped`] if the actor thread is gone.
+/// [`StoreError::MigrationFailed`] if a step fails,
+/// [`StoreError::DomainCounterUnreadable`] if the domain's version counter
+/// cannot be read, or [`StoreError::ActorStopped`] if the actor thread is
+/// gone. The two migration failures answer the queries already waiting for the
+/// domain as well as this call. A stopped actor is no state of the domain: it
+/// answers this call, and each waiting query reads the same fact off its own
+/// closed channel.
 pub async fn domain_migrate(
     tx: &StoreTx,
     domain: &'static str,
@@ -942,6 +1035,31 @@ pub(crate) fn temp_dir(label: &str) -> std::path::PathBuf {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// A [`temp_dir`] that removes itself when it goes out of scope. A removal
+/// written as the test's last line never runs on the path that matters: a
+/// failing assertion unwinds past it and leaves the directory behind on every
+/// run until the test is fixed.
+#[cfg(test)]
+pub(crate) struct SelfRemovingDir(std::path::PathBuf);
+
+#[cfg(test)]
+impl SelfRemovingDir {
+    pub(crate) fn new(label: &str) -> Self {
+        Self(temp_dir(label))
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for SelfRemovingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// The store's own tests.
@@ -3374,6 +3492,128 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tables, 0, "neither statement of the failed step survives");
+    }
+
+    /// A domain's version counter that cannot be read answers every query for
+    /// that domain: the submission, the query queued behind it and a query
+    /// arriving after it all get [`StoreError::DomainCounterUnreadable`], no
+    /// step of the list runs, and a later submission whose read succeeds
+    /// migrates the domain and serves the next query.
+    #[tokio::test]
+    async fn an_unreadable_domain_counter_answers_everyone_and_refuses_the_domain() {
+        let s = store();
+        let tx = s.tx();
+
+        // The counter column renamed away: the table is still there, so the
+        // read's CREATE TABLE IF NOT EXISTS is a no-op, and the version this
+        // code reads is gone.
+        s.run(|conn| {
+            conn.execute_batch("ALTER TABLE domain_migrations RENAME COLUMN version TO counted;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // The query op is sent from this task, before the migration op, so the
+        // actor has it queued when the migration reaches it. Two sends in one
+        // order say that; a clock says only that nothing happened yet.
+        let (answer_tx, answer_rx) = oneshot::channel();
+        tx.send(StoreOp::Query {
+            domain: "widgets",
+            f: Box::new(move |target| {
+                let answer = target.and_then(|conn| {
+                    Ok(conn.query_row("SELECT COUNT(*) FROM widgets", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?)
+                });
+                let _ = answer_tx.send(answer);
+            }),
+        })
+        .unwrap();
+
+        let step = "CREATE TABLE widgets (id INTEGER PRIMARY KEY);";
+        let failure = domain_migrate(&tx, "widgets", vec![step])
+            .await
+            .expect_err("the counter read names a column this table does not have");
+        match &failure {
+            StoreError::DomainCounterUnreadable { domain, .. } => assert_eq!(domain, "widgets"),
+            other => panic!(
+                "the submitter is answered with the counter read failing, and no \
+                 migration is claimed to have failed, got {other:?}"
+            ),
+        }
+
+        // The bound turns a query left parked into a failed test instead of a
+        // suite that never ends; what this asserts is the answer, not the wait.
+        let queued = timeout(Duration::from_secs(5), answer_rx)
+            .await
+            .expect("the queued query is answered, not left parked")
+            .expect("the actor answers the query it dequeued");
+        assert!(
+            matches!(queued, Err(StoreError::DomainCounterUnreadable { .. })),
+            "the query queued behind the domain is answered with the same \
+             failure, got {queued:?}"
+        );
+
+        let created: i64 = s
+            .run(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'widgets'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(created, 0, "no step of the domain's list ran");
+        assert!(
+            matches!(
+                s.gate.failure("widgets"),
+                Some(StoreError::DomainCounterUnreadable { .. })
+            ),
+            "and the domain holds the failure for the queries still to arrive"
+        );
+
+        // A query sent AFTER the failure is answered on the spot. Nothing in
+        // production submits a domain's migrations twice, so deferring it
+        // would park it for the life of the store; the bound turns that into a
+        // failed test instead of a suite that never ends.
+        let late = timeout(
+            Duration::from_secs(5),
+            domain_run(&tx, "widgets", |conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM widgets", [], |row| {
+                    row.get::<_, i64>(0)
+                })?)
+            }),
+        )
+        .await
+        .expect("a query arriving after the failure is answered, not deferred");
+        assert!(
+            matches!(late, Err(StoreError::DomainCounterUnreadable { .. })),
+            "a query arriving after the failure gets it too, got {late:?}"
+        );
+
+        s.run(|conn| {
+            conn.execute_batch("ALTER TABLE domain_migrations RENAME COLUMN counted TO version;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        domain_migrate(&tx, "widgets", vec![step])
+            .await
+            .expect("the counter reads again, so a later submission runs the step");
+
+        assert_eq!(
+            domain_run(&tx, "widgets", |conn| Ok(conn.query_row(
+                "SELECT COUNT(*) FROM widgets",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?))
+            .await
+            .unwrap(),
+            0,
+            "and the domain serves its queries against the migrated schema"
+        );
     }
 
     /// And because nothing survived, the fix goes straight in.
