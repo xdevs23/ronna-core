@@ -2,3 +2,7 @@
 result
 TODO.md
 LOCAL.md
+
+# Local worktrees and scratch, never tracked
+.worktrees/
+.cache/
