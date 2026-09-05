@@ -33,7 +33,9 @@
 //! seam — the library's schema and a consumer's schema advance on separate
 //! counters and neither can stall the other.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
+
+use super::StoreError;
 
 /// The library's schema, one entry per version. Applied in order; entry `i`
 /// becomes `user_version` `i + 1`.
@@ -455,21 +457,14 @@ const MIGRATIONS: &[&str] = &[
     // either trigger when one of them names no call. The two triggers state a
     // rule for every row of the two tables, and a rule that held for new rows
     // only would be no rule: every reader that pairs a stored resolution with
-    // the call it names relies on this step having read the old rows once. The
-    // failure leaves user_version below 9, so the step runs again on the next
-    // open.
+    // the call it names relies on this step having read the old rows once.
     //
     // The check is SQL, like every other step: RAISE is legal only inside a
     // trigger body, so one insert into a temporary table fires a temporary
     // trigger that aborts the batch with the sentence. The temporary pair is
-    // this step's own and both halves go at the end of it.
-    //
-    // The abort stops the batch before those two drops run, so the temporary
-    // pair survives in the temp schema. Both halves are created only if they
-    // are not there and the trigger reads the two stored tables again on every
-    // insert, so the step run a second time on the same connection aborts again
-    // while a stored resolution still names no call, and drops the pair on the
-    // run where none does.
+    // this step's own and both halves go at the end of it; the runner applies
+    // each step inside one transaction, so the pair rolls back with the rest
+    // when the abort comes.
     "
     CREATE TEMP TABLE IF NOT EXISTS v9_stored_resolutions_name_their_calls (checked INTEGER);
 
@@ -505,16 +500,20 @@ const MIGRATIONS: &[&str] = &[
     ",
 ];
 
-/// Apply every unapplied step, advancing `user_version` as each lands.
+/// Apply every unapplied step, advancing `user_version` as each is applied.
 ///
-/// Re-running is a no-op: a step whose version the counter already carries is
-/// skipped, so this is called unconditionally on every open.
+/// Each step and its `user_version` bump share one transaction: a step is
+/// either applied and counted, or neither. Re-running is a no-op: a step whose
+/// version the counter already carries is skipped, so this is called
+/// unconditionally on every open.
 ///
 /// # Errors
 ///
-/// Returns the database's error if a step or the counter update fails.
-pub(super) fn run(conn: &Connection) -> rusqlite::Result<()> {
-    let current: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+/// [`StoreError::CoreMigrationFailed`] naming the step that failed and
+/// carrying its classified failure, or the database's error if the counter
+/// cannot be read at all.
+pub(super) fn run(conn: &mut Connection) -> Result<(), StoreError> {
+    let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     tracing::info!(
         current,
         migrations_count = MIGRATIONS.len(),
@@ -522,10 +521,16 @@ pub(super) fn run(conn: &Connection) -> rusqlite::Result<()> {
     );
 
     for (i, sql) in MIGRATIONS.iter().enumerate() {
-        let version = u32::try_from(i + 1).unwrap_or(u32::MAX);
+        let version =
+            i64::try_from(i + 1).expect("a migration list longer than i64::MAX cannot be built");
         if version > current {
-            conn.execute_batch(sql)?;
-            conn.pragma_update(None, "user_version", version)?;
+            apply_step(conn, sql, |tx| {
+                tx.pragma_update(None, "user_version", version)
+            })
+            .map_err(|e| StoreError::CoreMigrationFailed {
+                version,
+                source: Box::new(e.into()),
+            })?;
             tracing::info!(version, "applied migration");
         }
     }
@@ -533,22 +538,47 @@ pub(super) fn run(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// One migration step and the recording of its version, in one transaction.
+///
+/// The batch and the closure that records the version commit together, so a
+/// step is either applied and counted, or neither. The closure is what keeps
+/// this one function instead of two: the transaction rule is written here
+/// once, and a runner supplies only its own recording step. The library's own
+/// steps count in the `user_version` counter, a consumer domain's count in a
+/// `domain_migrations` row, and both hand that step in as a closure over the
+/// transaction the batch just ran in.
+pub(super) fn apply_step(
+    conn: &mut Connection,
+    sql: &str,
+    record: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<()>,
+) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(sql)?;
+    record(&tx)?;
+    tx.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::agency::{LeafKind, SystemPrompt};
 
-    use super::{Connection, MIGRATIONS, run};
+    use super::{Connection, MIGRATIONS, StoreError, apply_step, run};
 
     fn migrated() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        run(&conn).unwrap();
+        run(&mut conn).unwrap();
         conn
     }
 
-    fn version(conn: &Connection) -> u32 {
+    fn version(conn: &Connection) -> i64 {
         conn.pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap()
+    }
+
+    /// The version a fully migrated database carries.
+    fn all_of_them() -> i64 {
+        i64::try_from(MIGRATIONS.len()).unwrap()
     }
 
     fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
@@ -563,14 +593,78 @@ mod tests {
     #[test]
     fn applies_all_migrations() {
         let conn = migrated();
-        assert_eq!(version(&conn), u32::try_from(MIGRATIONS.len()).unwrap());
+        assert_eq!(version(&conn), all_of_them());
     }
 
     #[test]
     fn idempotent() {
-        let conn = migrated();
-        run(&conn).unwrap();
-        assert_eq!(version(&conn), u32::try_from(MIGRATIONS.len()).unwrap());
+        let mut conn = migrated();
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), all_of_them());
+    }
+
+    /// A failed core step names the version that failed, the way a domain's
+    /// failure names its own, and hands the failure up in the class this crate
+    /// sorted it into. A database whose counter claims eight steps ran while it
+    /// holds none of their tables fails on the ninth, and the error says nine
+    /// and carries a [`StoreError`], so a caller can still tell a contended
+    /// open from a step the database refused.
+    #[test]
+    fn a_failed_step_names_its_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // The step exercised is MIGRATIONS[8], the v9 step: it reads
+        // `block_tool_result`, which nothing has created on this connection.
+        conn.pragma_update(None, "user_version", 8).unwrap();
+
+        let Err(StoreError::CoreMigrationFailed { version, source }) = run(&mut conn) else {
+            panic!("the ninth step reads tables this database does not have");
+        };
+        assert_eq!(version, 9, "the error names the step that failed");
+        assert!(
+            matches!(*source, StoreError::Sqlite(_)),
+            "the classified error survives the wrapping, got {source:?}"
+        );
+        assert!(
+            source.to_string().contains("block_tool_result"),
+            "and carries what the database said, got `{source}`"
+        );
+    }
+
+    /// A step whose second statement fails is applied or counted as a whole,
+    /// or not at all: the first statement's table is gone with the counter
+    /// unmoved, so no database carries half a step under a version saying the
+    /// step ran. The step is built here, because every shipped one is meant to
+    /// succeed.
+    #[test]
+    fn a_step_failing_partway_leaves_neither_its_first_statement_nor_a_bump() {
+        let mut conn = migrated();
+        let applied = version(&conn);
+
+        let half_a_step = "
+        CREATE TABLE the_first_statements_table (id INTEGER PRIMARY KEY);
+        INSERT INTO a_table_no_step_ever_created (id) VALUES (1);
+        ";
+        let failed = apply_step(&mut conn, half_a_step, |tx| {
+            tx.pragma_update(None, "user_version", applied + 1)
+        });
+        assert!(
+            failed.is_err(),
+            "the second statement writes to a table that is not there"
+        );
+
+        assert_eq!(version(&conn), applied, "the counter stays where it was");
+        let created: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'the_first_statements_table'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            created, 0,
+            "and the table the first statement made went back with it"
+        );
     }
 
     /// A fresh database carries the three nullable opaque columns on
@@ -667,15 +761,15 @@ mod tests {
     /// version gate is exercised against data, not just a fresh file.
     #[test]
     fn a_populated_v1_database_upgrades_to_v2_in_place() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         conn.execute_batch(MIGRATIONS[0]).unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
         conn.execute("INSERT INTO blocks (block_type) VALUES ('text')", [])
             .unwrap();
 
-        run(&conn).unwrap();
-        assert_eq!(version(&conn), u32::try_from(MIGRATIONS.len()).unwrap());
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), all_of_them());
         let anchor: Option<i64> = conn
             .query_row("SELECT dispatch_anchor FROM blocks WHERE id = 1", [], |r| {
                 r.get(0)
@@ -757,7 +851,7 @@ mod tests {
     /// actually widens.
     #[test]
     fn a_populated_store_with_markers_gains_the_zone_columns_in_place() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         for sql in &MIGRATIONS[..2] {
             conn.execute_batch(sql).unwrap();
@@ -769,8 +863,8 @@ mod tests {
         )
         .unwrap();
 
-        run(&conn).unwrap();
-        assert_eq!(version(&conn), u32::try_from(MIGRATIONS.len()).unwrap());
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), all_of_them());
 
         let row: (String, Option<String>, Option<String>, Option<String>) = conn
             .query_row(
@@ -835,7 +929,7 @@ mod tests {
     /// v2-to-v3 upgrades above, against the data this step widens.
     #[test]
     fn a_populated_store_with_resolutions_gains_the_ends_turn_stamp_in_place() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         for sql in &MIGRATIONS[..3] {
             conn.execute_batch(sql).unwrap();
@@ -849,8 +943,8 @@ mod tests {
         )
         .unwrap();
 
-        run(&conn).unwrap();
-        assert_eq!(version(&conn), u32::try_from(MIGRATIONS.len()).unwrap());
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), all_of_them());
 
         let row: (String, String, i64) = conn
             .query_row(
@@ -922,7 +1016,7 @@ mod tests {
     /// "no tools" — and a choice writes through afterwards.
     #[test]
     fn a_populated_store_gains_the_tool_choice_table_in_place() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         for sql in &MIGRATIONS[..6] {
             conn.execute_batch(sql).unwrap();
@@ -934,8 +1028,8 @@ mod tests {
         )
         .unwrap();
 
-        run(&conn).unwrap();
-        assert_eq!(version(&conn), u32::try_from(MIGRATIONS.len()).unwrap());
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), all_of_them());
 
         let said: String = conn
             .query_row(
@@ -990,7 +1084,7 @@ mod tests {
     /// none is refused from then on, on both tables.
     #[test]
     fn a_populated_store_gains_the_rule_that_a_resolution_names_its_call() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         for sql in &MIGRATIONS[..8] {
             conn.execute_batch(sql).unwrap();
@@ -1004,8 +1098,8 @@ mod tests {
         )
         .unwrap();
 
-        run(&conn).unwrap();
-        assert_eq!(version(&conn), u32::try_from(MIGRATIONS.len()).unwrap());
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), all_of_them());
         let named: i64 = conn
             .query_row(
                 "SELECT source_block_id FROM block_tool_result WHERE block_id = 2",
@@ -1050,7 +1144,7 @@ mod tests {
             ("tool_result", "block_tool_result", "content"),
             ("tool_error", "block_tool_error", "error"),
         ] {
-            let conn = Connection::open_in_memory().unwrap();
+            let mut conn = Connection::open_in_memory().unwrap();
             conn.pragma_update(None, "foreign_keys", "ON").unwrap();
             for sql in &MIGRATIONS[..8] {
                 conn.execute_batch(sql).unwrap();
@@ -1064,13 +1158,17 @@ mod tests {
             ))
             .unwrap();
 
-            let upgrade = run(&conn);
-            let refusal = upgrade
-                .expect_err("the step reads what is stored")
-                .to_string();
+            let Err(StoreError::CoreMigrationFailed {
+                version: failed,
+                source,
+            }) = run(&mut conn)
+            else {
+                panic!("the step reads what is stored");
+            };
+            assert_eq!(failed, 9, "the failure names the step");
             assert!(
-                refusal.contains("names no call block"),
-                "the failure names the case, got `{refusal}`"
+                source.to_string().contains("names no call block"),
+                "the failure names the case, got `{source}`"
             );
             assert_eq!(version(&conn), 8, "the counter stays below the step");
             let rule: i64 = conn
@@ -1082,6 +1180,19 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(rule, 0, "and the step created nothing on its way out");
+            let temporary: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_temp_master
+                     WHERE name = 'v9_stored_resolutions_name_their_calls'
+                        OR name = 'trg_v9_reads_the_stored_resolutions'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                temporary, 0,
+                "the temporary pair the check is built from goes back with the step"
+            );
         }
     }
 

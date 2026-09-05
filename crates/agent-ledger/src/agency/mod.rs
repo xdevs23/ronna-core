@@ -763,9 +763,9 @@ impl Projection for BlockKind {
 /// The empty string is a SENTINEL, never a value: it means the field was
 /// absent or was not a string, and two blocks that both fell back to it are
 /// not two blocks carrying the same id. Every predicate matching on a parsed
-/// id therefore rejects the empty string before comparing — the store
-/// constrains its own writes `NOT NULL`, but these predicates run over parsed
-/// JSON, which may come from anywhere.
+/// id therefore rejects the empty string before comparing: the store writes
+/// these columns `NOT NULL`, and the predicates still run over the parsed
+/// fields map, which a block built outside the store fills any way it likes.
 fn string_field(block: &Block, key: &str) -> String {
     block
         .fields
@@ -797,27 +797,18 @@ fn optional_string_field(block: &Block, key: &str) -> Option<String> {
 /// absent field, a field that is not an integer, and any value that is not
 /// positive all answer `None`, because no row is numbered 0 or less. A payload
 /// naming nothing therefore matches no row, where an absent field read as a
-/// number would let two such payloads pair up on the same 0. The store
-/// constrains its own writes, but these fields are parsed out of JSON, which
-/// may come from anywhere, so the reading has to answer for rows the store
-/// never wrote.
+/// number would let two such payloads pair up on the same 0.
 ///
-/// An absent field is the ordinary shape and passes in silence. A field that is
-/// there and holds something no row can be numbered is a producer writing
-/// garbage, so it is recorded with the block, the field and the value found
-/// before the answer comes back the same `None`.
+/// A stored row never reaches this read without a usable id. The approval and
+/// ancestor ids are `NOT NULL` columns; the two resolution ids are nullable
+/// columns whose NULL is refused twice over, because the store refuses a
+/// resolution naming no call at the write and at the load, failing such a row
+/// instead of handing one back. The read still runs over the parsed fields
+/// map, which a block built outside the store fills any way it likes, and that
+/// is who `None` answers for: absent and malformed alike, pairing with
+/// nothing.
 fn id_field(block: &Block, key: &str) -> Option<i64> {
-    let value = block.fields.get(key)?;
-    let id = value.as_i64().filter(|id| *id > 0);
-    if id.is_none() {
-        tracing::warn!(
-            block_id = block.id,
-            field = key,
-            value = %value,
-            "a block payload's id field holds a value that names no row"
-        );
-    }
-    id
+    block.fields.get(key)?.as_i64().filter(|id| *id > 0)
 }
 
 #[cfg(test)]

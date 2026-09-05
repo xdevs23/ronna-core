@@ -514,17 +514,18 @@ fn answered_call(block: &Block) -> Option<(i64, CallOutcome)> {
 /// that is not a call, and a call whose outcome already sits in the ledger.
 ///
 /// The tail both approval kinds' routing ends on (2026-09-03), written once so
-/// the two cannot answer differently. Id-keyed and position-aware: the route
-/// stays open only while the covered call itself is unresolved, so an unrelated
-/// result appended later can never close it and the call's own result closes it
-/// for good — that IS what keeps the redispatch walk idempotent, and without it
-/// the walk re-executes an already-answered call on every tick. An id read as
-/// `None` names nothing and there is no row to look up, which is how a payload
-/// naming no call routes nowhere.
+/// the two cannot answer differently. Id-keyed: the route stays open only while
+/// the covered call itself is unresolved, so an unrelated result appended later
+/// can never close it and the call's own result closes it for good — that IS
+/// what keeps the redispatch walk idempotent, and without it the walk
+/// re-executes an already-answered call on every tick. An id read as `None`
+/// names nothing and there is no row to look up, which is how a payload naming
+/// no call routes nowhere.
 ///
 /// Resolution is answered through [`ToolCall::resolved_in`], THE resolution
 /// predicate, and the row is read through [`BlockKind`], like every other
 /// decision about what a block is.
+#[must_use]
 pub(super) fn unresolved_call_named(ledger: &[Block], id: Option<i64>) -> Option<i64> {
     let named = id?;
     let call_block = ledger.iter().find(|block| block.id == named)?;

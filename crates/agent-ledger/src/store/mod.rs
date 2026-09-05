@@ -153,18 +153,33 @@ pub enum StoreError {
         /// cover.
         tables: Vec<String>,
     },
-    /// A domain's migrations failed, so its tables are in an unknown state and
-    /// every query for that domain is refused with this instead of being run or
-    /// parked. Naming the step that failed is the whole point: the domain stays
-    /// refused until a corrected migration is submitted and succeeds.
-    #[error("domain '{domain}' migration {version} failed: {reason}")]
+    /// A step of the library's own schema failed, so the store does not open
+    /// at all. A step and its version bump share one transaction, so nothing
+    /// of the named step is applied and the counter still says it has not run.
+    #[error("core migration {version} failed: {source}")]
+    CoreMigrationFailed {
+        /// The one-based step that failed.
+        version: i64,
+        /// The step's failure in the class this crate sorted it into, so a
+        /// contended open still reads as contended and a damaged file as
+        /// unusable.
+        source: Box<StoreError>,
+    },
+    /// A step of a consumer domain's migrations failed, so its tables are in
+    /// an unknown state and every query for that domain is refused with this
+    /// instead of being run or parked. Naming the step that failed is the whole
+    /// point: the domain stays refused until a corrected migration is submitted
+    /// and succeeds.
+    #[error("domain '{domain}' migration {version} failed: {source}")]
     MigrationFailed {
         /// The domain whose schema is in doubt.
         domain: String,
         /// The one-based step that failed.
         version: i64,
-        /// What the database said.
-        reason: String,
+        /// The step's failure in the class this crate sorted it into, shared
+        /// because every later query for the domain is answered with this same
+        /// failure and a database error cannot be cloned.
+        source: Arc<StoreError>,
     },
     /// The named block is no tool call of the named conversation: it is a block
     /// of another kind, a call held by another ledger only, or an id that names
@@ -286,7 +301,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// If the database cannot be opened or its migrations fail.
+    /// If the database cannot be opened, or
+    /// [`StoreError::CoreMigrationFailed`] if a step of the library's own
+    /// schema fails.
     pub fn open(db_path: &Path) -> Result<Self, StoreError> {
         Self::open_with(db_path, StoreConfig::default())
     }
@@ -304,7 +321,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// If the database cannot be opened, if any migrations fail, or if a
+    /// If the database cannot be opened, if any migrations fail
+    /// ([`StoreError::CoreMigrationFailed`] for the library's own schema,
+    /// [`StoreError::MigrationFailed`] for a consumer domain), or if a
     /// descriptor fails validation ([`StoreError::InvalidDescriptor`]).
     pub fn open_with(db_path: &Path, config: StoreConfig) -> Result<Self, StoreError> {
         let conn = Connection::open(db_path)?;
@@ -316,7 +335,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// If the database cannot be created or its migrations fail.
+    /// If the database cannot be created, or
+    /// [`StoreError::CoreMigrationFailed`] if a step of the library's own
+    /// schema fails.
     pub fn in_memory() -> Result<Self, StoreError> {
         Self::in_memory_with(StoreConfig::default())
     }
@@ -328,7 +349,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// If the database cannot be created, if any migrations fail, or if a
+    /// If the database cannot be created, if any migrations fail
+    /// ([`StoreError::CoreMigrationFailed`] for the library's own schema,
+    /// [`StoreError::MigrationFailed`] for a consumer domain), or if a
     /// descriptor fails validation ([`StoreError::InvalidDescriptor`]).
     pub fn in_memory_with(config: StoreConfig) -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
@@ -354,7 +377,7 @@ impl Store {
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "cache_size", -8000)?;
 
-        migrations::run(&conn)?;
+        migrations::run(&mut conn)?;
         ensure_tracking_tables(&conn)?;
 
         // What the library's own migrations create, snapshotted from a
@@ -591,7 +614,7 @@ const CORE_DOMAIN: &str = "core";
 #[derive(Clone)]
 struct FailedMigration {
     version: i64,
-    reason: String,
+    source: Arc<StoreError>,
 }
 
 impl FailedMigration {
@@ -599,7 +622,7 @@ impl FailedMigration {
         StoreError::MigrationFailed {
             domain: domain.to_owned(),
             version: self.version,
-            reason: self.reason.clone(),
+            source: Arc::clone(&self.source),
         }
     }
 }
@@ -697,8 +720,8 @@ fn ensure_tracking_tables(conn: &Connection) -> Result<(), StoreError> {
 /// the library's. Correct by construction, with no hand-mirrored literal to
 /// rot.
 fn core_table_snapshot() -> Result<std::collections::HashSet<String>, StoreError> {
-    let conn = Connection::open_in_memory()?;
-    migrations::run(&conn)?;
+    let mut conn = Connection::open_in_memory()?;
+    migrations::run(&mut conn)?;
     ensure_tracking_tables(&conn)?;
     let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
     let tables = stmt
@@ -709,11 +732,12 @@ fn core_table_snapshot() -> Result<std::collections::HashSet<String>, StoreError
 
 /// Apply one domain's migrations, tracking its version in `domain_migrations`.
 ///
-/// Each step runs in a transaction of its own **with its version bump inside
-/// it**, so a step is either applied and counted or neither. A multi-statement
-/// step that fails halfway used to leave its earlier statements applied under
-/// an unchanged version, and the retry then met the tables the first attempt
-/// had created — a domain bricked by its own recovery path.
+/// Each step runs through `migrations::apply_step`, the same helper the
+/// library's own steps run through, with the `domain_migrations` row as the
+/// recording closure: a step is either applied and counted or neither. A
+/// multi-statement step whose earlier statements survived an unchanged version
+/// would leave the retry meeting the tables the first attempt created, a
+/// domain unable to migrate again.
 fn run_domain_migrations(
     conn: &mut Connection,
     domain: &'static str,
@@ -721,15 +745,24 @@ fn run_domain_migrations(
 ) -> Result<(), FailedMigration> {
     let current_version = domain_version(conn, domain).map_err(|e| FailedMigration {
         version: 0,
-        reason: e.to_string(),
+        source: Arc::new(e.into()),
     })?;
 
     for (i, sql) in sqls.iter().enumerate() {
-        let version = i64::try_from(i + 1).unwrap_or(i64::MAX);
+        let version =
+            i64::try_from(i + 1).expect("a migration list longer than i64::MAX cannot be built");
         if version > current_version {
-            apply_domain_step(conn, domain, version, sql).map_err(|e| FailedMigration {
+            migrations::apply_step(conn, sql, |tx| {
+                tx.execute(
+                    "INSERT INTO domain_migrations (domain, version) VALUES (?1, ?2)
+                     ON CONFLICT(domain) DO UPDATE SET version = excluded.version",
+                    rusqlite::params![domain, version],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| FailedMigration {
                 version,
-                reason: e.to_string(),
+                source: Arc::new(e.into()),
             })?;
             tracing::info!(domain, version, "applied domain migration");
         }
@@ -756,23 +789,6 @@ fn domain_version(conn: &Connection, domain: &'static str) -> rusqlite::Result<i
         )
         .optional()?
         .unwrap_or(0))
-}
-
-/// One migration step and its version bump, in one transaction.
-fn apply_domain_step(
-    conn: &mut Connection,
-    domain: &'static str,
-    version: i64,
-    sql: &str,
-) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
-    tx.execute_batch(sql)?;
-    tx.execute(
-        "INSERT INTO domain_migrations (domain, version) VALUES (?1, ?2)
-         ON CONFLICT(domain) DO UPDATE SET version = excluded.version",
-        rusqlite::params![domain, version],
-    )?;
-    tx.commit()
 }
 
 /// Run a closure inside a transaction. Commits on `Ok`, rolls back on `Err`.

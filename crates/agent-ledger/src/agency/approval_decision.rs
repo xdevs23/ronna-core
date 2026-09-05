@@ -55,10 +55,11 @@ impl Agency for ApprovalDecision {
         let BlockKind::ApprovalRequest(request) = BlockKind::from_block(request_block) else {
             return None;
         };
-        // The route runs to the request, which routes on to the call, so it
-        // stays open on the same terms the request's own routing reads: once
-        // the underlying call's outcome exists, nothing is owed.
-        unresolved_call_named(ledger, request.for_block_id).map(|_| answered)
+        // The route stays open while the underlying call still owes its body,
+        // and the id it answers with is the request's own.
+        unresolved_call_named(ledger, request.for_block_id)
+            .is_some()
+            .then_some(answered)
     }
 }
 
