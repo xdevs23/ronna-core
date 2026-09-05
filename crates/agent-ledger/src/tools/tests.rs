@@ -12,8 +12,8 @@
 //! to the chokepoint by the test itself, so a red result names an assertion
 //! rather than a timeout, and the suite stays parallel and fast.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -3036,5 +3036,349 @@ async fn a_consumers_decline_counts_toward_the_forced_end_and_its_failure_does_n
         tail_ask(&o.ctx).await,
         Some(Awaiting::Model),
         "and either way the model is owed one more round"
+    );
+}
+
+// ─── Calls that run in order (2026-09-02) ────────────────────────────────────
+
+/// A tool whose calls must take effect in the order the model issued them.
+/// Every body records which call block it ran for and DEFERS: the call stays
+/// unresolved until the test settles it, which is the state a call whose work
+/// is still in flight is in, and the only state the parking rule reads.
+///
+/// The name is a field, so two of these registered under two names are two
+/// in-order tools — which is how the order is shown to bind ACROSS names: a
+/// model that sends through one and replies through another means both to
+/// arrive in the order it wrote them.
+struct OrderedProbe {
+    name: &'static str,
+    started: Arc<Mutex<Vec<i64>>>,
+}
+
+impl ToolHandler<CoreEvent> for OrderedProbe {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name.into(),
+            description: "a test-only tool whose calls run in order".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn runs_in_order(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _input: &'a str,
+        ctx: ToolContext<'a, CoreEvent>,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            self.started.lock().unwrap().push(ctx.block_id);
+            ToolOutcome::Pending
+        })
+    }
+}
+
+/// An ordinary tool beside them, whose calls stay parallel: its body records
+/// its call block and answers at once.
+struct ParallelProbe {
+    started: Arc<Mutex<Vec<i64>>>,
+}
+
+impl ToolHandler<CoreEvent> for ParallelProbe {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "parallel".into(),
+            description: "a test-only tool whose calls stay parallel".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _input: &'a str,
+        ctx: ToolContext<'a, CoreEvent>,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            self.started.lock().unwrap().push(ctx.block_id);
+            ToolOutcome::Done("done".into())
+        })
+    }
+}
+
+/// A stored ledger, a runner over the three probes, the list of call blocks
+/// whose bodies have started in the order they started, and the store's own
+/// change stream — the source the scheduler wakes on, so a test can show that
+/// a resolution really does buy the tick that re-emits the parked call.
+struct OrderRig {
+    o: Oracle,
+    runner: ToolRunner<BlockKind, CoreEvent>,
+    started: Arc<Mutex<Vec<i64>>>,
+    changes: crate::reactivity::Consumer,
+}
+
+impl OrderRig {
+    async fn new() -> Self {
+        Self::with_window(ToolCallWindow::default()).await
+    }
+
+    /// The same rig under the conversation window the test chose, so a test
+    /// can make the window hot enough to speak on the second call.
+    async fn with_window(window: ToolCallWindow) -> Self {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        for name in ["ordered", "also_ordered"] {
+            registry.register(
+                name,
+                OrderedProbe {
+                    name,
+                    started: Arc::clone(&started),
+                },
+            );
+        }
+        registry.register(
+            "parallel",
+            ParallelProbe {
+                started: Arc::clone(&started),
+            },
+        );
+        let o = Oracle::new().await;
+        o.user_text("go").await;
+        let changes = o.ctx.store.changes.consumer();
+        let mut runner = ToolRunner::<BlockKind, _>::new(Arc::new(registry));
+        runner.set_window(window);
+        Self {
+            o,
+            runner,
+            started,
+            changes,
+        }
+    }
+
+    /// Record one call through the live-tail path, which drives it at insert —
+    /// the emission that keeps siblings parallel, and the one the parking rule
+    /// has to stand down from.
+    async fn call(&self, tool_call_id: &str, name: &str) -> i64 {
+        self.runner
+            .insert_call(
+                &self.o.ctx,
+                false,
+                tool_call_id.into(),
+                name.into(),
+                "{}".into(),
+                CallOrigin::default(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Feed every pending wakeup to the REAL chokepoint, answering which calls
+    /// were woken.
+    async fn pump(&mut self) -> Vec<i64> {
+        let mut woken = Vec::new();
+        while let Ok(event) = self.o.rx.try_recv() {
+            if let CoreEvent::ToolCallReady { call_block_id, .. } = event {
+                self.runner
+                    .run_wakeup(&self.o.ctx, false, call_block_id)
+                    .await;
+                woken.push(call_block_id);
+            }
+        }
+        woken
+    }
+
+    /// Settle a deferred call through the out-of-band door, exactly as a
+    /// backing system does.
+    async fn settle(&self, call: i64) {
+        self.o
+            .ctx
+            .store
+            .resolve_tool_call(
+                self.o.ctx.conversation_id,
+                call,
+                crate::block::ToolCallResult::Success {
+                    content: "settled".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("the call was unresolved");
+    }
+
+    fn started(&self) -> Vec<i64> {
+        self.started.lock().unwrap().clone()
+    }
+}
+
+/// AC17 — three in-order calls in ONE round, the first held: the second body
+/// starts only after the first resolves, and the third only after the second.
+/// The two names prove the order binds across tools, not within one.
+///
+/// Nothing here waits on a clock. A held body and a deferred one are the same
+/// thing to the ledger — the call is unresolved — and the ledger is what the
+/// rule reads, so the wait is expressed by settling the call, not by
+/// releasing a thread.
+#[tokio::test]
+async fn in_order_calls_run_one_after_another_in_the_order_they_were_recorded() {
+    let mut rig = OrderRig::new().await;
+    let first = rig.call("o-1", "ordered").await;
+    let second = rig.call("o-2", "also_ordered").await;
+    let third = rig.call("o-3", "ordered").await;
+
+    let woken = rig.pump().await;
+    assert_eq!(
+        woken,
+        vec![first, second, third],
+        "all three are woken at insert, which is what keeps siblings parallel"
+    );
+    assert_eq!(
+        rig.started(),
+        vec![first],
+        "the two calls behind the held one never reach a body"
+    );
+
+    // The resolution is a store change on a table the scheduler wakes on, so
+    // the tick that re-emits the parked call is one the ledger itself buys.
+    let _ = rig.changes.drain();
+    rig.settle(first).await;
+    assert!(
+        rig.changes
+            .drain()
+            .iter()
+            .any(|change| change.table == "block_tool_result"),
+        "the resolution announces itself to the scheduler's own change source"
+    );
+    let outcome = tick(&rig.o.ctx, false).await.expect("an unlatched tick");
+    assert!(
+        outcome.parked,
+        "the cursor parks on the second call, which is still owed"
+    );
+    assert_eq!(
+        rig.pump().await,
+        vec![second],
+        "the drive re-emits the parked call, and only it"
+    );
+    assert_eq!(
+        rig.started(),
+        vec![first, second],
+        "so its body starts, after the first call resolved and never before"
+    );
+
+    rig.settle(second).await;
+    tick(&rig.o.ctx, false).await;
+    assert_eq!(rig.pump().await, vec![third]);
+    assert_eq!(rig.started(), vec![first, second, third]);
+
+    // And every started body ran exactly once, wakeups and re-drives included.
+    rig.settle(third).await;
+    for _ in 0..3 {
+        tick(&rig.o.ctx, false).await;
+        rig.pump().await;
+    }
+    assert_eq!(rig.started(), vec![first, second, third]);
+}
+
+/// AC17 — a parallel tool's call beside the held ones is not held: it runs on
+/// its own wakeup while an in-order call sits unresolved in front of it, and an
+/// unresolved call of its own orders nothing.
+#[tokio::test]
+async fn a_parallel_tools_call_beside_in_order_calls_is_not_held() {
+    let mut rig = OrderRig::new().await;
+    let held = rig.call("p-1", "ordered").await;
+    let beside = rig.call("p-2", "parallel").await;
+    let behind = rig.call("p-3", "ordered").await;
+
+    rig.pump().await;
+    assert_eq!(
+        rig.started(),
+        vec![held, beside],
+        "the parallel call runs beside the held one; the in-order call behind it waits"
+    );
+
+    // The parallel call is resolved and the in-order one is not, so what holds
+    // the third call is the in-order call alone.
+    rig.settle(held).await;
+    tick(&rig.o.ctx, false).await;
+    rig.pump().await;
+    assert_eq!(rig.started(), vec![held, beside, behind]);
+}
+
+/// AC17 — a refusal IS a resolution, so the order stands in front of it: with
+/// a window that has room for one call, the second in-order call is parked
+/// while the first is unresolved, and NOTHING is written for it. Refusing it
+/// there would let it take effect ahead of the call it must follow.
+///
+/// The window is not skipped, only waited on: once the first call resolves,
+/// the second reaches the window and is refused by it, and its body still
+/// never runs.
+#[tokio::test]
+async fn a_hot_window_never_refuses_an_in_order_call_waiting_its_turn() {
+    let mut rig = OrderRig::with_window(ToolCallWindow {
+        calls: 1,
+        seconds: 60,
+        consecutive_limit: 5,
+    })
+    .await;
+    // The first call is admitted while the window still has room, and its
+    // body defers — so it is the unresolved call the second one must follow.
+    // The second call is what spends the window.
+    let first = rig.call("w-1", "ordered").await;
+    rig.pump().await;
+    assert_eq!(
+        rig.started(),
+        vec![first],
+        "the first call reached its body"
+    );
+
+    let second = rig.call("w-2", "ordered").await;
+    rig.pump().await;
+    assert_eq!(
+        rig.started(),
+        vec![first],
+        "the second call never reaches a body while the first is unresolved"
+    );
+    let ledger = rig
+        .o
+        .ctx
+        .store
+        .list_blocks(rig.o.ctx.conversation_id)
+        .await
+        .unwrap();
+    assert!(
+        ledger
+            .iter()
+            .all(|block| block.block_type != "tool_result" && block.block_type != "tool_error"),
+        "the parked call carries no outcome at all, the window's refusal included"
+    );
+
+    rig.settle(first).await;
+    tick(&rig.o.ctx, false).await;
+    rig.pump().await;
+    assert_eq!(
+        rig.started(),
+        vec![first],
+        "the second call's turn comes, and the window answers it then"
+    );
+    assert_eq!(
+        error_texts(&rig.o.ctx).await,
+        vec![crate::agency::ToolError::rate_limit_refusal(1, 60)],
+        "with the refusal the window was hot for"
+    );
+    let answered: Vec<i64> = rig
+        .o
+        .ctx
+        .store
+        .list_blocks(rig.o.ctx.conversation_id)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|block| block.block_type == "tool_error")
+        .map(|block| block.fields["source_block_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        answered,
+        vec![second],
+        "and it answers the call that waited"
     );
 }

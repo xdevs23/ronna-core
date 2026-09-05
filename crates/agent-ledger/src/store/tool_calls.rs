@@ -397,8 +397,10 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::params;
+
     use crate::block::{Role, ToolCallResult};
-    use crate::store::{BlockDestination, Store, ToolCallInsert};
+    use crate::store::{BlockDestination, Store, ToolCallInsert, transact};
 
     async fn call_block(store: &Store, conv: i64, tool_call_id: &str) -> i64 {
         store
@@ -814,6 +816,76 @@ mod tests {
             "the recorded outcome is the one that won"
         );
         assert!(blocks.iter().all(|b| b.block_type != "tool_error"));
+    }
+
+    /// AC18, the shape that cannot exist: a resolution row naming NO call is
+    /// refused by the store itself, on both tables.
+    ///
+    /// The column has carried the call since it shipped and every writer fills
+    /// it, so no stored resolution lacks one — and the schema says so rather
+    /// than leaving it to the callers, which is why the kinds carry the id
+    /// plainly and no reader branches on a row that answers no call. The write
+    /// goes in raw here because no door in this file can produce the shape,
+    /// and it goes in the ONE transaction every resolution door writes in: the
+    /// `blocks` row and the kind row are one write, so the refusal takes both.
+    ///
+    /// What "nothing was recorded" is read with is the raw count over `blocks`,
+    /// not a ledger reader. A reader joins through the kind tables and would
+    /// walk straight past a `blocks` row the refusal left behind — the one
+    /// residue this test exists to see.
+    #[tokio::test]
+    async fn a_resolution_naming_no_call_is_refused_by_the_store() {
+        let store = Store::in_memory().unwrap();
+        let conv = store
+            .create_conversation("p".into(), "m".into(), "m".into(), String::new())
+            .await
+            .unwrap();
+        call_block(&store, conv, "call_1").await;
+        let before = block_rows(&store).await;
+
+        for (kind, table, column) in [
+            ("tool_result", "block_tool_result", "content"),
+            ("tool_error", "block_tool_error", "error"),
+        ] {
+            let refused = store
+                .run(move |conn| {
+                    transact(conn, |tx| {
+                        tx.execute("INSERT INTO blocks (block_type) VALUES (?1)", [kind])?;
+                        let block_id = tx.last_insert_rowid();
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO {table} (block_id, tool_call_id, {column}, source_block_id)
+                                 VALUES (?1, 'call_1', 'orphaned', NULL)"
+                            ),
+                            params![block_id],
+                        )?;
+                        Ok(())
+                    })
+                })
+                .await;
+            assert!(
+                refused.is_err(),
+                "a {kind} that names no call is refused, got {refused:?}"
+            );
+        }
+
+        assert_eq!(
+            block_rows(&store).await,
+            before,
+            "a refused resolution leaves no row anywhere, orphaned blocks included"
+        );
+    }
+
+    /// Every row of `blocks`, counted raw — no join, no kind table, no
+    /// conversation. A block nothing points at counts here and nowhere else.
+    async fn block_rows(store: &Store) -> i64 {
+        store
+            .run(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM blocks", [], |row| row.get(0))
+                    .map_err(Into::into)
+            })
+            .await
+            .unwrap()
     }
 
     /// The junction-shared call, resolved per ledger: a fork inherits the call

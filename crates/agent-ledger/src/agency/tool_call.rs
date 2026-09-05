@@ -9,13 +9,13 @@ use crate::store::StoreError;
 use crate::types::Awaiting;
 
 use super::projection::{ContentPart, Projection};
-use super::{Agency, AgencyCtx, BlockKind, FromBlock};
+use super::{Agency, AgencyCtx, BlockKind, FromBlock, ToolError, ToolResult};
 
 /// A model's request for tool work.
 ///
 /// A regular call owes the SYSTEM its execution: `run()` emits the wakeup and
-/// stays not-done until a result or an error with this call's id follows in the
-/// ledger. Parking the cursor here IS the guard against streaming a fresh turn
+/// stays not-done until a result or an error naming this call's own row sits
+/// in the ledger. Parking the cursor here IS the guard against streaming a fresh turn
 /// while calls still dangle — without it a later sibling's result green-lights
 /// a turn and the earlier call is never answered.
 ///
@@ -58,59 +58,118 @@ impl super::LeafKind for ToolCall {
 }
 
 impl ToolCall {
-    /// Does a result or an error for this call follow it in the ledger?
+    /// Does a result or an error for this call sit in the ledger?
     ///
-    /// Keyed on the specific call id, never on kind alone — an unrelated result
-    /// landing later must never settle this call. This is THE resolution
-    /// predicate: the approval kinds' routing and the runner's ledger
-    /// idempotency all answer through it, so they cannot drift apart.
+    /// Keyed on this call's own BLOCK id (2026-09-02) — the call's one
+    /// identity, since a model's `tool_call_id` can repeat and two calls of one
+    /// round can carry the same echo. This is THE resolution predicate: the
+    /// approval kinds' routing and the runner's ledger idempotency all answer
+    /// through it, so they cannot drift apart, and it asks exactly what the
+    /// store's own conditional resolution write asks.
     ///
     /// The kinds it accepts are read through [`BlockKind`], not off the stored
     /// type string. Comparing the string here would be a second place that
     /// decides what a tool outcome is, and the two would answer differently the
     /// first time either changed.
-    ///
-    /// **An absent id matches nothing.** A payload without `tool_call_id`
-    /// parses to the empty string, and two such blocks would cross-match on
-    /// it — an unrelated failure would silently resolve this call. The store
-    /// constrains its own writes `NOT NULL`, but this predicate runs over
-    /// parsed JSON rather than over that constraint, so it answers false the
-    /// moment there is no id to key on.
     #[must_use]
     pub fn resolved_in(&self, ledger: &[Block]) -> bool {
         self.outcome_position_in(ledger).is_some()
     }
 
-    /// WHERE this call's outcome sits — the index in `ledger` of the first
-    /// result or error carrying this call's id after this call's own row, or
-    /// `None` when nothing answers it.
+    /// WHAT answered this call: the result or the error naming it, or `None`
+    /// while nothing does (2026-09-02).
     ///
-    /// This IS [`resolved_in`](Self::resolved_in), which asks the same
-    /// question and keeps only the yes-or-no: one rule, one implementation,
-    /// two readings of it. The position half exists because a cut through a
-    /// ledger has to know how far forward an answer lies, not merely that it
-    /// lies somewhere (2026-08-31, the compaction slice) — and a second walk
-    /// deciding what answers a call would be a second answer to the question
-    /// the runner and the approval chain already ask here.
+    /// The public reading of a call's state, for a consumer whose tool defers
+    /// its work to a backing system: a result means the work came out, an
+    /// error means it did not, and `None` means the call is still pending.
+    /// The consumer holds no walk of its own and no comparison of the
+    /// provider's echo — this is the one place a call is paired with its
+    /// outcome, so the framework and every consumer answer alike.
     ///
-    /// Every condition the resolution predicate carries holds unchanged: the
-    /// match is keyed on this call's own id, an absent id matches nothing,
-    /// and the outcome kinds are read through [`BlockKind`] rather than off
-    /// the stored type string.
+    /// It reads the same block [`resolved_in`](Self::resolved_in) does, through
+    /// the same pairing read, so a call can never read resolved here and
+    /// unresolved there. The outcome handed back is the one that read
+    /// classified, never a second classification of the same row.
+    #[must_use]
+    pub fn outcome_in(&self, ledger: &[Block]) -> Option<CallOutcome> {
+        ledger.iter().find_map(|block| self.answered_by(block))
+    }
+
+    /// The outcome this ONE block carries for this call, or `None` when the
+    /// block answers another call or answers none.
+    ///
+    /// The whole pairing rule for a single row: [`answered_call`] says which
+    /// call a block answers and hands back what kind of answer it is, and this
+    /// keeps the answer where the call is this one. Every reading below walks
+    /// the ledger through here, so the yes-or-no, the position and the outcome
+    /// come from one comparison and one classification.
+    fn answered_by(&self, block: &Block) -> Option<CallOutcome> {
+        answered_call(block).and_then(|(named, outcome)| (named == self.id).then_some(outcome))
+    }
+
+    /// WHERE this call's outcome sits — the index in `ledger` of the result or
+    /// error naming this call's block, or `None` when nothing answers it.
+    ///
+    /// This IS [`resolved_in`](Self::resolved_in) and
+    /// [`outcome_in`](Self::outcome_in), which ask the same question and keep
+    /// the yes-or-no and the row: one rule, one implementation, three readings
+    /// of it. The position half exists because a cut through a ledger has to
+    /// know how far forward an answer lies, not merely that it lies somewhere
+    /// (2026-08-31, the compaction slice) — and a second walk deciding what
+    /// answers a call would be a second answer to the question the runner and
+    /// the approval chain already ask here.
+    ///
+    /// It reads the WHOLE ledger, not only the rows behind this call
+    /// (2026-09-02). The forward-only walk was what kept a repeated echo from
+    /// letting an earlier call's result settle a later call; a block id names
+    /// exactly one call, so position carries none of the identity any more and
+    /// restricting the search would only hide an outcome a fork's junction
+    /// order put in front of its call.
     #[must_use]
     pub(crate) fn outcome_position_in(&self, ledger: &[Block]) -> Option<usize> {
-        if self.tool_call_id.is_empty() {
-            return None;
-        }
-        let own = ledger.iter().position(|block| block.id == self.id)?;
-        ledger[own + 1..]
+        ledger
             .iter()
-            .position(|block| match BlockKind::from_block(block) {
-                BlockKind::ToolResult(result) => result.tool_call_id == self.tool_call_id,
-                BlockKind::ToolError(error) => error.tool_call_id == self.tool_call_id,
-                _ => false,
+            .position(|block| self.answered_by(block).is_some())
+    }
+
+    /// The first call BEFORE this one in the ledger that `of_interest` accepts
+    /// and no outcome answers (2026-09-02) — the ORDERING question, answered
+    /// over the snapshot the caller already holds.
+    ///
+    /// `of_interest` is what keeps this fold from knowing anything about
+    /// tools: the caller says which calls the order binds, and the ledger says
+    /// which of them are still owed an outcome. The runner asks it for a call
+    /// whose tool runs in order, and a `Some` answer names the call that must
+    /// take effect first.
+    ///
+    /// One pass collects what every outcome in the ledger answers, and the
+    /// walk in front of this call reads that set — instead of asking
+    /// [`resolved_in`](Self::resolved_in) per candidate, which would re-walk
+    /// the ledger once for every earlier call. Both readings pair the same
+    /// way, through [`answered_call`].
+    ///
+    /// Ledger order is the conversation's own order — its junction order, the
+    /// order the calls were recorded in — so "before" means what the model
+    /// issued first.
+    #[must_use]
+    pub(crate) fn earlier_unresolved_call(
+        ledger: &[Block],
+        before: &ToolCall,
+        of_interest: &dyn Fn(&ToolCall) -> bool,
+    ) -> Option<i64> {
+        let own = ledger.iter().position(|block| block.id == before.id)?;
+        let answered: std::collections::HashSet<i64> = ledger
+            .iter()
+            .filter_map(|block| answered_call(block).map(|(named, _)| named))
+            .collect();
+        ledger[..own]
+            .iter()
+            .find_map(|block| match BlockKind::from_block(block) {
+                BlockKind::ToolCall(call) if !answered.contains(&call.id) && of_interest(&call) => {
+                    Some(call.id)
+                }
+                _ => None,
             })
-            .map(|offset| own + 1 + offset)
     }
 
     /// Does the ledger hold a call anchored on `anchor` whose outcome the
@@ -121,17 +180,19 @@ impl ToolCall {
     /// is the proof that the turn's continuation is genuinely due — its
     /// outcome resumes the turn no matter what else the ledger absorbs.
     /// Keyed on the anchor, never on recency — another turn's dangling call
-    /// must not keep this turn's identity alive. Two calls are NOT that
-    /// proof and are excluded by the narrowing, because each pinned an
-    /// identity indefinitely:
+    /// must not keep this turn's identity alive. One call is NOT that proof
+    /// and is excluded by the narrowing, because it held an identity open
+    /// with no end: an INTERACTIVE call parks on the user, who may never
+    /// answer. Its close ends the turn; a later approval writes the outcome
+    /// with the call's own anchor, and the tail inheritance re-attaches the
+    /// identity at that dispatch.
     ///
-    /// - An INTERACTIVE call parks on the user, who may never answer. Its
-    ///   close ends the turn; a later approval writes the outcome with the
-    ///   call's own anchor, and the tail inheritance re-attaches the
-    ///   identity at that dispatch.
-    /// - An EMPTY-ID call can never be resolved at all —
-    ///   [`Self::resolved_in`] matches outcomes on the id, and an absent id
-    ///   matches nothing — so counting it as owed reads as owed forever.
+    /// A call the provider named with an EMPTY echo was excluded beside it
+    /// until the pairing moved onto the block id (2026-09-02): the exclusion
+    /// existed because such a call could never be matched by any outcome and
+    /// so read as owed forever. It is matched by its own row now, the runner
+    /// answers it like any other call, and a system-owed call is exactly what
+    /// it is.
     ///
     /// Resolution is answered through [`Self::resolved_in`], THE resolution
     /// predicate, so this cannot drift from what the runner and the
@@ -146,9 +207,7 @@ impl ToolCall {
                 && matches!(
                     BlockKind::from_block(block),
                     BlockKind::ToolCall(call)
-                        if !call.interactive
-                            && !call.tool_call_id.is_empty()
-                            && !call.resolved_in(ledger)
+                        if !call.interactive && !call.resolved_in(ledger)
                 )
         })
     }
@@ -397,6 +456,39 @@ impl ToolCall {
                     )
             })
             .then_some(anchor)
+    }
+}
+
+/// What a call's outcome is, for a reader that needs to tell the two apart
+/// (2026-09-02): [`ToolCall::outcome_in`] hands one back, and a call with no
+/// outcome yet hands back nothing at all.
+///
+/// The kinds themselves, not a copy of what they say: whatever a resolution
+/// records — the text, the turn-ending stamp, the refusal fact — the reader
+/// gets, and nothing here has to grow a field when a resolution does.
+#[derive(Debug, Clone)]
+pub enum CallOutcome {
+    /// The call came out with an answer.
+    Result(ToolResult),
+    /// The call came out with a failure, refused or attempted.
+    Error(ToolError),
+}
+
+/// What one block answers, and for which call: the ledger row a tool outcome
+/// names paired with the outcome itself, or `None` for every block that is not
+/// a tool outcome.
+///
+/// THE pairing read (2026-09-02). Every question about whether a call is
+/// answered — the resolution predicate, the position the cut needs, the public
+/// outcome reading, the ordering fold — comes through here, so a call and its
+/// outcome are paired in exactly one place, and the classification that says
+/// result-or-error happens once for a row instead of once per reader. The
+/// kinds are read through [`BlockKind`], like every other outcome decision.
+fn answered_call(block: &Block) -> Option<(i64, CallOutcome)> {
+    match BlockKind::from_block(block) {
+        BlockKind::ToolResult(result) => Some((result.call_block_id, CallOutcome::Result(result))),
+        BlockKind::ToolError(error) => Some((error.call_block_id, CallOutcome::Error(error))),
+        _ => None,
     }
 }
 

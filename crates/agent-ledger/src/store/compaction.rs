@@ -509,12 +509,16 @@ mod tests {
         block
     }
 
-    /// The result answering that call — role-less, like every outcome.
-    fn result(id: i64, tool_call_id: &str) -> Block {
+    /// The result answering the call in row `answers` — role-less, like every
+    /// outcome, and naming the call by its BLOCK id, which is what pairs the
+    /// two. The provider's echo rides along as the model sees it and decides
+    /// nothing.
+    fn result(id: i64, answers: i64) -> Block {
         let mut block = block(id, None, "tool_result");
+        block.fields.insert("tool_call_id".into(), json!("echo"));
         block
             .fields
-            .insert("tool_call_id".into(), json!(tool_call_id));
+            .insert("source_block_id".into(), json!(answers));
         block.fields.insert("content".into(), json!("ok"));
         block
     }
@@ -589,7 +593,7 @@ mod tests {
             user(3),
             answer(4),
             call(5, "c1"),
-            result(6, "c1"),
+            result(6, 5),
             answer(7),
             user(8),
         ];
@@ -609,9 +613,9 @@ mod tests {
             user(1),
             answer(2),
             call(3, "c1"),
-            result(4, "c1"),
+            result(4, 3),
             call(5, "c2"),
-            result(6, "c2"),
+            result(6, 5),
             answer(7),
             user(8),
         ];
@@ -656,7 +660,7 @@ mod tests {
     /// splits.
     #[test]
     fn a_cut_that_reaches_the_end_falls_back_to_the_near_side() {
-        let blocks = vec![user(1), answer(2), call(3, "c1"), user(4), result(5, "c1")];
+        let blocks = vec![user(1), answer(2), call(3, "c1"), user(4), result(5, 3)];
         let cut = ledger_cut(&blocks).expect("the near side splits it");
         assert_eq!(
             cut.first_half_ends, 1,

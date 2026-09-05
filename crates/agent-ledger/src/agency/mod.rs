@@ -65,7 +65,7 @@ pub use records::{Status, Streaming, StreamingThinking, StreamingToolCall, Unkno
 pub use system_prompt::SystemPrompt;
 pub use text::Text;
 pub use thinking::Thinking;
-pub use tool_call::ToolCall;
+pub use tool_call::{CallOutcome, ToolCall};
 pub use tool_choice::ToolChoice;
 pub use tool_error::{Refusal, ToolError};
 pub use tool_result::ToolResult;

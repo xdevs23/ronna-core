@@ -434,6 +434,68 @@ const MIGRATIONS: &[&str] = &[
          );
      END;
     ",
+    // v9 (2026-09-02): a resolution names the call it answers, or it is
+    // refused. `source_block_id` has been on both resolution tables since v1
+    // and every writer has filled it, but the column stayed nullable — so the
+    // one shape the code must never produce was only ever avoided by its
+    // callers. The kinds now pair a call with its outcome on that id, because
+    // a model's tool_call_id can repeat and the block id cannot, and a
+    // resolution naming nothing would answer for no call while looking like an
+    // outcome. The rule moves to where the rows are written: the wrong shape
+    // fails loudly the first time anyone builds it, and every reader is spared
+    // a branch for a row that cannot exist.
+    //
+    // Two triggers instead of a rebuilt table with NOT NULL columns: the
+    // rebuild would have to drop and recreate two tables that other rows point
+    // at, where a trigger states the same rule in one statement each. INSERT
+    // only, because these rows are appended and never updated. A step, not an
+    // edit to v1's CREATE TABLE, for the reason v3 records.
+    //
+    // The step ALSO reads the rows already stored, and fails before it creates
+    // either trigger when one of them names no call. A rule that only refuses
+    // new rows would let such a database upgrade quietly and then break at the
+    // first read of that whole conversation, far from the cause. Failing here
+    // names the case while the database is still the one that has it, and
+    // leaves user_version below 9, so the step runs again once the rows are
+    // repaired.
+    //
+    // The check is SQL, like every other step: RAISE is legal only inside a
+    // trigger body, so one insert into a temporary table fires a temporary
+    // trigger that aborts the batch with the sentence. The temporary pair is
+    // this step's own and both halves go at the end of it.
+    "
+    CREATE TEMP TABLE IF NOT EXISTS v9_stored_resolutions_name_their_calls (checked INTEGER);
+
+    CREATE TEMP TRIGGER IF NOT EXISTS trg_v9_reads_the_stored_resolutions
+         BEFORE INSERT ON v9_stored_resolutions_name_their_calls
+     BEGIN
+         SELECT RAISE(
+             ABORT,
+             'a stored tool result or tool error names no call block: repair every block_tool_result and block_tool_error row whose source_block_id is NULL, then reopen'
+         )
+         WHERE EXISTS (SELECT 1 FROM block_tool_result WHERE source_block_id IS NULL)
+            OR EXISTS (SELECT 1 FROM block_tool_error  WHERE source_block_id IS NULL);
+     END;
+
+    INSERT INTO v9_stored_resolutions_name_their_calls (checked) VALUES (1);
+
+    DROP TRIGGER IF EXISTS trg_v9_reads_the_stored_resolutions;
+    DROP TABLE IF EXISTS v9_stored_resolutions_name_their_calls;
+
+    CREATE TRIGGER IF NOT EXISTS trg_tool_result_names_its_call
+         BEFORE INSERT ON block_tool_result
+         WHEN NEW.source_block_id IS NULL
+     BEGIN
+         SELECT RAISE(ABORT, 'a tool result names the call block it answers');
+     END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_tool_error_names_its_call
+         BEFORE INSERT ON block_tool_error
+         WHEN NEW.source_block_id IS NULL
+     BEGIN
+         SELECT RAISE(ABORT, 'a tool error names the call block it answers');
+     END;
+    ",
 ];
 
 /// Apply every unapplied step, advancing `user_version` as each lands.
@@ -913,6 +975,105 @@ mod tests {
              row resolves through",
             SystemPrompt::KINDS[0]
         );
+    }
+
+    /// v9 on a POPULATED store: a database carrying resolutions written before
+    /// the step upgrades in place — every one of them names its call already,
+    /// which is why the rule can be stated at all — and a resolution naming
+    /// none is refused from then on, on both tables.
+    #[test]
+    fn a_populated_store_gains_the_rule_that_a_resolution_names_its_call() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for sql in &MIGRATIONS[..8] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 8).unwrap();
+        conn.execute_batch(
+            "INSERT INTO blocks (block_type) VALUES ('tool_call');
+             INSERT INTO blocks (block_type) VALUES ('tool_result');
+             INSERT INTO block_tool_result (block_id, tool_call_id, content, source_block_id)
+                 VALUES (2, 'before', 'the old answer', 1);",
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+        assert_eq!(version(&conn), u32::try_from(MIGRATIONS.len()).unwrap());
+        let named: i64 = conn
+            .query_row(
+                "SELECT source_block_id FROM block_tool_result WHERE block_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            named, 1,
+            "the existing resolution survives, naming its call"
+        );
+
+        conn.execute_batch("INSERT INTO blocks (block_type) VALUES ('tool_result');")
+            .unwrap();
+        let nameless = conn.execute(
+            "INSERT INTO block_tool_result (block_id, tool_call_id, content, source_block_id)
+                 VALUES (3, 'after', 'answers nobody', NULL)",
+            [],
+        );
+        assert!(nameless.is_err(), "a result naming no call is refused");
+
+        conn.execute_batch("INSERT INTO blocks (block_type) VALUES ('tool_error');")
+            .unwrap();
+        let nameless = conn.execute(
+            "INSERT INTO block_tool_error (block_id, tool_call_id, error, source_block_id)
+                 VALUES (4, 'after', 'answers nobody', NULL)",
+            [],
+        );
+        assert!(nameless.is_err(), "an error naming no call is refused");
+    }
+
+    /// v9 on a store that already HOLDS the shape the rule forbids: the step
+    /// fails, saying which rows to repair, and the counter stays where it was
+    /// so the upgrade runs again after the repair. A step that refused new
+    /// rows only would leave this database reading as upgraded and break at the
+    /// first read of the conversation carrying that row.
+    #[test]
+    fn a_stored_resolution_naming_no_call_fails_the_v9_step() {
+        for (kind, table, column) in [
+            ("tool_result", "block_tool_result", "content"),
+            ("tool_error", "block_tool_error", "error"),
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for sql in &MIGRATIONS[..8] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 8).unwrap();
+            conn.execute_batch(&format!(
+                "INSERT INTO blocks (block_type) VALUES ('tool_call');
+                 INSERT INTO blocks (block_type) VALUES ('{kind}');
+                 INSERT INTO {table} (block_id, tool_call_id, {column}, source_block_id)
+                     VALUES (2, 'legacy', 'answers nobody', NULL);"
+            ))
+            .unwrap();
+
+            let upgrade = run(&conn);
+            let refusal = upgrade
+                .expect_err("the step reads what is stored")
+                .to_string();
+            assert!(
+                refusal.contains("names no call block"),
+                "the failure names the case, got `{refusal}`"
+            );
+            assert_eq!(version(&conn), 8, "the counter stays below the step");
+            let rule: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'trigger' AND name = 'trg_tool_result_names_its_call'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(rule, 0, "and the step created nothing on its way out");
+        }
     }
 
     /// The display-only summary channel sits beside content and the opaque

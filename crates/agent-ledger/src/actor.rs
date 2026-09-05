@@ -880,7 +880,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     ///   interrupt stamping a dead turn's summoner. The sixth break proved
     ///   the fifth's two arms leak in both directions — a model-owed tail
     ///   kept a dead identity for someone else's summons, and a parked
-    ///   interactive or empty-id call kept one forever — so the rule now
+    ///   interactive call kept one forever — so the rule now
     ///   keeps only for an unanswered outcome or a system-owed call, both
     ///   documented at the rule. Rejected: reusing the held anchor only for
     ///   turn-product frontiers — the absorbed message is exactly a
@@ -948,18 +948,18 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     ///   is excluded by the fold itself (2026-08-30), so an ends-turn round
     ///   leaves the two sides equal and the turn ends; or
     /// - **the system owes an outcome** — an unresolved, NON-interactive
-    ///   tool call with a non-empty call id, anchored on this turn, exists
-    ///   in the snapshot ([`ToolCall::system_owed_call_anchored_in`]): the
-    ///   runner will answer it, and that outcome resumes the turn.
+    ///   tool call anchored on this turn exists in the snapshot
+    ///   ([`ToolCall::system_owed_call_anchored_in`]): the runner will answer
+    ///   it, and that outcome resumes the turn.
     ///
     /// The fifth break's frontier arm — "the tail owes the model keeps the
     /// identity" — is DELETED: a model-owed tail is someone's summons,
     /// never evidence of this turn's continuation, and it kept a dead
     /// turn's identity for exactly the fresh summons the rule exists to
     /// protect. The unresolved-call arm is narrowed for the same break's
-    /// other shape: an interactive call parks on the user and an empty-id
-    /// call can never resolve, so either one read as owed pinned the
-    /// identity indefinitely. How each proven shape falls out:
+    /// other shape: an interactive call parks on the user, and read as owed
+    /// it held the identity open with no end. How each proven shape falls
+    /// out:
     ///
     /// - **The truncated round**: no call recorded, no outcome — both arms
     ///   empty, the close ends the turn, and a message absorbed in the
@@ -2549,92 +2549,107 @@ mod tests {
         assert_eq!(actor.open_turn, Some(absorbed));
     }
 
+    /// A turn whose one tool call is the caller's, closed on tool use — the
+    /// exact moment the identity-release rule is asked, and the only thing the
+    /// two tests below differ by is the call.
+    ///
+    /// The probe and the recheck signal ride back because the actor's
+    /// collaborators must outlive the assertions.
+    struct ClosedToolUseTurn {
+        ctx: RuntimeContext<BlockKind, CoreEvent>,
+        conv: i64,
+        summons: i64,
+        actor: ConversationActor<BlockKind, CoreEvent>,
+        _probe: ComposedProbe,
+        _recheck: ReadSignal<u64>,
+    }
+
+    async fn closed_tool_use_turn(call: ToolCallInsert) -> ClosedToolUseTurn {
+        let (ctx, conv, probe) = scripted_context(Script::CountOnly).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        ctx.store
+            .insert_tool_call_block(
+                crate::store::BlockDestination::anchored(conv, Some(summons)),
+                crate::block::Role::Assistant,
+                call,
+                None,
+            )
+            .await
+            .unwrap();
+        let (mut actor, recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.streaming = true;
+        actor.open_turn = Some(summons);
+        actor.handle_stream_done(Some(StopReason::ToolUse));
+        actor.handle_stream_closed().await;
+        ClosedToolUseTurn {
+            ctx,
+            conv,
+            summons,
+            actor,
+            _probe: probe,
+            _recheck: recheck,
+        }
+    }
+
     /// The verified sixth break's shape B at the rule level (2026-08-23):
     /// a call the SYSTEM never owes an outcome for must not hold the
     /// identity. An INTERACTIVE call parks on the user, who may never
     /// answer — counting it as an owed continuation pinned the identity
     /// indefinitely, and someone else's fresh summons inherited it. The
     /// close ends the turn; when the approval later resolves, the outcome
-    /// carries the turn's anchor and the tail inheritance re-attaches. An
-    /// empty-id call is the same shape one step further: no outcome can
-    /// ever match it, so it reads as unresolved forever.
+    /// carries the turn's anchor and the tail inheritance re-attaches.
     #[tokio::test]
     async fn a_parked_interactive_call_does_not_hold_the_identity() {
-        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
-        let summons = ctx
-            .store
-            .insert_text_block(conv, crate::block::Role::User, "summons".into())
-            .await
-            .unwrap();
-        ctx.store
-            .insert_tool_call_block(
-                crate::store::BlockDestination::anchored(conv, Some(summons)),
-                crate::block::Role::Assistant,
-                ToolCallInsert {
-                    tool_call_id: "call-interactive".into(),
-                    name: "echo".into(),
-                    input: "{}".into(),
-                    interactive: true,
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
-        actor.streaming = true;
-        actor.open_turn = Some(summons);
-        actor.handle_stream_done(Some(StopReason::ToolUse));
-        actor.handle_stream_closed().await;
+        let mut turn = closed_tool_use_turn(ToolCallInsert {
+            tool_call_id: "call-interactive".into(),
+            name: "echo".into(),
+            input: "{}".into(),
+            interactive: true,
+        })
+        .await;
         assert_eq!(
-            actor.open_turn, None,
+            turn.actor.open_turn, None,
             "a parked interactive call ends the identity"
         );
 
         // The user never answers the approval; someone summons a NEW turn.
         // Its dispatch anchors on itself, never on the parked turn.
-        let fresh = ctx
+        let fresh = turn
+            .ctx
             .store
-            .insert_text_block(conv, crate::block::Role::User, "fresh".into())
+            .insert_text_block(turn.conv, crate::block::Role::User, "fresh".into())
             .await
             .unwrap();
-        actor.handle_blocks_ready().await;
+        turn.actor.handle_blocks_ready().await;
         assert_eq!(
-            actor.turn_anchor.get(),
+            turn.actor.turn_anchor.get(),
             Some(fresh),
             "the fresh summons' turn never inherits the parked turn's identity"
         );
+    }
 
-        // The empty-id call: nothing can ever resolve it, so reading it as
-        // an owed continuation pins the identity forever. It ends the turn
-        // the same way.
-        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
-        let summons = ctx
-            .store
-            .insert_text_block(conv, crate::block::Role::User, "summons".into())
-            .await
-            .unwrap();
-        ctx.store
-            .insert_tool_call_block(
-                crate::store::BlockDestination::anchored(conv, Some(summons)),
-                crate::block::Role::Assistant,
-                ToolCallInsert {
-                    tool_call_id: String::new(),
-                    name: "echo".into(),
-                    input: "{}".into(),
-                    interactive: false,
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
-        actor.streaming = true;
-        actor.open_turn = Some(summons);
-        actor.handle_stream_done(Some(StopReason::ToolUse));
-        actor.handle_stream_closed().await;
+    /// The call the interactive exclusion never covered: one the provider
+    /// named with an EMPTY echo. The system owes it an outcome like any other,
+    /// because the outcome is paired with it by its own row (2026-09-02), so
+    /// its turn KEEPS the identity — the release rule narrows to the
+    /// interactive call alone.
+    #[tokio::test]
+    async fn an_echoless_call_keeps_the_identity() {
+        let turn = closed_tool_use_turn(ToolCallInsert {
+            tool_call_id: String::new(),
+            name: "echo".into(),
+            input: "{}".into(),
+            interactive: false,
+        })
+        .await;
         assert_eq!(
-            actor.open_turn, None,
-            "a call no outcome can ever match ends the identity"
+            turn.actor.open_turn,
+            Some(turn.summons),
+            "an echoless call is owed an outcome, so its turn keeps the identity"
         );
     }
 

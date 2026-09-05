@@ -15,8 +15,16 @@ use super::projection::{ContentPart, Projection, render_tool_error};
 /// a result answers through.
 #[derive(Debug, Clone)]
 pub struct ToolError {
-    /// The call this answers.
+    /// The provider's id for the call, echoed back so the model can pair the
+    /// two. Never the pairing key: the model may reuse it.
     pub tool_call_id: String,
+    /// The ledger row of the call this answers — the call's one identity, read
+    /// off the row's own `source_block_id` (2026-09-02). The result kind
+    /// carries it on the same terms, stated in full on
+    /// [`ToolResult::call_block_id`](super::ToolResult::call_block_id): plain,
+    /// because the store refuses a resolution that names no call, and 0 for a
+    /// payload built outside the store.
+    pub call_block_id: i64,
     /// Why it failed.
     pub error: String,
     /// Whether a standing no declined the call instead of it being attempted —
@@ -218,6 +226,7 @@ impl super::LeafKind for ToolError {
     fn parse(block: &Block) -> Self {
         Self {
             tool_call_id: super::string_field(block, "tool_call_id"),
+            call_block_id: super::i64_field(block, "source_block_id"),
             error: super::string_field(block, "error"),
             // Read optionally, the turn-ending stamp's own shape: the column
             // is NOT NULL with a default, so every failure the widening step

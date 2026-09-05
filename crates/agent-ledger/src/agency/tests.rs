@@ -76,6 +76,16 @@ fn kind(block_type: &str, role: Option<Role>) -> BlockKind {
     BlockKind::from_block(&bare_block(block_type, role))
 }
 
+/// The block this id names, out of a ledger that must be holding it: every
+/// test here reads a stored row by its id, and a ledger missing it is the
+/// test's own setup being wrong, never a case under assertion.
+fn block_named(ledger: &[Block], block_id: i64) -> &Block {
+    ledger
+        .iter()
+        .find(|block| block.id == block_id)
+        .expect("the ledger holds the block")
+}
+
 async fn stored_kind(rig: &Rig, block_id: i64) -> BlockKind {
     let ledger = rig
         .ctx
@@ -83,8 +93,7 @@ async fn stored_kind(rig: &Rig, block_id: i64) -> BlockKind {
         .list_blocks(rig.ctx.conversation_id)
         .await
         .unwrap();
-    let block = ledger.iter().find(|b| b.id == block_id).unwrap();
-    BlockKind::from_block(block)
+    BlockKind::from_block(block_named(&ledger, block_id))
 }
 
 async fn resolve_with_result(rig: &Rig, tool_call_id: &str, call_block_id: i64) {
@@ -485,37 +494,10 @@ async fn unrelated_result_never_settles_a_call() {
     assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, block_id);
 }
 
-/// Two payloads with no id at all must not pair up.
-///
-/// The store constrains its own writes `NOT NULL`, so these blocks are built
-/// by hand: the predicate reads PARSED JSON, and it has to answer for payloads
-/// the store never wrote. Both sides parse their missing `tool_call_id` to the
-/// empty string, and matching on that would resolve a call with a result that
-/// answers nothing.
-#[test]
-fn an_id_less_call_is_not_settled_by_an_id_less_result() {
-    let mut call_block = bare_block("tool_call", Some(Role::Assistant));
-    call_block.id = 1;
-    let mut result_block = bare_block("tool_result", None);
-    result_block.id = 2;
-    let ledger = vec![call_block.clone(), result_block];
-
-    let BlockKind::ToolCall(call) = BlockKind::from_block(&call_block) else {
-        panic!("expected a tool call");
-    };
-    assert_eq!(
-        call.tool_call_id, "",
-        "the absent id parses to the sentinel"
-    );
-    assert!(
-        !call.resolved_in(&ledger),
-        "an absent id resolves nothing — the empty string is not a match"
-    );
-}
-
 /// A result already on the ledger BEFORE the call — an earlier call sharing
 /// the same provider id, already resolved — must not settle the later call:
-/// the predicate only reads forward from the call's own position.
+/// the result names the earlier call's own row, and the echo the two share
+/// decides nothing.
 #[tokio::test]
 async fn a_result_preceding_the_call_does_not_settle_it() {
     let mut rig = rig().await;
@@ -526,6 +508,101 @@ async fn a_result_preceding_the_call_does_not_settle_it() {
     let call = stored_kind(&rig, block_id).await;
     assert!(!call.run(&rig.ctx).await.unwrap());
     assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, block_id);
+}
+
+/// AC18 — two calls of one round carrying ONE echo, through the real write
+/// path: each is resolved by its own result and by nothing else.
+///
+/// This is the case the provider's echo cannot answer. Both results carry
+/// `dup`, and both sit after both calls, so an echo comparison reads either
+/// call as settled by the first result. The block id names one call, so the
+/// first call's result leaves the second still owed one, and the second's
+/// result answers only the second.
+#[tokio::test]
+async fn two_calls_sharing_one_echo_resolve_only_through_their_own_result() {
+    let rig = rig().await;
+    let first = insert_call(&rig, "dup").await;
+    let second = insert_call(&rig, "dup").await;
+    resolve_with_result(&rig, "dup", first).await;
+
+    let ledger = rig
+        .ctx
+        .store
+        .list_blocks(rig.ctx.conversation_id)
+        .await
+        .unwrap();
+    let call_kind = |id: i64| match BlockKind::from_block(block_named(&ledger, id)) {
+        BlockKind::ToolCall(call) => call,
+        _ => panic!("expected a tool call"),
+    };
+    assert!(
+        call_kind(first).resolved_in(&ledger),
+        "the first call takes its own result"
+    );
+    assert!(
+        !call_kind(second).resolved_in(&ledger),
+        "and the shared echo does not settle the second call"
+    );
+
+    rig.ctx
+        .store
+        .fail_tool_call_block(rig.ctx.conversation_id, "dup".into(), "boom".into(), second)
+        .await
+        .unwrap()
+        .expect("the second call is still owed an outcome");
+    let ledger = rig
+        .ctx
+        .store
+        .list_blocks(rig.ctx.conversation_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        call_kind(first).outcome_in(&ledger),
+        Some(CallOutcome::Result(result)) if result.content == "ok"
+    ));
+    assert!(matches!(
+        call_kind(second).outcome_in(&ledger),
+        Some(CallOutcome::Error(error)) if error.error == "boom"
+    ));
+}
+
+/// AC18 — the outcome reading, which is how a consumer tells a call that came
+/// out from one that failed from one still in flight. Three states, one
+/// reading, and no echo comparison anywhere in it.
+#[tokio::test]
+async fn the_outcome_reading_answers_result_error_and_pending() {
+    let rig = rig().await;
+    let pending = insert_call(&rig, "pending").await;
+    let done = insert_call(&rig, "done").await;
+    let broken = insert_call(&rig, "broken").await;
+    resolve_with_result(&rig, "done", done).await;
+    rig.ctx
+        .store
+        .fail_tool_call_block(
+            rig.ctx.conversation_id,
+            "broken".into(),
+            "it broke".into(),
+            broken,
+        )
+        .await
+        .unwrap()
+        .expect("the call is unresolved");
+
+    let ledger = rig
+        .ctx
+        .store
+        .list_blocks(rig.ctx.conversation_id)
+        .await
+        .unwrap();
+    let outcome = |id: i64| {
+        let BlockKind::ToolCall(call) = BlockKind::from_block(block_named(&ledger, id)) else {
+            panic!("expected a tool call");
+        };
+        call.outcome_in(&ledger)
+    };
+    assert!(outcome(pending).is_none(), "nothing has answered it yet");
+    assert!(matches!(outcome(done), Some(CallOutcome::Result(_))));
+    assert!(matches!(outcome(broken), Some(CallOutcome::Error(_))));
 }
 
 #[tokio::test]
@@ -638,8 +715,7 @@ async fn post_gate_of(rig: &Rig, block_id: i64) -> Option<i64> {
         .list_blocks(rig.ctx.conversation_id)
         .await
         .unwrap();
-    let block = ledger.iter().find(|b| b.id == block_id).unwrap();
-    BlockKind::from_block(block).post_gate_id(&ledger)
+    BlockKind::from_block(block_named(&ledger, block_id)).post_gate_id(&ledger)
 }
 
 /// An undecided request routes nowhere — the walk owes nothing until the human

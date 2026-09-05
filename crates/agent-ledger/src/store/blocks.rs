@@ -42,6 +42,11 @@ use super::{DomainGate, StoreError};
 ///
 /// 2026-09-01, the same lockstep again: the tool choice arrived as a join of
 /// its own, carrying the one column that holds the recorded names.
+///
+/// 2026-09-02, the same lockstep once more: both resolution joins gained
+/// `source_block_id`, the call each one answers. It was written from the
+/// beginning and selected by nothing, so the kinds could only pair on the
+/// provider's echo — which a model may reuse.
 pub(super) const BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
@@ -49,8 +54,8 @@ pub(super) const BLOCKS_QUERY: &str = "SELECT
             bc.role AS bc_role, bc.language AS bc_language, bc.content AS bc_content,
             btc.role AS btc_role, btc.tool_call_id AS btc_tool_call_id, btc.name AS btc_name, btc.input AS btc_input, btc.interactive AS btc_interactive,
             bstc.role AS bstc_role, bstc.tool_call_id AS bstc_tool_call_id, bstc.name AS bstc_name, bstc.input AS bstc_input,
-            btr.tool_call_id AS btr_tool_call_id, btr.content AS btr_content, btr.ends_turn AS btr_ends_turn,
-            bte.tool_call_id AS bte_tool_call_id, bte.error AS bte_error, bte.refusal AS bte_refusal,
+            btr.tool_call_id AS btr_tool_call_id, btr.content AS btr_content, btr.ends_turn AS btr_ends_turn, btr.source_block_id AS btr_source_block_id,
+            bte.tool_call_id AS bte_tool_call_id, bte.error AS bte_error, bte.refusal AS bte_refusal, bte.source_block_id AS bte_source_block_id,
             bth.role AS bth_role, bth.content AS bth_content, bth.title AS bth_title, bth.summary AS bth_summary,
             bth.opaque_kind AS bth_opaque_kind, bth.opaque_data AS bth_opaque_data, bth.opaque_item_id AS bth_opaque_item_id,
             bs.status AS bs_status, bs.subtitle AS bs_subtitle,
@@ -186,6 +191,28 @@ fn required<T: rusqlite::types::FromSql>(
             block_id,
             block_type: block_type.to_owned(),
         }),
+    }
+}
+
+/// The call a resolution row names, refused when it names none (2026-09-02).
+///
+/// The column is nullable in the shipped schema and has been written by every
+/// writer since it shipped; the schema step that refuses a NULL at the write
+/// closes the shape from the other side. So a NULL reaching this read is a row
+/// built around the store, and the load fails on it by name instead of
+/// handing back a resolution that answers no call — which every reader would
+/// then have to carry a branch for.
+fn source_of_resolution(
+    row: &rusqlite::Row<'_>,
+    name: &str,
+    block_id: i64,
+) -> Result<i64, StoreError> {
+    match row.get::<_, Option<i64>>(name)? {
+        Some(source) => Ok(source),
+        None => Err(StoreError::Other(format!(
+            "resolution block {block_id} names no tool call: a result or an error \
+             records the call block it answers"
+        ))),
     }
 }
 
@@ -381,6 +408,10 @@ fn tool_payload(
                 "ends_turn".into(),
                 Value::Bool(col_opt::<i64>(row, "btr_ends_turn")?.unwrap_or(0) != 0),
             );
+            fields.insert(
+                "source_block_id".into(),
+                Value::Number(source_of_resolution(row, "btr_source_block_id", block_id)?.into()),
+            );
         }
         "tool_error" => {
             fields.insert(
@@ -399,6 +430,10 @@ fn tool_payload(
             fields.insert(
                 "refusal".into(),
                 Value::Bool(col_opt::<i64>(row, "bte_refusal")?.unwrap_or(0) != 0),
+            );
+            fields.insert(
+                "source_block_id".into(),
+                Value::Number(source_of_resolution(row, "bte_source_block_id", block_id)?.into()),
             );
         }
         _ => return Ok(None),

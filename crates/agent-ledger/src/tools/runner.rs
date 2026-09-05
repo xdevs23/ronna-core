@@ -8,10 +8,12 @@
 //! recorded there. That is what collapses many triggers into exactly one body
 //! execution without a queue, a lock or a run-once flag anywhere.
 //!
-//! Because no emitter path can route around this pass, three properties hold
+//! Because no emitter path can route around this pass, four properties hold
 //! under any interleaving: a refused call can never execute, a deferred call
-//! can never execute unapproved, and one call can never carry both a success
-//! and an error. ONE restart residual stands against the first of them,
+//! can never execute unapproved, one call can never carry both a success and
+//! an error, and a call of a tool that runs in order can never execute while
+//! an earlier in-order call of its conversation is unresolved. ONE restart
+//! residual stands against the first of them,
 //! recorded on the `claimed` read's own doc below: a pending body that ran
 //! before a restart can be refused afterwards, and its late result loses the
 //! conditional write — an in-process claim cannot survive the process.
@@ -20,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::agency::{
     AgencyCtx, BlockKind, FromBlock, GateDecision, Refusal, RuntimeKind, ToolCall, ToolError,
@@ -143,6 +145,42 @@ pub(crate) struct ToolWindowBound {
 /// one tool instead of for the conversation.
 fn window_spent(ledger: &[Block], calls: usize, seconds: i64, of_tool: Option<&str>) -> bool {
     ToolCall::calls_in_trailing_window(ledger, seconds, of_tool) > calls
+}
+
+/// Which earlier call must act before this one (2026-09-02), or `None` when
+/// nothing holds it back.
+///
+/// A `Some` answer parks the call and records NOTHING: an order is not a
+/// verdict, and a call waiting its turn is still a call the ledger says is
+/// owed. It re-emits the way a latched wakeup re-emits — the cursor parks on
+/// an unresolved call and re-drives it on the next tick, and the resolution
+/// that frees this call is itself a store change that triggers one — so the
+/// order needs no queue, no timer and no wakeup path of its own.
+///
+/// Which calls the order binds is the CONSUMER's answer
+/// ([`ToolHandler::runs_in_order`]), read for THIS call and for every earlier
+/// one through the very set this conversation resolves its tools by
+/// ([`ResolvedTools`]): a name the conversation does not have resolves to no
+/// handler, runs nowhere, and orders nothing — which is why this reads the
+/// handler off `resolved` instead of taking one, and why it can answer before
+/// the pass has decided what an unresolvable name gets.
+///
+/// A tool that runs in parallel — every tool, by default — never reaches
+/// the fold at all.
+fn earlier_call_to_act_first<E>(
+    call: &ToolCall,
+    ledger: &[Block],
+    resolved: &ResolvedTools<'_, E>,
+) -> Option<i64> {
+    let runs_in_order = |of: &ToolCall| {
+        resolved
+            .handler(&of.name)
+            .is_some_and(<dyn ToolHandler<E>>::runs_in_order)
+    };
+    if !runs_in_order(call) {
+        return None;
+    }
+    ToolCall::earlier_unresolved_call(ledger, call, &runs_in_order)
 }
 
 /// The admission chokepoint, holding the registry it resolves calls against.
@@ -431,32 +469,47 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
     /// 2. **Already resolved?** Return. This is what makes a duplicate wakeup
     ///    free, and it comes FIRST so no later step can re-run a completed
     ///    body.
-    /// 3. **Is a tool-call window spent** — the conversation's, or this
-    ///    tool's own (2026-08-30)? If either is, this call resolves with that
-    ///    window's refusal and NOTHING
-    ///    else runs. It comes before every other refusal, the unknown tool
-    ///    included: a hot window meeting an unknown tool name would otherwise
-    ///    loop on the teaching text, a second unbounded shape. What the
-    ///    window never touches is a call whose body may already have run —
-    ///    one claimed by this process, one carrying a granted human approval
-    ///    (step 6's `Approved`) — and an interactive call, whose admission
-    ///    belongs to the human; refusing any of those would write "this call
-    ///    was not run" over a call that did run, and orphan its real result
-    ///    at the conditional write. The window governs FRESH admissions
-    ///    alone. The interactive skip is defensive only: an interactive call
-    ///    is answered by the human and never reaches this pass at all.
-    /// 4. **Resolve the tool against the tools THIS CONVERSATION HAS** — its
+    /// 3. **Resolve the tool against the tools THIS CONVERSATION HAS** — its
     ///    newest recorded choice intersected with the registry
     ///    ([`ResolvedTools`]), which is the very same resolution the dispatch
-    ///    offered the turn from. A name the set does not carry resolves the
-    ///    call with an error instead of leaving it dangling: a call nobody
-    ///    can run is still a call the model is waiting on.
-    /// 5. **Ask the consumer's own admission** ([`ToolHandler::admit`]) over
+    ///    offered the turn from. Resolving is not yet deciding: the set is
+    ///    read here because step 4 asks it what runs in order, and what a name
+    ///    the set does not carry gets is step 5's answer.
+    /// 4. **Does an earlier call of this conversation have to act first?**
+    ///    For a tool that [`runs_in_order`](ToolHandler::runs_in_order), an
+    ///    earlier unresolved call of any in-order tool parks this one: the
+    ///    wakeup is dropped and NOTHING is recorded, and the call re-emits
+    ///    through the cursor's own re-drive once that call resolves. It comes
+    ///    before every step that can record an outcome, because each of those
+    ///    resolves the call, and a later in-order call resolved while an
+    ///    earlier one is unresolved has taken effect out of turn — a hot
+    ///    window refusing the second of two in-order calls is exactly that.
+    ///    The handler is read off step 3's set and never taken, so a name this
+    ///    conversation does not have finds no in-order handler, orders
+    ///    nothing, and falls through to the refusal step 6 writes for it.
+    /// 5. **Is a tool-call window spent** — the conversation's, or this
+    ///    tool's own (2026-08-30)? If either is, this call resolves with that
+    ///    window's refusal and NOTHING else runs. It is the first refusal of
+    ///    the pass, the unknown tool included: a hot window meeting an unknown
+    ///    tool name would otherwise loop on the teaching text, a second
+    ///    unbounded shape. What the window never touches is a call whose body
+    ///    may already have run — one claimed by this process, one carrying a
+    ///    granted human approval (step 9's `Approved`) — and an interactive
+    ///    call, whose admission belongs to the human; refusing any of those
+    ///    would write "this call was not run" over a call that did run, and
+    ///    orphan its real result at the conditional write. The window governs
+    ///    FRESH admissions alone. The interactive skip is defensive only: an
+    ///    interactive call is answered by the human and never reaches this
+    ///    pass at all.
+    /// 6. **A name the set does not carry** resolves the call with an error
+    ///    instead of leaving it dangling: a call nobody can run is still a
+    ///    call the model is waiting on.
+    /// 7. **Ask the consumer's own admission** ([`ToolHandler::admit`]) over
     ///    the snapshot this pass loaded — before any clearance is parked, so
     ///    a call the consumer declines never puts a request in front of a
     ///    human.
-    /// 6. **Ungated?** Straight to the body. No evaluation, no record of one.
-    /// 7. **Read the recorded standing** and, only where nothing is recorded
+    /// 8. **Ungated?** Straight to the body. No evaluation, no record of one.
+    /// 9. **Read the recorded standing** and, only where nothing is recorded
     ///    yet, ask the tool's own gate — which records its answer before
     ///    anything acts on it.
     async fn execute_ready_call(&self, ctx: &AgencyCtx<E>, call_block_id: i64) {
@@ -496,14 +549,28 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
         // agree with each other.
         let approval = approval_state(&ledger, call.id);
 
-        if self.window_refuses(ctx, &ledger, &call, approval).await {
-            return;
-        }
-
         // What this conversation has, resolved exactly once and from the very
         // rule the dispatch offered its definitions by — so a name the model
         // was shown resolves here, and a name it was not shown cannot.
         let resolved = ResolvedTools::of(&ledger, &self.registry);
+
+        // The order stands down before anything can record an outcome: every
+        // refusal below resolves the call, and a resolution is a call taking
+        // effect.
+        if let Some(earlier) = earlier_call_to_act_first(&call, &ledger, &resolved) {
+            debug!(
+                name = call.name,
+                conversation_id = ctx.conversation_id,
+                earlier_call = earlier,
+                "tool runner: an earlier call of this conversation runs first, standing down"
+            );
+            return;
+        }
+
+        if self.window_refuses(ctx, &ledger, &call, approval).await {
+            return;
+        }
+
         let Some(handler) = resolved.handler(&call.name) else {
             // The model-facing sentence must not tell the two cases apart —
             // naming a registered-but-excluded tool would disclose the

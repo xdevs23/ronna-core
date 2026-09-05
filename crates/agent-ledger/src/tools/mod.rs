@@ -231,6 +231,56 @@ pub trait ToolHandler<E>: Send + Sync {
         false
     }
 
+    /// Whether calls of this tool must TAKE EFFECT in the order the model
+    /// issued them (2026-09-02). Default: parallel, like every other tool.
+    ///
+    /// A tool answers `true` when its calls act on something outside the
+    /// ledger whose order a reader can see — messages arriving in a chat, say.
+    /// Parallel bodies would reach that outside in whatever order they
+    /// finished, which for such a tool is a defect the model cannot correct.
+    ///
+    /// What the runner does with it: a ready call of an in-order tool whose
+    /// conversation still holds an EARLIER unresolved call of ANY in-order
+    /// tool is parked — its wakeup is dropped, exactly as a latched wakeup is,
+    /// and the call re-emits on the tick the earlier call's resolution
+    /// triggers. So the calls run one at a time, in the order they were
+    /// recorded, and one is never in flight beside another. Calls of every
+    /// other tool are untouched and stay parallel.
+    ///
+    /// The order binds across names as much as within one: two tools that both
+    /// answer `true` order against each other, because a model that sends
+    /// through one and replies through another means both to arrive in the
+    /// order it wrote them.
+    ///
+    /// The wait is exactly as long as the earlier call's resolution takes.
+    /// A [`Pending`](ToolOutcome::Pending) body holds it until its backing
+    /// system settles the call, which is the shape this hook exists for; an
+    /// [`interactive`](Self::interactive) in-order call holds it until the
+    /// human answers, which is what "in the order the model issued them"
+    /// means for a call the human owns.
+    ///
+    /// Nothing else records the order: no lock, no queue, no second column.
+    /// The ledger already says which calls are unresolved, and a second record
+    /// of the same fact is the shape this runtime refuses everywhere.
+    ///
+    /// **Read live, at the ordering question — where
+    /// [`interactive`](Self::interactive) is stamped onto the call block at
+    /// insert.** The two properties answer different questions, so they are
+    /// read differently on purpose. Interactive says who owes a call its next
+    /// move, and a replay asks that of a long-finished call, so the answer has
+    /// to live in the block. An order binds only calls still waiting to act: a
+    /// resolved call orders nothing, and nothing ever reads back whether it
+    /// once did. So the property is read, for this call and for every earlier
+    /// one, from the tools THIS CONVERSATION HAS — the very set that resolves a
+    /// call to a handler at all. A tool the conversation loses therefore stops
+    /// ordering at the moment it stops running: a fresh call of it resolves
+    /// with an unresolved-tool error, and one of its calls still unresolved
+    /// from before holds no sibling back. A stamped answer would say the
+    /// opposite, and park live calls behind a tool nothing can run.
+    fn runs_in_order(&self) -> bool {
+        false
+    }
+
     /// The consumer's OWN admission for one call, consulted on every call
     /// (2026-09-01). Default: admit.
     ///
