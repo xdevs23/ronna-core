@@ -19,7 +19,8 @@ use serde_json::Value;
 
 use crate::agency::ratchet::oracle::Oracle;
 use crate::agency::{
-    Agency, AgencyCtx, Awaiting, BlockKind, FromBlock, GateDecision, ratchet, redispatch,
+    Agency, AgencyCtx, Awaiting, BlockKind, CallOutcome, FromBlock, GateDecision, ratchet,
+    redispatch,
 };
 use crate::block::Block;
 use crate::event::CoreEvent;
@@ -3338,7 +3339,7 @@ async fn a_hot_window_never_refuses_an_in_order_call_waiting_its_turn() {
         vec![first],
         "the second call never reaches a body while the first is unresolved"
     );
-    let ledger = rig
+    let while_parked = rig
         .o
         .ctx
         .store
@@ -3346,7 +3347,7 @@ async fn a_hot_window_never_refuses_an_in_order_call_waiting_its_turn() {
         .await
         .unwrap();
     assert!(
-        ledger
+        while_parked
             .iter()
             .all(|block| block.block_type != "tool_result" && block.block_type != "tool_error"),
         "the parked call carries no outcome at all, the window's refusal included"
@@ -3360,25 +3361,54 @@ async fn a_hot_window_never_refuses_an_in_order_call_waiting_its_turn() {
         vec![first],
         "the second call's turn comes, and the window answers it then"
     );
-    assert_eq!(
-        error_texts(&rig.o.ctx).await,
-        vec![crate::agency::ToolError::rate_limit_refusal(1, 60)],
-        "with the refusal the window was hot for"
-    );
-    let answered: Vec<i64> = rig
+
+    // Which call an outcome answers is asked of the library's own pairing,
+    // never read off the raw payload: one walk of the ledger, and both calls
+    // answered through the reading a consumer has.
+    let after_the_turn = rig
         .o
         .ctx
         .store
         .list_blocks(rig.o.ctx.conversation_id)
         .await
-        .unwrap()
+        .unwrap();
+    let outcome = |call_block_id: i64| {
+        let block = after_the_turn
+            .iter()
+            .find(|block| block.id == call_block_id)
+            .expect("the ledger holds the call");
+        let BlockKind::ToolCall(call) = BlockKind::from_block(block) else {
+            panic!("expected a tool call");
+        };
+        call.outcome_in(&after_the_turn)
+    };
+    assert!(
+        matches!(
+            outcome(second),
+            Some(CallOutcome::Error(error))
+                if error.error == crate::agency::ToolError::rate_limit_refusal(1, 60)
+        ),
+        "the call that waited carries the refusal the window was hot for"
+    );
+    assert!(
+        matches!(outcome(first), Some(CallOutcome::Result(_))),
+        "and the first call keeps its own result"
+    );
+
+    // The refusal was written ONCE. Reading a call's outcome finds the first
+    // block that answers it, so a second refusal written on the re-drive would
+    // hide behind the first; counting every error in the conversation is what
+    // sees it. Read through the kind, never off the payload.
+    let errors: Vec<Option<i64>> = after_the_turn
         .iter()
-        .filter(|block| block.block_type == "tool_error")
-        .map(|block| block.fields["source_block_id"].as_i64().unwrap())
+        .filter_map(|block| match BlockKind::from_block(block) {
+            BlockKind::ToolError(error) => Some(error.call_block_id),
+            _ => None,
+        })
         .collect();
     assert_eq!(
-        answered,
-        vec![second],
-        "and it answers the call that waited"
+        errors,
+        vec![Some(second)],
+        "one tool error in the whole conversation, and it answers the call that waited"
     );
 }

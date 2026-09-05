@@ -789,17 +789,35 @@ fn optional_string_field(block: &Block, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// An integer payload field, or 0 when the payload does not carry it.
+/// An id-valued payload field: the row it names, or `None` when it names none.
 ///
-/// 0 is the same kind of sentinel [`string_field`]'s empty string is: no row
-/// has id 0, so a predicate keyed on a parsed row id rejects it rather than
-/// letting two absent ids match each other.
-fn i64_field(block: &Block, key: &str) -> i64 {
-    block
-        .fields
-        .get(key)
-        .and_then(Value::as_i64)
-        .unwrap_or_default()
+/// The read for every id the agency kinds carry, and the one place the rule
+/// lives for them; the one id read outside it is the quote reader in the store's
+/// block loading, which reads a quote's start and end block ids its own way. An
+/// absent field, a field that is not an integer, and any value that is not
+/// positive all answer `None`, because no row is numbered 0 or less. A payload
+/// naming nothing therefore matches no row, where an absent field read as a
+/// number would let two such payloads pair up on the same 0. The store
+/// constrains its own writes, but these fields are parsed out of JSON, which
+/// may come from anywhere, so the reading has to answer for rows the store
+/// never wrote.
+///
+/// An absent field is the ordinary shape and passes in silence. A field that is
+/// there and holds something no row can be numbered is a producer writing
+/// garbage, so it is recorded with the block, the field and the value found
+/// before the answer comes back the same `None`.
+fn id_field(block: &Block, key: &str) -> Option<i64> {
+    let value = block.fields.get(key)?;
+    let id = value.as_i64().filter(|id| *id > 0);
+    if id.is_none() {
+        tracing::warn!(
+            block_id = block.id,
+            field = key,
+            value = %value,
+            "a block payload's id field holds a value that names no row"
+        );
+    }
+    id
 }
 
 #[cfg(test)]

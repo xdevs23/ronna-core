@@ -27,15 +27,9 @@ pub struct ToolResult {
     pub tool_call_id: String,
     /// The ledger row of the call this answers — the call's one identity, and
     /// what every reader pairs on (2026-09-02). Read off the resolution row's
-    /// own `source_block_id`, which the store has written since the column
-    /// shipped and refuses to leave unnamed.
-    ///
-    /// Plain, not optional, and that IS the reading of an unnamed row:
-    /// every writer names the call, the store refuses a resolution that names
-    /// none — at the write and at the upgrade that states the rule — and no
-    /// reader carries a branch for a row that cannot exist. A payload with no
-    /// field at all, a block built outside the store, reads 0.
-    pub call_block_id: i64,
+    /// own `source_block_id` through the crate's `id_field`, which answers
+    /// `None` for a payload naming no call.
+    pub call_block_id: Option<i64>,
     /// What the tool returned.
     pub content: String,
     /// Stamped on the block at the resolution write from the handler's own
@@ -58,7 +52,7 @@ impl super::LeafKind for ToolResult {
     fn parse(block: &Block) -> Self {
         Self {
             tool_call_id: super::string_field(block, "tool_call_id"),
-            call_block_id: super::i64_field(block, "source_block_id"),
+            call_block_id: super::id_field(block, "source_block_id"),
             content: super::string_field(block, "content"),
             ends_turn: block
                 .fields

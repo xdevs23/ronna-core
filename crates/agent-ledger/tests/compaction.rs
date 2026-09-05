@@ -412,7 +412,7 @@ async fn a_consumer_opens_the_thread_the_summary_carries() {
     );
     assert_eq!(
         AncestorReference::parse(&blocks[1]).conversation_id,
-        source,
+        Some(source),
         "the ancestry rides a column of the block's own row"
     );
     assert_eq!(
@@ -458,7 +458,7 @@ async fn a_consumer_opens_the_thread_the_summary_carries() {
     let blocks = store.list_blocks(thread).await.unwrap();
     assert_eq!(
         AncestorReference::parse(&blocks[1]).conversation_id,
-        source,
+        Some(source),
         "the record survives the conversation it names"
     );
 }

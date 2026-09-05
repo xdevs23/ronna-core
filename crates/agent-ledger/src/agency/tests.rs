@@ -494,6 +494,98 @@ async fn unrelated_result_never_settles_a_call() {
     assert_wakeup(&mut rig.rx, rig.ctx.conversation_id, block_id);
 }
 
+/// A result that names no call must not pair up with a call that has no row
+/// of its own.
+///
+/// The store refuses to write a resolution naming nothing, so these blocks are
+/// built by hand: the pairing reads PARSED JSON, and it has to answer for
+/// payloads the store never wrote. The call carries an ordinary row id; the
+/// result side's id is absent from the payload, and the one id read answers
+/// nothing for it. Every reading is asserted — the resolution predicate, the
+/// public outcome, and the ordering fold — because all three pair through that
+/// read and a reading left out is a reading free to drift.
+#[test]
+fn a_result_naming_no_call_settles_nothing() {
+    let mut call_block = bare_block("tool_call", Some(Role::Assistant));
+    call_block.id = 1;
+    let mut result_block = bare_block("tool_result", None);
+    result_block.id = 2;
+    let mut later_call_block = bare_block("tool_call", Some(Role::Assistant));
+    later_call_block.id = 3;
+    let ledger = vec![
+        call_block.clone(),
+        result_block.clone(),
+        later_call_block.clone(),
+    ];
+
+    let BlockKind::ToolResult(result) = BlockKind::from_block(&result_block) else {
+        panic!("expected a tool result");
+    };
+    assert_eq!(
+        result.call_block_id, None,
+        "the payload names no call, so the id read answers none"
+    );
+    let BlockKind::ToolCall(call) = BlockKind::from_block(&call_block) else {
+        panic!("expected a tool call");
+    };
+    assert!(
+        !call.resolved_in(&ledger),
+        "a result naming no call settles nothing"
+    );
+    assert!(
+        call.outcome_in(&ledger).is_none(),
+        "and the outcome reading answers the same, off the same comparison"
+    );
+
+    let BlockKind::ToolCall(later) = BlockKind::from_block(&later_call_block) else {
+        panic!("expected a tool call");
+    };
+    assert_eq!(
+        ToolCall::earlier_unresolved_call(&ledger, &later, &|_| true),
+        Some(call_block.id),
+        "the ordering fold reads the same call as unresolved, never as answered"
+    );
+}
+
+/// A field that is there and holds something no row can be numbered is a
+/// producer writing garbage, and the read says so once. An absent field is the
+/// ordinary shape and passes in silence, and so does a real id.
+#[test]
+fn an_unusable_id_is_recorded_only_where_the_field_is_there() {
+    use crate::providers::empty::capture::recorded;
+
+    let mut block = bare_block("tool_result", None);
+    let absent = recorded(|| assert_eq!(id_field(&block, "source_block_id"), None));
+    assert!(
+        absent.is_empty(),
+        "an absent field records nothing: {absent:?}"
+    );
+
+    block
+        .fields
+        .insert("source_block_id".into(), serde_json::Value::from(7));
+    let usable = recorded(|| assert_eq!(id_field(&block, "source_block_id"), Some(7)));
+    assert!(usable.is_empty(), "a real id records nothing: {usable:?}");
+
+    for unusable in [
+        serde_json::Value::from("7"),
+        serde_json::Value::from(0),
+        serde_json::Value::from(-1),
+        serde_json::Value::Null,
+    ] {
+        block
+            .fields
+            .insert("source_block_id".into(), unusable.clone());
+        let lines = recorded(|| assert_eq!(id_field(&block, "source_block_id"), None));
+        assert_eq!(lines.len(), 1, "{unusable} is recorded once: {lines:?}");
+        assert!(
+            lines[0].starts_with("WARN"),
+            "and recorded as a warning: {:?}",
+            lines[0]
+        );
+    }
+}
+
 /// A result already on the ledger BEFORE the call — an earlier call sharing
 /// the same provider id, already resolved — must not settle the later call:
 /// the result names the earlier call's own row, and the echo the two share

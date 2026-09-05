@@ -474,7 +474,8 @@ impl<K: RuntimeKind, E: RuntimeEvent> ToolRunner<K, E> {
     ///    ([`ResolvedTools`]), which is the very same resolution the dispatch
     ///    offered the turn from. Resolving is not yet deciding: the set is
     ///    read here because step 4 asks it what runs in order, and what a name
-    ///    the set does not carry gets is step 5's answer.
+    ///    the set does not carry gets is step 6's error — unless a window is
+    ///    hot, in which case step 5 answers first with its refusal.
     /// 4. **Does an earlier call of this conversation have to act first?**
     ///    For a tool that [`runs_in_order`](ToolHandler::runs_in_order), an
     ///    earlier unresolved call of any in-order tool parks this one: the

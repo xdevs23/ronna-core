@@ -442,8 +442,8 @@ const MIGRATIONS: &[&str] = &[
     // a model's tool_call_id can repeat and the block id cannot, and a
     // resolution naming nothing would answer for no call while looking like an
     // outcome. The rule moves to where the rows are written: the wrong shape
-    // fails loudly the first time anyone builds it, and every reader is spared
-    // a branch for a row that cannot exist.
+    // fails loudly the first time anyone builds it, instead of being avoided
+    // by whoever happens to be writing.
     //
     // Two triggers instead of a rebuilt table with NOT NULL columns: the
     // rebuild would have to drop and recreate two tables that other rows point
@@ -452,17 +452,24 @@ const MIGRATIONS: &[&str] = &[
     // edit to v1's CREATE TABLE, for the reason v3 records.
     //
     // The step ALSO reads the rows already stored, and fails before it creates
-    // either trigger when one of them names no call. A rule that only refuses
-    // new rows would let such a database upgrade quietly and then break at the
-    // first read of that whole conversation, far from the cause. Failing here
-    // names the case while the database is still the one that has it, and
-    // leaves user_version below 9, so the step runs again once the rows are
-    // repaired.
+    // either trigger when one of them names no call. The two triggers state a
+    // rule for every row of the two tables, and a rule that held for new rows
+    // only would be no rule: every reader that pairs a stored resolution with
+    // the call it names relies on this step having read the old rows once. The
+    // failure leaves user_version below 9, so the step runs again on the next
+    // open.
     //
     // The check is SQL, like every other step: RAISE is legal only inside a
     // trigger body, so one insert into a temporary table fires a temporary
     // trigger that aborts the batch with the sentence. The temporary pair is
     // this step's own and both halves go at the end of it.
+    //
+    // The abort stops the batch before those two drops run, so the temporary
+    // pair survives in the temp schema. Both halves are created only if they
+    // are not there and the trigger reads the two stored tables again on every
+    // insert, so the step run a second time on the same connection aborts again
+    // while a stored resolution still names no call, and drops the pair on the
+    // run where none does.
     "
     CREATE TEMP TABLE IF NOT EXISTS v9_stored_resolutions_name_their_calls (checked INTEGER);
 
@@ -471,7 +478,7 @@ const MIGRATIONS: &[&str] = &[
      BEGIN
          SELECT RAISE(
              ABORT,
-             'a stored tool result or tool error names no call block: repair every block_tool_result and block_tool_error row whose source_block_id is NULL, then reopen'
+             'a stored tool result or tool error names no call block, and the store does not upgrade while one exists: list them with SELECT block_id FROM block_tool_result WHERE source_block_id IS NULL and the same on block_tool_error'
          )
          WHERE EXISTS (SELECT 1 FROM block_tool_result WHERE source_block_id IS NULL)
             OR EXISTS (SELECT 1 FROM block_tool_error  WHERE source_block_id IS NULL);
@@ -1031,10 +1038,12 @@ mod tests {
     }
 
     /// v9 on a store that already HOLDS the shape the rule forbids: the step
-    /// fails, saying which rows to repair, and the counter stays where it was
-    /// so the upgrade runs again after the repair. A step that refused new
-    /// rows only would leave this database reading as upgraded and break at the
-    /// first read of the conversation carrying that row.
+    /// fails, naming the case and the query that lists the rows, and the
+    /// counter stays where it was so the upgrade runs again on the next open.
+    /// The row breaks no read — the pairing answers no call for an absent id —
+    /// so nothing later would fail on it, and the upgrade is the earliest
+    /// moment a database this code never wrote can be named at all, while it
+    /// is still the database in front of the operator.
     #[test]
     fn a_stored_resolution_naming_no_call_fails_the_v9_step() {
         for (kind, table, column) in [

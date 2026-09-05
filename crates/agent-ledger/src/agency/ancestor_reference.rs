@@ -21,10 +21,9 @@ use super::projection::Projection;
 /// from must survive that rather than cascade with it.
 #[derive(Debug, Clone)]
 pub struct AncestorReference {
-    /// The conversation this thread continues. 0 is the absent sentinel —
-    /// no conversation carries that id — so a row whose column did not read
-    /// back names nothing rather than naming row zero.
-    pub conversation_id: i64,
+    /// The conversation this thread continues, read through the crate's
+    /// `id_field`, which answers `None` for a row that names none.
+    pub conversation_id: Option<i64>,
 }
 
 impl super::LeafKind for AncestorReference {
@@ -32,7 +31,7 @@ impl super::LeafKind for AncestorReference {
 
     fn parse(block: &Block) -> Self {
         Self {
-            conversation_id: super::i64_field(block, "ancestor_conversation_id"),
+            conversation_id: super::id_field(block, "ancestor_conversation_id"),
         }
     }
 }

@@ -103,6 +103,14 @@ impl ToolCall {
     /// keeps the answer where the call is this one. Every reading below walks
     /// the ledger through here, so the yes-or-no, the position and the outcome
     /// come from one comparison and one classification.
+    ///
+    /// Keyed on this call's own ROW id, which no parse can invent — the same
+    /// shape [`ApprovalRequest::decision_in`](super::ApprovalRequest::decision_in)
+    /// states for its own id-keyed reading. A resolution naming no call is
+    /// already out: [`answered_call`] reads its id through the crate's
+    /// `id_field` and hands back nothing at all, so an unrelated failure can
+    /// never settle a call it does not answer, whatever id the call itself was
+    /// built with.
     fn answered_by(&self, block: &Block) -> Option<CallOutcome> {
         answered_call(block).and_then(|(named, outcome)| (named == self.id).then_some(outcome))
     }
@@ -476,18 +484,52 @@ pub enum CallOutcome {
 
 /// What one block answers, and for which call: the ledger row a tool outcome
 /// names paired with the outcome itself, or `None` for every block that is not
-/// a tool outcome.
+/// a tool outcome and for one that names no call.
 ///
 /// THE pairing read (2026-09-02). Every question about whether a call is
 /// answered — the resolution predicate, the position the cut needs, the public
 /// outcome reading, the ordering fold — comes through here, so a call and its
-/// outcome are paired in exactly one place, and the classification that says
-/// result-or-error happens once for a row instead of once per reader. The
-/// kinds are read through [`BlockKind`], like every other outcome decision.
+/// outcome are paired in exactly one place: every one of those readings takes
+/// its comparison and its result-or-error classification from this one
+/// function, and so they cannot drift apart. That includes the nameless
+/// payload, whose id the outcome kinds read through the crate's `id_field`: it
+/// answers no call here, and therefore answers none in any of them. The kinds
+/// are read through [`BlockKind`], like every other outcome decision.
 fn answered_call(block: &Block) -> Option<(i64, CallOutcome)> {
     match BlockKind::from_block(block) {
-        BlockKind::ToolResult(result) => Some((result.call_block_id, CallOutcome::Result(result))),
-        BlockKind::ToolError(error) => Some((error.call_block_id, CallOutcome::Error(error))),
+        BlockKind::ToolResult(result) => {
+            let named = result.call_block_id?;
+            Some((named, CallOutcome::Result(result)))
+        }
+        BlockKind::ToolError(error) => {
+            let named = error.call_block_id?;
+            Some((named, CallOutcome::Error(error)))
+        }
+        _ => None,
+    }
+}
+
+/// The unresolved call this id names: the id back while the row it names is a
+/// tool call still owing its body, and `None` for an id naming no row, a row
+/// that is not a call, and a call whose outcome already sits in the ledger.
+///
+/// The tail both approval kinds' routing ends on (2026-09-03), written once so
+/// the two cannot answer differently. Id-keyed and position-aware: the route
+/// stays open only while the covered call itself is unresolved, so an unrelated
+/// result appended later can never close it and the call's own result closes it
+/// for good — that IS what keeps the redispatch walk idempotent, and without it
+/// the walk re-executes an already-answered call on every tick. An id read as
+/// `None` names nothing and there is no row to look up, which is how a payload
+/// naming no call routes nowhere.
+///
+/// Resolution is answered through [`ToolCall::resolved_in`], THE resolution
+/// predicate, and the row is read through [`BlockKind`], like every other
+/// decision about what a block is.
+pub(super) fn unresolved_call_named(ledger: &[Block], id: Option<i64>) -> Option<i64> {
+    let named = id?;
+    let call_block = ledger.iter().find(|block| block.id == named)?;
+    match BlockKind::from_block(call_block) {
+        BlockKind::ToolCall(call) if !call.resolved_in(ledger) => Some(named),
         _ => None,
     }
 }

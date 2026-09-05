@@ -6,6 +6,7 @@ use crate::block::Block;
 use crate::types::{ApprovalChoice, Awaiting};
 
 use super::projection::Projection;
+use super::tool_call::unresolved_call_named;
 use super::{Agency, BlockKind, FromBlock};
 
 /// The human's verdict on an approval request.
@@ -18,8 +19,9 @@ use super::{Agency, BlockKind, FromBlock};
 pub struct ApprovalDecision {
     /// The ledger row this decision is.
     pub id: i64,
-    /// The request this decision answers.
-    pub for_block_id: i64,
+    /// The request this decision answers, read through the crate's `id_field`,
+    /// which answers `None` for a decision that names none.
+    pub for_block_id: Option<i64>,
     /// Whether the verdict was approval.
     pub approved: bool,
 }
@@ -30,7 +32,7 @@ impl super::LeafKind for ApprovalDecision {
     fn parse(block: &Block) -> Self {
         Self {
             id: block.id,
-            for_block_id: super::i64_field(block, "for_block_id"),
+            for_block_id: super::id_field(block, "for_block_id"),
             approved: block.fields.get("decision").and_then(Value::as_str)
                 == Some(ApprovalChoice::Approved.as_str()),
         }
@@ -46,25 +48,17 @@ impl Agency for ApprovalDecision {
         if !self.approved {
             return None;
         }
-        // Parsed ids are matched against ROW ids only, and no row is numbered
-        // 0, so a decision naming no request routes nowhere instead of
-        // pairing with another id-less block.
-        if self.for_block_id <= 0 {
-            return None;
-        }
-        let request_block = ledger.iter().find(|block| block.id == self.for_block_id)?;
+        // A decision naming no request routes nowhere, and neither does a
+        // request naming no call: the id read answers `None` for both.
+        let answered = self.for_block_id?;
+        let request_block = ledger.iter().find(|block| block.id == answered)?;
         let BlockKind::ApprovalRequest(request) = BlockKind::from_block(request_block) else {
             return None;
         };
-        // The same id-keyed, position-aware discipline as the request's own
-        // routing: once the underlying call's result exists, nothing is owed.
-        let call_block = ledger
-            .iter()
-            .find(|block| block.id == request.for_block_id)?;
-        match BlockKind::from_block(call_block) {
-            BlockKind::ToolCall(call) if !call.resolved_in(ledger) => Some(self.for_block_id),
-            _ => None,
-        }
+        // The route runs to the request, which routes on to the call, so it
+        // stays open on the same terms the request's own routing reads: once
+        // the underlying call's outcome exists, nothing is owed.
+        unresolved_call_named(ledger, request.for_block_id).map(|_| answered)
     }
 }
 
