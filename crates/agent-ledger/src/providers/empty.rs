@@ -116,7 +116,10 @@ fn is_empty(role: MessageRole, text: &str) -> bool {
 /// dependency is added for it.
 #[cfg(test)]
 pub(crate) mod capture {
+    use std::fmt::Write;
     use std::sync::{Arc, Mutex};
+
+    use tracing::instrument::WithSubscriber;
 
     use tracing::field::{Field, Visit};
     use tracing::{Event, Metadata, Subscriber, span};
@@ -158,14 +161,16 @@ pub(crate) mod capture {
         fn exit(&self, _span: &span::Id) {}
     }
 
-    /// An event's own `message` field — the line a reader sees. Named for the
-    /// field it reads, not for the layer's own word for a chat message.
+    /// The message and its diagnostic fields, as a log reader sees them.
     struct MessageField(String);
 
     impl Visit for MessageField {
         fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
             if field.name() == "message" {
-                self.0 = format!("{value:?}");
+                write!(self.0, "{value:?}").expect("writing to a string succeeds");
+            } else {
+                write!(self.0, " {}={value:?}", field.name())
+                    .expect("writing to a string succeeds");
             }
         }
     }
@@ -176,6 +181,14 @@ pub(crate) mod capture {
         let recorder = Recorder::default();
         tracing::subscriber::with_default(recorder.clone(), work);
         recorder.lines()
+    }
+
+    pub(crate) async fn recorded_future<T>(
+        work: impl std::future::Future<Output = T>,
+    ) -> (T, Vec<String>) {
+        let recorder = Recorder::default();
+        let result = work.with_subscriber(recorder.clone()).await;
+        (result, recorder.lines())
     }
 }
 

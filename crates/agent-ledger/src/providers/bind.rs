@@ -196,7 +196,7 @@ async fn pump_stream(
                         return PumpOutcome::RateLimited { retry_after_secs: *retry_after_secs };
                     }
                     if e.is_recoverable() {
-                        warn!(error = %e, "recoverable mid-stream error — reconnecting");
+                        warn!(error = ?e, "recoverable mid-stream error — reconnecting");
                         return PumpOutcome::Recoverable(e);
                     }
                     return PumpOutcome::Terminal(e);

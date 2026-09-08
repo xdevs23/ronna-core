@@ -60,6 +60,28 @@ async fn drive(
     out
 }
 
+#[tokio::test]
+async fn reconnect_log_keeps_the_http_errors_source() {
+    let error = crate::providers::http::client()
+        .get("not-an-absolute-url")
+        .build()
+        .expect_err("a relative URL cannot build a request");
+    let mut events: EventStream = Box::pin(stream::iter([Err(LlmError::Http(error))]));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (outcome, lines) = crate::providers::empty::capture::recorded_future(pump_stream(
+        &mut events,
+        &tx,
+        &CancellationToken::new(),
+    ))
+    .await;
+    assert!(matches!(outcome, PumpOutcome::Recoverable(_)));
+    let line = lines
+        .iter()
+        .find(|line| line.contains("recoverable mid-stream error"))
+        .expect("the reconnect is logged");
+    assert!(line.contains("source: RelativeUrlWithoutBase"), "{line}");
+}
+
 fn is_status(resp: &ProviderResponse, needle: &str) -> bool {
     matches!(resp, ProviderResponse::Event(StreamEvent::ProviderStatus { label }) if label.contains(needle))
 }

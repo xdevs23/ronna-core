@@ -171,7 +171,7 @@ async fn connect(
         .json(body)
         .send()
         .await
-        .inspect_err(|e| warn!(error = %e, "chat stream failed"))?;
+        .inspect_err(|e| warn!(error = ?e, timeout = e.is_timeout(), "chat stream failed"))?;
 
     if response.status().is_success() {
         return Ok(response);
@@ -261,4 +261,44 @@ pub(super) fn open_stream(
             }
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::empty::capture::recorded_future;
+
+    #[tokio::test]
+    async fn request_failure_logs_its_source_without_the_key_or_body() {
+        let body = WireRequest {
+            model: "test-model-not-for-logs".into(),
+            max_tokens: None,
+            messages: Vec::new(),
+            tools: None,
+            temperature: None,
+            stream: true,
+            stream_options: None,
+            reasoning_effort: None,
+        };
+        // A relative URL fails before any connection is attempted.
+        let (result, lines) = recorded_future(connect(
+            &http::streaming_client(),
+            "not-an-absolute-url",
+            "test-key-not-for-logs",
+            HeaderMap::new(),
+            &body,
+        ))
+        .await;
+        let error = result.expect_err("the relative URL is rejected");
+        assert!(!error.to_string().contains("RelativeUrlWithoutBase"));
+        let line = lines
+            .iter()
+            .find(|line| line.contains("chat stream failed"))
+            .expect("the failure is logged");
+        assert!(line.contains("source: RelativeUrlWithoutBase"), "{line}");
+        assert!(line.contains("timeout=false"), "{line}");
+        for secret in ["test-key-not-for-logs", "test-model-not-for-logs"] {
+            assert!(lines.iter().all(|line| !line.contains(secret)));
+        }
+    }
 }
