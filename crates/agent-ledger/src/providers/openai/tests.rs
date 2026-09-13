@@ -14,6 +14,41 @@ use crate::providers::types::{StopReason, StreamEvent, ToolDefinition};
 mod request_goldens {
     use super::*;
 
+    /// A schema goes out as this dialect's `text.format`, strict and under
+    /// the fixed name; a request without one carries no `text` field.
+    #[test]
+    fn a_schema_is_sent_as_the_text_format() {
+        let schema = json!({ "type": "object", "additionalProperties": false, "properties": {}, "required": [] });
+        let mut request = CompletionRequest {
+            model: "gpt-test".into(),
+            messages: vec![Message {
+                role: MessageRole::User,
+                content: MessageContent::Text("hello".into()),
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: true,
+            reasoning: None,
+            response_schema: None,
+        };
+        let plain = serde_json::to_value(
+            OpenAiResponsesProvider::build_request_body(&request, true, true).0,
+        )
+        .expect("the request serializes");
+        assert!(plain.get("text").is_none());
+
+        request.response_schema = Some(schema.clone());
+        let body = serde_json::to_value(
+            OpenAiResponsesProvider::build_request_body(&request, true, true).0,
+        )
+        .expect("the request serializes");
+        assert_eq!(
+            body["text"],
+            json!({ "format": { "type": "json_schema", "name": "response", "strict": true, "schema": schema } })
+        );
+    }
+
     fn block(id: i64, role: Option<Role>, ty: &str, fields: &[(&str, &str)]) -> Block {
         let mut m = serde_json::Map::new();
         for (k, v) in fields {
@@ -82,6 +117,7 @@ mod request_goldens {
             temperature: None,
             stream: true,
             reasoning,
+            response_schema: None,
         };
         serde_json::to_value(OpenAiResponsesProvider::build_request_body(&request, true, true).0)
             .expect("the body serializes")
@@ -1227,6 +1263,7 @@ mod empty_assistant_content {
             temperature: None,
             stream: true,
             reasoning: None,
+            response_schema: None,
         };
 
         let err = OpenAiResponsesProvider::new("test-key".into(), None)

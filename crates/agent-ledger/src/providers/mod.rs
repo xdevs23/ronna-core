@@ -94,7 +94,7 @@ pub mod openai;
 #[cfg(feature = "openrouter")]
 pub mod openrouter;
 
-pub use bind::{OpenedTurn, run_http_bind_loop, run_http_bind_loop_with_replay};
+pub use bind::{OpenedTurn, TurnRequest, run_http_bind_loop, run_http_bind_loop_with_replay};
 pub use registry::ProviderRegistry;
 pub use render::{blocks_to_messages, render_blocks_to_text, render_conversation};
 pub use types::{

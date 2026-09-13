@@ -19,6 +19,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use futures::StreamExt;
+use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -219,25 +220,18 @@ pub async fn run_http_bind_loop<F, Fut>(
     resp_tx: UnboundedSender<ProviderResponse>,
     open_stream: F,
 ) where
-    F: Fn(Vec<Message>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>) -> Fut
-        + Send
-        + Sync
-        + 'static,
+    F: Fn(TurnRequest) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<EventStream, LlmError>> + Send + 'static,
 {
-    run_http_bind_loop_with_replay(
-        req_rx,
-        resp_tx,
-        move |messages, model, tools, reasoning, _include_reasoning_payloads| {
-            let events = open_stream(messages, model, tools, reasoning);
-            async move {
-                Ok(OpenedTurn {
-                    events: events.await?,
-                    carried_payloads: false,
-                })
-            }
-        },
-    )
+    run_http_bind_loop_with_replay(req_rx, resp_tx, move |turn, _include_reasoning_payloads| {
+        let events = open_stream(turn);
+        async move {
+            Ok(OpenedTurn {
+                events: events.await?,
+                carried_payloads: false,
+            })
+        }
+    })
     .await;
 }
 
@@ -258,10 +252,7 @@ pub async fn run_http_bind_loop_with_replay<F, Fut>(
     resp_tx: UnboundedSender<ProviderResponse>,
     open_stream: F,
 ) where
-    F: Fn(Vec<Message>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>, bool) -> Fut
-        + Send
-        + Sync
-        + 'static,
+    F: Fn(TurnRequest, bool) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<OpenedTurn, LlmError>> + Send + 'static,
 {
     let open_stream = std::sync::Arc::new(open_stream);
@@ -274,6 +265,7 @@ pub async fn run_http_bind_loop_with_replay<F, Fut>(
                 model,
                 tools,
                 reasoning,
+                response_schema,
             } => {
                 if let Some(token) = active.take() {
                     token.cancel();
@@ -294,6 +286,7 @@ pub async fn run_http_bind_loop_with_replay<F, Fut>(
                         model,
                         tools,
                         reasoning,
+                        response_schema,
                     },
                 ));
             }
@@ -321,12 +314,20 @@ pub async fn run_http_bind_loop_with_replay<F, Fut>(
 
 /// One turn's inputs, kept together because every re-open of the SAME turn must
 /// use the SAME ones — a reconnect that rebuilt them from anything live would
-/// silently change the request mid-turn.
-struct TurnRequest {
-    messages: Vec<Message>,
-    model: ModelSelector,
-    tools: Vec<ToolDefinition>,
-    reasoning: Option<ReasoningLevel>,
+/// silently change the request mid-turn. A vendor's opener receives one of
+/// these per attempt and builds its wire request from it.
+#[derive(Debug, Clone)]
+pub struct TurnRequest {
+    /// The conversation so far, already projected into neutral messages.
+    pub messages: Vec<Message>,
+    /// Which model.
+    pub model: ModelSelector,
+    /// The tools this turn may call.
+    pub tools: Vec<ToolDefinition>,
+    /// The selected reasoning level, or `None` to defer.
+    pub reasoning: Option<ReasoningLevel>,
+    /// The JSON Schema the answer must satisfy, or `None` for text.
+    pub response_schema: Option<Value>,
 }
 
 /// Drive one turn end to end: open the stream, retrying rate limits; pump it;
@@ -373,9 +374,7 @@ async fn run_stream_cycle<F, Fut>(
     token: CancellationToken,
     turn: TurnRequest,
 ) where
-    F: Fn(Vec<Message>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>, bool) -> Fut
-        + Send
-        + Sync,
+    F: Fn(TurnRequest, bool) -> Fut + Send + Sync,
     Fut: Future<Output = Result<OpenedTurn, LlmError>> + Send,
 {
     // Counts recoverable mid-stream reconnects across the whole turn.
@@ -565,20 +564,11 @@ async fn open_with_rate_limit_retry<F, Fut>(
     budget: &mut RateLimitBudget,
 ) -> Option<Result<OpenedTurn, LlmError>>
 where
-    F: Fn(Vec<Message>, ModelSelector, Vec<ToolDefinition>, Option<ReasoningLevel>, bool) -> Fut
-        + Send
-        + Sync,
+    F: Fn(TurnRequest, bool) -> Fut + Send + Sync,
     Fut: Future<Output = Result<OpenedTurn, LlmError>> + Send,
 {
     loop {
-        let opened = open_stream(
-            turn.messages.clone(),
-            turn.model.clone(),
-            turn.tools.clone(),
-            turn.reasoning,
-            include_payloads,
-        )
-        .await;
+        let opened = open_stream(turn.clone(), include_payloads).await;
 
         let Err(LlmError::RateLimited { retry_after_secs }) = opened else {
             return Some(opened);

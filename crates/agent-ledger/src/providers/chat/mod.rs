@@ -35,7 +35,7 @@ pub(crate) use base::{
 pub(crate) use sse::{SseState, decode_string_content};
 #[cfg(feature = "_chat")]
 #[allow(unused_imports)]
-pub(crate) use wire::{WireMessageContent, WireModel};
+pub(crate) use wire::{WireMessageContent, WireModel, json_schema_response_format};
 
 #[cfg(all(test, feature = "_chat"))]
 mod tests;

@@ -32,6 +32,16 @@ pub(super) struct ResponsesRequest {
     pub(super) reasoning: Option<ReasoningParam>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) include: Option<Vec<&'static str>>,
+    /// The answer's schema, in this dialect's `text.format` envelope; absent
+    /// for text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) text: Option<ResponsesText>,
+}
+
+/// The text-output settings, of which this library sets only the format.
+#[derive(Serialize)]
+pub(super) struct ResponsesText {
+    pub(super) format: Value,
 }
 
 #[derive(Serialize)]

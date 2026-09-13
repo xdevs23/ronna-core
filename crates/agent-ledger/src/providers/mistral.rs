@@ -31,7 +31,7 @@ use super::types::{
     CompletionRequest, LlmError, ModelInfo, ModelSelector, OpaquePayload, ProviderRx, ProviderTx,
     ReasoningCapability, ReasoningLevel, StreamEvent,
 };
-use super::{BoxFuture, ProviderModule};
+use super::{BoxFuture, ProviderModule, TurnRequest};
 
 const MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
 
@@ -312,20 +312,21 @@ impl ProviderModule for MistralModule {
         tokio::spawn(bind::run_http_bind_loop_with_replay(
             req_rx,
             resp_tx,
-            move |messages, selector, tools, reasoning, include_reasoning_payloads| {
-                let model = match selector {
+            move |turn: TurnRequest, include_reasoning_payloads| {
+                let model = match turn.model {
                     ModelSelector::Specific(m) => m,
                     ModelSelector::Lightweight { .. } => LIGHTWEIGHT_MODEL.into(),
                 };
                 let provider = mistral_provider(api_key.clone(), base_url.clone());
                 let request = CompletionRequest {
                     model,
-                    messages,
-                    tools,
+                    messages: turn.messages,
+                    tools: turn.tools,
                     max_tokens: None,
                     temperature: None,
                     stream: true,
-                    reasoning,
+                    reasoning: turn.reasoning,
+                    response_schema: turn.response_schema,
                 };
                 async move {
                     provider

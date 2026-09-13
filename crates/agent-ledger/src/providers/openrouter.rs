@@ -21,10 +21,10 @@ use super::bind;
 use super::chat::{ChatProvider, WireModel, provider_from_config};
 use super::http_store::{HttpProviderConfig, HttpProviderStore};
 use super::types::{
-    CompletionRequest, LlmError, Message, ModelInfo, ModelSelector, ProviderRx, ProviderTx,
-    ReasoningCapability, ReasoningLevel, ToolDefinition,
+    CompletionRequest, LlmError, ModelInfo, ModelSelector, ProviderRx, ProviderTx,
+    ReasoningCapability, ReasoningLevel,
 };
-use super::{BoxFuture, ProviderModule};
+use super::{BoxFuture, ProviderModule, TurnRequest};
 
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
@@ -107,24 +107,19 @@ fn openrouter_reasoning(model: &WireModel) -> ReasoningCapability {
 /// spoken, and background work runs on the instance's configured
 /// [`background_model`] where there is one, otherwise on the request's own
 /// main model.
-fn turn_request(
-    selector: ModelSelector,
-    lightweight_model: Option<&str>,
-    messages: Vec<Message>,
-    tools: Vec<ToolDefinition>,
-    reasoning: Option<ReasoningLevel>,
-) -> CompletionRequest {
+fn turn_request(turn: TurnRequest, lightweight_model: Option<&str>) -> CompletionRequest {
     CompletionRequest {
-        model: match selector {
+        model: match turn.model {
             ModelSelector::Specific(model) => model,
             ModelSelector::Lightweight { main } => lightweight_model.map_or(main, str::to_string),
         },
-        messages,
-        tools,
+        messages: turn.messages,
+        tools: turn.tools,
         max_tokens: None,
         temperature: None,
         stream: true,
-        reasoning,
+        reasoning: turn.reasoning,
+        response_schema: turn.response_schema,
     }
 }
 
@@ -205,15 +200,9 @@ impl ProviderModule for OpenRouterModule {
         tokio::spawn(bind::run_http_bind_loop_with_replay(
             req_rx,
             resp_tx,
-            move |messages, selector, tools, reasoning, include_reasoning_payloads| {
+            move |turn, include_reasoning_payloads| {
                 let provider = openrouter_provider(api_key.clone(), base_url.clone());
-                let request = turn_request(
-                    selector,
-                    lightweight_model.as_deref(),
-                    messages,
-                    tools,
-                    reasoning,
-                );
+                let request = turn_request(turn, lightweight_model.as_deref());
                 async move {
                     provider
                         .open_turn(request, include_reasoning_payloads)

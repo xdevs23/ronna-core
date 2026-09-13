@@ -55,6 +55,14 @@ pub struct CompletionRequest {
     /// API parameter.
     #[serde(default)]
     pub reasoning: Option<ReasoningLevel>,
+    /// The JSON Schema the answer must satisfy, or `None` for ordinary text.
+    ///
+    /// The schema is the caller's document, passed through untouched: the
+    /// provider holds the model to it, and what comes back is the JSON the
+    /// caller reads. Each vendor's request builder puts it where that vendor's
+    /// API expects a schema.
+    #[serde(default)]
+    pub response_schema: Option<Value>,
 }
 
 /// One message as the model reads it: a voice and its content.
@@ -443,6 +451,8 @@ pub enum ProviderRequest {
         tools: Vec<ToolDefinition>,
         /// The selected reasoning level, or `None` to defer.
         reasoning: Option<ReasoningLevel>,
+        /// The JSON Schema the answer must satisfy, or `None` for text.
+        response_schema: Option<Value>,
     },
     /// Abandon the active stream.
     Interrupt,

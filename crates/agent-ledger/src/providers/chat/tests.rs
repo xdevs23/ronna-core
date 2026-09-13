@@ -662,7 +662,29 @@ mod usage_tests {
             temperature: None,
             stream: true,
             reasoning,
+            response_schema: None,
         }
+    }
+
+    /// A schema goes out as this dialect's strict `response_format`, under the
+    /// fixed name, with the caller's document untouched inside it; a request
+    /// without one carries no such field, so existing bodies are unchanged.
+    #[test]
+    fn a_schema_is_sent_as_a_strict_json_schema_response_format() {
+        let provider = plain_provider();
+        let schema = json!({ "type": "object", "properties": { "summary": { "type": "string" } }, "required": ["summary"], "additionalProperties": false });
+        let mut with_schema = request(None);
+        with_schema.response_schema = Some(schema.clone());
+        let body = serde_json::to_value(provider.build_request_body(&with_schema, true, true).0)
+            .expect("the request serializes");
+        assert_eq!(
+            body["response_format"],
+            json!({ "type": "json_schema", "json_schema": { "name": "response", "strict": true, "schema": schema } })
+        );
+
+        let plain = serde_json::to_value(provider.build_request_body(&request(None), true, true).0)
+            .expect("the request serializes");
+        assert!(plain.get("response_format").is_none());
     }
 
     /// Every streaming request opts into the terminal counts; a non-streaming
@@ -1358,6 +1380,7 @@ mod empty_assistant_content {
             temperature: None,
             stream: true,
             reasoning: None,
+            response_schema: None,
         };
 
         let err = refusing_provider()

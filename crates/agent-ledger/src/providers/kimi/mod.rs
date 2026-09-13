@@ -26,6 +26,7 @@ use tracing::{info, warn};
 use crate::store::{StoreError, StoreTx};
 
 use super::bind;
+use super::chat;
 use super::empty;
 use super::http;
 use super::types::{
@@ -126,6 +127,7 @@ impl KimiProvider {
         messages: &[Message],
         model: String,
         tools: &[ToolDefinition],
+        response_schema: Option<&Value>,
         stream: bool,
     ) -> WireRequest {
         let thinking_enabled = self
@@ -148,6 +150,9 @@ impl KimiProvider {
             prompt_cache_key: self.prompt_cache_key.clone(),
             thinking: self.thinking.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
+            // This endpoint speaks the chat-completions dialect, so the
+            // schema travels in that dialect's envelope.
+            response_format: response_schema.map(chat::json_schema_response_format),
         }
     }
 
@@ -208,8 +213,9 @@ impl KimiProvider {
         messages: &[Message],
         model: String,
         tools: &[ToolDefinition],
+        response_schema: Option<&Value>,
     ) -> Result<EventStream, LlmError> {
-        let body = self.build_request(messages, model, tools, true);
+        let body = self.build_request(messages, model, tools, response_schema, true);
         empty::refuse_if_no_message(body.messages.len())?;
 
         Ok(wire::open_stream(
@@ -593,37 +599,38 @@ impl ProviderModule for KimiModule {
         let (config_thinking, config_effort) = resolve_kimi_options(&config);
         let store = self.store.clone();
 
-        tokio::spawn(bind::run_http_bind_loop(
-            req_rx,
-            resp_tx,
-            move |messages, selector, tools, reasoning| {
-                let model = match selector {
-                    ModelSelector::Specific(m) => m,
-                    ModelSelector::Lightweight { .. } => LIGHTWEIGHT_MODEL.into(),
-                };
+        tokio::spawn(bind::run_http_bind_loop(req_rx, resp_tx, move |turn| {
+            let model = match turn.model {
+                ModelSelector::Specific(m) => m,
+                ModelSelector::Lightweight { .. } => LIGHTWEIGHT_MODEL.into(),
+            };
 
-                // The conversation's selected level overrides the instance's.
-                let (thinking, effort) = match reasoning {
-                    Some(level) => kimi_options_for_level(level),
-                    None => (config_thinking.clone(), config_effort.clone()),
-                };
-                let provider_id = provider_id.clone();
-                let store = store.clone();
-                let config = config.clone();
+            // The conversation's selected level overrides the instance's.
+            let (thinking, effort) = match turn.reasoning {
+                Some(level) => kimi_options_for_level(level),
+                None => (config_thinking.clone(), config_effort.clone()),
+            };
+            let provider_id = provider_id.clone();
+            let store = store.clone();
+            let config = config.clone();
 
-                async move {
-                    let token = refresh_and_persist(&store, &provider_id, &config).await?;
+            async move {
+                let token = refresh_and_persist(&store, &provider_id, &config).await?;
 
-                    let provider =
-                        KimiProvider::new(token, config["base_url"].as_str().map(String::from))
-                            .with_conversation_id(conversation_id)
-                            .with_thinking(thinking)
-                            .with_reasoning_effort(effort);
+                let provider =
+                    KimiProvider::new(token, config["base_url"].as_str().map(String::from))
+                        .with_conversation_id(conversation_id)
+                        .with_thinking(thinking)
+                        .with_reasoning_effort(effort);
 
-                    provider.stream_turn(&messages, model, &tools)
-                }
-            },
-        ));
+                provider.stream_turn(
+                    &turn.messages,
+                    model,
+                    &turn.tools,
+                    turn.response_schema.as_ref(),
+                )
+            }
+        }));
 
         (req_tx, resp_rx)
     }

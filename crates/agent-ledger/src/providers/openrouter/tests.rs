@@ -26,14 +26,17 @@ mod background_model_on_the_wire {
     fn wire_body(selector: ModelSelector, configured: Option<&str>) -> Value {
         let provider = openrouter_provider("test-key".into(), None);
         let request = turn_request(
-            selector,
+            TurnRequest {
+                model: selector,
+                messages: vec![Message {
+                    role: MessageRole::User,
+                    content: MessageContent::Text("hello".into()),
+                }],
+                tools: vec![],
+                reasoning: None,
+                response_schema: None,
+            },
             configured,
-            vec![Message {
-                role: MessageRole::User,
-                content: MessageContent::Text("hello".into()),
-            }],
-            vec![],
-            None,
         );
         let (body, _) = provider.build_request_body(&request, true, true);
         serde_json::to_value(&body).expect("the wire serializes")

@@ -498,6 +498,16 @@ const MIGRATIONS: &[&str] = &[
          SELECT RAISE(ABORT, 'a tool error names the call block it answers');
      END;
     ",
+    // v10 (2026-09-13): the shape a turn answers in, on the same record as
+    // the tools it is offered. A JSON Schema document, serialized like the
+    // names beside it; NULL is ordinary text, and every choice recorded
+    // before this step answered in text. The newest record speaks for both
+    // columns at once: an ordinary tool-choice append records no schema and
+    // so clears one, which is what keeps a schema from outliving the turn it
+    // was written for.
+    "
+    ALTER TABLE block_tool_choice ADD COLUMN response_schema TEXT;
+    ",
 ];
 
 /// Apply every unapplied step, advancing `user_version` as each is applied.
@@ -1050,7 +1060,7 @@ mod tests {
         let conn = migrated();
         assert_eq!(
             table_columns(&conn, "block_tool_choice"),
-            vec!["block_id", "names"]
+            vec!["block_id", "names", "response_schema"]
         );
 
         conn.execute_batch(
@@ -1071,6 +1081,54 @@ mod tests {
             recorded,
             vec!["[\"read\",\"write\"]".to_owned(), "[]".to_owned()]
         );
+    }
+
+    /// v10 — a store from before it gains the schema column in place: every
+    /// choice recorded before the step reads as prose (NULL), and a schema
+    /// writes through afterwards beside the names.
+    #[test]
+    fn a_populated_store_gains_the_response_schema_column_in_place() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for sql in &MIGRATIONS[..9] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 9).unwrap();
+        conn.execute_batch(
+            "INSERT INTO blocks (block_type) VALUES ('tool_choice');
+             INSERT INTO block_tool_choice (block_id, names) VALUES (1, '[]');",
+        )
+        .unwrap();
+        run(&mut conn).unwrap();
+        assert_eq!(
+            table_columns(&conn, "block_tool_choice"),
+            vec!["block_id", "names", "response_schema"]
+        );
+        let before: Option<String> = conn
+            .query_row(
+                "SELECT response_schema FROM block_tool_choice WHERE block_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, None,
+            "a choice from before the step answers in prose"
+        );
+        conn.execute_batch(
+            "INSERT INTO blocks (block_type) VALUES ('tool_choice');
+             INSERT INTO block_tool_choice (block_id, names, response_schema)
+             VALUES (2, '[]', '{\"type\":\"object\"}');",
+        )
+        .unwrap();
+        let after: Option<String> = conn
+            .query_row(
+                "SELECT response_schema FROM block_tool_choice WHERE block_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after.as_deref(), Some("{\"type\":\"object\"}"));
     }
 
     /// A populated store from before v7 gains the table in place: its rows

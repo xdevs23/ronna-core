@@ -26,6 +26,12 @@ pub struct ToolChoice {
     /// The tool names this conversation has, in the order they were recorded.
     /// Empty is a decision: this conversation has no tools.
     pub names: Vec<String>,
+    /// The JSON Schema the next turn's answer must satisfy, or `None` for
+    /// ordinary text. It rides the same record as the names because the two
+    /// are one decision about a turn — what it may call and what shape it
+    /// answers in — and the newest record speaks for both: an append that
+    /// records no schema clears one.
+    pub response_schema: Option<Value>,
 }
 
 impl ToolChoice {
@@ -78,6 +84,7 @@ impl super::LeafKind for ToolChoice {
                         .collect()
                 })
                 .unwrap_or_default(),
+            response_schema: block.fields.get("response_schema").cloned(),
         }
     }
 }

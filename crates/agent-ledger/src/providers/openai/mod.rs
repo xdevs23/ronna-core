@@ -19,14 +19,14 @@ use super::types::{
     CompletionRequest, ContentPart, LlmError, Message, MessageContent, MessageRole, ModelInfo,
     ModelSelector, OpaquePayload, ProviderRx, ProviderTx, ReasoningCapability, ReasoningLevel,
 };
-use super::{BoxFuture, ProviderModule};
+use super::{BoxFuture, ProviderModule, TurnRequest};
 
 mod parser;
 mod wire;
 
 use wire::{
-    InputItem, ReasoningParam, ReasoningSummaryText, ResponsesRequest, ResponsesTool,
-    WireModelsResponse,
+    InputItem, ReasoningParam, ReasoningSummaryText, ResponsesRequest, ResponsesText,
+    ResponsesTool, WireModelsResponse,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -99,6 +99,17 @@ impl OpenAiResponsesProvider {
                 effort: request.reasoning.and_then(openai_reasoning_effort),
             }),
             include: reasoning_capable.then(|| vec!["reasoning.encrypted_content"]),
+            text: request
+                .response_schema
+                .as_ref()
+                .map(|schema| ResponsesText {
+                    format: serde_json::json!({
+                        "type": "json_schema",
+                        "name": "response",
+                        "strict": true,
+                        "schema": schema,
+                    }),
+                }),
         };
         (body, carried_payloads)
     }
@@ -571,20 +582,21 @@ impl ProviderModule for OpenAiModule {
         tokio::spawn(bind::run_http_bind_loop_with_replay(
             req_rx,
             resp_tx,
-            move |messages, selector, tools, reasoning, include_reasoning_payloads| {
-                let model = match selector {
+            move |turn: TurnRequest, include_reasoning_payloads| {
+                let model = match turn.model {
                     ModelSelector::Specific(m) => m,
                     ModelSelector::Lightweight { .. } => LIGHTWEIGHT_MODEL.into(),
                 };
                 let provider = OpenAiResponsesProvider::new(api_key.clone(), base_url.clone());
                 let request = CompletionRequest {
                     model,
-                    messages,
-                    tools,
+                    messages: turn.messages,
+                    tools: turn.tools,
                     max_tokens: None,
                     temperature: None,
                     stream: true,
-                    reasoning,
+                    reasoning: turn.reasoning,
+                    response_schema: turn.response_schema,
                 };
                 async move {
                     provider

@@ -15,6 +15,7 @@
 //! matching block in junction order.
 
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
 
 use crate::agency::{LeafKind, ToolChoice};
 
@@ -41,7 +42,7 @@ impl Store {
     ) -> Result<i64, StoreError> {
         self.run(move |conn| {
             transact(conn, |tx| {
-                insert_tool_choice_block(tx, conversation_id, &names)
+                insert_tool_choice_block(tx, conversation_id, &names, None)
             })
         })
         .await
@@ -57,8 +58,10 @@ impl Store {
         &self,
         conversation_id: i64,
     ) -> Result<Option<Vec<String>>, StoreError> {
-        self.run(move |conn| newest_tool_choice(conn, conversation_id))
-            .await
+        Ok(self
+            .run(move |conn| newest_tool_choice(conn, conversation_id))
+            .await?
+            .map(|choice| choice.names))
     }
 }
 
@@ -67,18 +70,20 @@ impl Store {
 ///
 /// The names are serialized in ONE place, here, and read back in one,
 /// [`decode_tool_names`], so no second encoding and no second reading of the
-/// stored list exists.
+/// stored list exists. The schema beside them is the caller's JSON Schema
+/// document, serialized as given.
 pub(super) fn insert_tool_choice_block(
     conn: &Connection,
     conversation_id: i64,
     names: &[String],
+    response_schema: Option<&Value>,
 ) -> Result<i64, StoreError> {
     let encoded = serde_json::to_string(names)
         .map_err(|error| StoreError::Other(format!("tool names do not serialize: {error}")))?;
     let block_id = insert_block(conn, conversation_id, ToolChoice::KINDS[0])?;
     conn.execute(
-        "INSERT INTO block_tool_choice (block_id, names) VALUES (?1, ?2)",
-        params![block_id, encoded],
+        "INSERT INTO block_tool_choice (block_id, names, response_schema) VALUES (?1, ?2, ?3)",
+        params![block_id, encoded, response_schema.map(Value::to_string)],
     )?;
     Ok(block_id)
 }
@@ -89,29 +94,36 @@ pub(super) fn insert_tool_choice_block(
 pub(super) fn newest_tool_choice(
     conn: &Connection,
     conversation_id: i64,
-) -> Result<Option<Vec<String>>, StoreError> {
-    let stored: Option<String> = conn
+) -> Result<Option<ToolChoice>, StoreError> {
+    let stored: Option<(String, Option<String>)> = conn
         .query_row(
-            "SELECT tc.names
+            "SELECT tc.names, tc.response_schema
              FROM conversation_blocks cb
              JOIN blocks b ON b.id = cb.block_id
              JOIN block_tool_choice tc ON tc.block_id = b.id
              WHERE cb.conversation_id = ?1 AND b.block_type = ?2
              ORDER BY cb.id DESC LIMIT 1",
             params![conversation_id, ToolChoice::KINDS[0]],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some(stored) = stored else {
+    let Some((names, schema)) = stored else {
         return Ok(None);
     };
-    let names = decode_tool_names(&stored).map_err(|error| {
+    let corrupt = |what: &str, error: serde_json::Error| {
         StoreError::Other(format!(
-            "conversation {conversation_id} records a tool choice whose names do not \
+            "conversation {conversation_id} records a tool choice whose {what} do not \
              parse: {error}"
         ))
-    })?;
-    Ok(Some(names))
+    };
+    Ok(Some(ToolChoice {
+        names: decode_tool_names(&names).map_err(|error| corrupt("names", error))?,
+        response_schema: schema
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| corrupt("response schema", error))?,
+    }))
 }
 
 /// Read the stored column back into the list [`insert_tool_choice_block`]
@@ -210,6 +222,70 @@ mod tests {
                 .names,
             Vec::<String>::new()
         );
+    }
+
+    /// A recorded schema reads back through both readers of the record, and
+    /// an ordinary append — which records none — clears it: the newest record
+    /// speaks for both columns, so a schema cannot outlive its turn.
+    #[tokio::test]
+    async fn a_recorded_schema_reads_back_and_an_ordinary_append_clears_it() {
+        let store = Store::in_memory().unwrap();
+        let conv = conversation(&store).await;
+        let schema = serde_json::json!({ "type": "object", "required": ["summary"] });
+        store
+            .run({
+                let schema = schema.clone();
+                move |conn| {
+                    transact(conn, |tx| {
+                        insert_tool_choice_block(tx, conv, &[], Some(&schema))
+                    })
+                }
+            })
+            .await
+            .unwrap();
+
+        let blocks = store.list_blocks(conv).await.unwrap();
+        let fold = ToolChoice::newest_in(&blocks).expect("the ledger carries the record");
+        assert!(fold.names.is_empty());
+        assert_eq!(fold.response_schema, Some(schema.clone()));
+        let statement = store
+            .run(move |conn| newest_tool_choice(conn, conv))
+            .await
+            .unwrap()
+            .expect("the statement reads the record");
+        assert_eq!(statement.response_schema, Some(schema));
+
+        store
+            .append_tool_choice(conv, vec!["read".into()])
+            .await
+            .unwrap();
+        let blocks = store.list_blocks(conv).await.unwrap();
+        assert_eq!(
+            ToolChoice::newest_in(&blocks).unwrap().response_schema,
+            None,
+            "the later record records no schema, and the newest record speaks"
+        );
+    }
+
+    /// A schema column that is not JSON is corrupt to BOTH readers, like a
+    /// names column that is not a list: neither answers "text" for it.
+    #[tokio::test]
+    async fn a_schema_column_that_is_not_json_is_refused_by_both_readers() {
+        let store = Store::in_memory().unwrap();
+        let conv = conversation(&store).await;
+        let block_id = store.append_tool_choice(conv, Vec::new()).await.unwrap();
+        store
+            .run(move |conn| {
+                conn.execute(
+                    "UPDATE block_tool_choice SET response_schema = 'not json' WHERE block_id = ?1",
+                    [block_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(store.newest_tool_choice(conv).await.is_err());
+        assert!(store.list_blocks(conv).await.is_err());
     }
 
     /// A column holding a list of anything but strings is corrupt to BOTH

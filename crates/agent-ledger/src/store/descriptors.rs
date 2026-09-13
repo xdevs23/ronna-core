@@ -1560,7 +1560,7 @@ mod tests {
             bad.for_block_id AS bad_for_block_id, bad.decision AS bad_decision, bad.system_reason AS bad_system_reason, bad.user_reason AS bad_user_reason,
             bdm.date AS bdm_date, bdm.tz_abbrev AS bdm_tz_abbrev, bdm.tz_name AS bdm_tz_name, bdm.written_at AS bdm_written_at,
             banc.ancestor_conversation_id AS banc_ancestor,
-            btch.names AS btch_names
+            btch.names AS btch_names, btch.response_schema AS btch_response_schema
      FROM blocks b
      LEFT JOIN block_text bt ON bt.block_id = b.id AND b.block_type IN ('text', 'streaming', 'system_prompt', 'harness_message')
      LEFT JOIN block_quote bq ON bq.block_id = b.id AND b.block_type = 'quote'

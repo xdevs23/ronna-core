@@ -760,6 +760,7 @@ mod empty_assistant_content {
                 &[text(MessageRole::Assistant, "   ")],
                 LIGHTWEIGHT_MODEL.into(),
                 &[],
+                None,
             )
             .err()
             .expect("a request with nothing to send is refused");
@@ -797,4 +798,22 @@ mod empty_assistant_content {
             ])
         );
     }
+}
+
+/// A schema goes out in the chat-completions envelope this endpoint speaks;
+/// a request without one carries no `response_format`.
+#[test]
+fn a_schema_is_sent_as_the_chat_response_format() {
+    let provider = KimiProvider::new("test-token".into(), None);
+    let schema = serde_json::json!({ "type": "object" });
+    let plain = serde_json::to_value(provider.build_request(&[], "m".into(), &[], None, true))
+        .expect("the request serializes");
+    assert!(plain.get("response_format").is_none());
+    let body =
+        serde_json::to_value(provider.build_request(&[], "m".into(), &[], Some(&schema), true))
+            .expect("the request serializes");
+    assert_eq!(
+        body["response_format"],
+        serde_json::json!({ "type": "json_schema", "json_schema": { "name": "response", "strict": true, "schema": schema } })
+    );
 }

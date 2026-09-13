@@ -15,21 +15,13 @@ use crate::providers::types::{StopReason, Usage};
 /// Drive the loop with a single stream request and collect every response until
 /// the channel closes.
 async fn drive(
-    open: impl Fn(
-        Vec<Message>,
-        ModelSelector,
-        Vec<ToolDefinition>,
-        Option<ReasoningLevel>,
-    ) -> EventStream
-    + Send
-    + Sync
-    + 'static,
+    open: impl Fn(TurnRequest) -> EventStream + Send + Sync + 'static,
 ) -> Vec<ProviderResponse> {
     let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let loop_handle = tokio::spawn(run_http_bind_loop(req_rx, resp_tx, move |b, m, t, r| {
-        let events = open(b, m, t, r);
+    let loop_handle = tokio::spawn(run_http_bind_loop(req_rx, resp_tx, move |turn| {
+        let events = open(turn);
         async move { Ok::<_, LlmError>(events) }
     }));
 
@@ -41,6 +33,7 @@ async fn drive(
             },
             tools: vec![],
             reasoning: None,
+            response_schema: None,
         })
         .unwrap();
 
@@ -93,7 +86,7 @@ fn is_status(resp: &ProviderResponse, needle: &str) -> bool {
 async fn reconnects_then_completes() {
     let attempts = Arc::new(AtomicU32::new(0));
     let a = attempts.clone();
-    let out = drive(move |_, _, _, _| {
+    let out = drive(move |_| {
         let n = a.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
             // First attempt: connect, then drop mid-stream.
@@ -156,7 +149,7 @@ async fn reconnects_then_completes() {
 /// terminates with a transport error followed by a single close.
 #[tokio::test(start_paused = true)]
 async fn exhausts_retries_then_errors() {
-    let out = drive(|_, _, _, _| {
+    let out = drive(|_| {
         Box::pin(stream::iter(vec![
             Ok(StreamEvent::Connected),
             Err(LlmError::Stream("error decoding response body".into())),
@@ -212,7 +205,7 @@ async fn exhausts_retries_then_errors() {
 async fn rate_limited_stream_retries_then_succeeds() {
     let attempts = Arc::new(AtomicU32::new(0));
     let a = attempts.clone();
-    let out = drive(move |_, _, _, _| {
+    let out = drive(move |_| {
         if a.fetch_add(1, Ordering::SeqCst) == 0 {
             Box::pin(stream::iter(vec![
                 Ok(StreamEvent::Connected),
@@ -268,7 +261,7 @@ async fn rate_limited_stream_retries_then_succeeds() {
 async fn rate_limit_after_content_is_terminal() {
     let attempts = Arc::new(AtomicU32::new(0));
     let a = attempts.clone();
-    let out = drive(move |_, _, _, _| {
+    let out = drive(move |_| {
         a.fetch_add(1, Ordering::SeqCst);
         Box::pin(stream::iter(vec![
             Ok(StreamEvent::Connected),
@@ -308,7 +301,7 @@ async fn retry_after_hint_is_honored() {
     let a = attempts.clone();
 
     let started = tokio::time::Instant::now();
-    let out = drive(move |_, _, _, _| {
+    let out = drive(move |_| {
         if a.fetch_add(1, Ordering::SeqCst) == 0 {
             Box::pin(stream::iter(vec![
                 Ok(StreamEvent::Connected),
@@ -353,19 +346,15 @@ async fn dropping_the_sender_stops_the_cycle() {
     let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let loop_handle = tokio::spawn(run_http_bind_loop(
-        req_rx,
-        resp_tx,
-        move |_b, _m, _t, _r| {
-            counted.fetch_add(1, Ordering::SeqCst);
-            // A stream that opens and then says nothing: the shape a cycle can sit
-            // in for minutes.
-            let events =
-                Box::pin(stream::iter(vec![Ok(StreamEvent::Connected)]).chain(stream::pending()))
-                    as EventStream;
-            async move { Ok::<_, LlmError>(events) }
-        },
-    ));
+    let loop_handle = tokio::spawn(run_http_bind_loop(req_rx, resp_tx, move |_turn| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        // A stream that opens and then says nothing: the shape a cycle can sit
+        // in for minutes.
+        let events =
+            Box::pin(stream::iter(vec![Ok(StreamEvent::Connected)]).chain(stream::pending()))
+                as EventStream;
+        async move { Ok::<_, LlmError>(events) }
+    }));
 
     req_tx
         .send(ProviderRequest::Stream {
@@ -375,6 +364,7 @@ async fn dropping_the_sender_stops_the_cycle() {
             },
             tools: vec![],
             reasoning: None,
+            response_schema: None,
         })
         .unwrap();
 
@@ -421,7 +411,7 @@ async fn a_superseded_turn_sends_no_close() {
     let loop_handle = tokio::spawn(run_http_bind_loop_with_replay(
         req_rx,
         resp_tx,
-        move |_b, _m, _t, _r, _include| {
+        move |_turn, _include| {
             let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
             let gate = gate.clone();
             async move {
@@ -454,6 +444,7 @@ async fn a_superseded_turn_sends_no_close() {
         },
         tools: vec![],
         reasoning: None,
+        response_schema: None,
     };
     req_tx.send(request()).unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -487,4 +478,55 @@ async fn a_superseded_turn_sends_no_close() {
         "and it is last"
     );
     loop_handle.await.expect("the loop exits with the channel");
+}
+
+/// The schema is part of the turn's inputs: every re-open of the SAME turn
+/// hands the opener the same one, so a reconnect can never silently turn a
+/// schema-bound turn into a prose one.
+#[tokio::test(start_paused = true)]
+async fn every_reopen_of_a_turn_carries_the_same_schema() {
+    let schema = serde_json::json!({ "type": "object" });
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let recorded = seen.clone();
+    let loop_handle = tokio::spawn(run_http_bind_loop(req_rx, resp_tx, move |turn| {
+        let first = recorded.lock().unwrap().is_empty();
+        recorded.lock().unwrap().push(turn.response_schema);
+        let events = if first {
+            vec![
+                Ok(StreamEvent::Connected),
+                Err(LlmError::Stream("error decoding response body".into())),
+            ]
+        } else {
+            vec![
+                Ok(StreamEvent::Connected),
+                Ok(StreamEvent::MessageEnd {
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ]
+        };
+        async move { Ok::<_, LlmError>(Box::pin(stream::iter(events)) as EventStream) }
+    }));
+    req_tx
+        .send(ProviderRequest::Stream {
+            messages: vec![],
+            model: ModelSelector::Specific("m".into()),
+            tools: vec![],
+            reasoning: None,
+            response_schema: Some(schema.clone()),
+        })
+        .unwrap();
+    while let Some(resp) = resp_rx.recv().await {
+        if matches!(resp, ProviderResponse::Done) {
+            break;
+        }
+    }
+    drop(req_tx);
+    loop_handle.abort();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![Some(schema.clone()), Some(schema)]
+    );
 }

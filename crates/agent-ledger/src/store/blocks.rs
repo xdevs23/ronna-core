@@ -63,7 +63,7 @@ pub(super) const BLOCKS_QUERY: &str = "SELECT
             bad.for_block_id AS bad_for_block_id, bad.decision AS bad_decision, bad.system_reason AS bad_system_reason, bad.user_reason AS bad_user_reason,
             bdm.date AS bdm_date, bdm.tz_abbrev AS bdm_tz_abbrev, bdm.tz_name AS bdm_tz_name, bdm.written_at AS bdm_written_at,
             banc.ancestor_conversation_id AS banc_ancestor,
-            btch.names AS btch_names
+            btch.names AS btch_names, btch.response_schema AS btch_response_schema
      FROM blocks b
      LEFT JOIN block_text bt ON bt.block_id = b.id AND b.block_type IN ('text', 'streaming', 'system_prompt', 'harness_message')
      LEFT JOIN block_quote bq ON bq.block_id = b.id AND b.block_type = 'quote'
@@ -484,6 +484,18 @@ fn structural_payload(
                 "names".into(),
                 Value::Array(names.into_iter().map(Value::String).collect()),
             );
+            // The answer's schema, stored serialized beside the names and
+            // held to the same rule: a column that is not JSON is a corrupt
+            // row, not a turn that answers in text.
+            let schema: Option<String> = row.get("btch_response_schema")?;
+            if let Some(schema) = schema {
+                let schema = serde_json::from_str(&schema).map_err(|error| {
+                    StoreError::Other(format!(
+                        "block {block_id} records a response schema that does not parse: {error}"
+                    ))
+                })?;
+                fields.insert("response_schema".into(), schema);
+            }
         }
         // Roleless in the row — its grouping under the harness's voice is the
         // KIND's projection fact, not a stored column.

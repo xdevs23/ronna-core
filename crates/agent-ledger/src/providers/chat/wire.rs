@@ -28,6 +28,20 @@ pub(crate) struct WireRequest {
     pub(super) stream_options: Option<WireStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reasoning_effort: Option<String>,
+    /// The answer's schema, in this dialect's own envelope; absent for text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) response_format: Option<Value>,
+}
+
+/// The chat-completions envelope for a JSON Schema answer: the schema itself
+/// under a constant name, and `strict`, which is what makes the endpoint hold
+/// the model to the schema instead of merely suggesting it. The name is
+/// required by the dialect and means nothing to a caller, so it is fixed.
+pub(crate) fn json_schema_response_format(schema: &Value) -> Value {
+    serde_json::json!({
+        "type": "json_schema",
+        "json_schema": { "name": "response", "strict": true, "schema": schema },
+    })
 }
 
 /// Streaming opt-ins.
@@ -279,6 +293,7 @@ mod tests {
             stream: true,
             stream_options: None,
             reasoning_effort: None,
+            response_format: None,
         };
         // A relative URL fails before any connection is attempted.
         let (result, lines) = recorded_future(connect(

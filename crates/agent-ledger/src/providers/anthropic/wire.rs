@@ -37,6 +37,16 @@ pub(super) struct WireRequest {
     /// The effort tier for adaptive thinking.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) effort: Option<String>,
+    /// The answer's schema, in this dialect's `output_config.format`
+    /// envelope; absent for text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) output_config: Option<OutputConfig>,
+}
+
+/// The output settings, of which this library sets only the format.
+#[derive(Serialize)]
+pub(super) struct OutputConfig {
+    pub(super) format: Value,
 }
 
 #[derive(Serialize)]

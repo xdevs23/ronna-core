@@ -76,6 +76,8 @@ pub(super) enum BlockContent {
         /// choice records the same choice, and nothing is recomputed against
         /// whatever registry happens to be loaded at copy time.
         names: String,
+        /// The serialized answer schema, carried verbatim for the same reason.
+        response_schema: Option<String>,
     },
 }
 
@@ -216,12 +218,15 @@ impl BlockContent {
     /// function for the reason the marker's is one — a copy carries the row
     /// VERBATIM, and nothing about what the names mean is decided here.
     fn read_tool_choice(conn: &Connection, block_id: i64) -> Result<Self, StoreError> {
-        let names: String = conn.query_row(
-            "SELECT names FROM block_tool_choice WHERE block_id = ?1",
+        let (names, response_schema) = conn.query_row(
+            "SELECT names, response_schema FROM block_tool_choice WHERE block_id = ?1",
             [block_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        Ok(Self::ToolChoice { names })
+        Ok(Self::ToolChoice {
+            names,
+            response_schema,
+        })
     }
 
     /// Insert this content as the payload for `new_block_id`.
@@ -312,10 +317,14 @@ impl BlockContent {
                     params![new_block_id, ancestor_conversation_id],
                 )?;
             }
-            Self::ToolChoice { names } => {
+            Self::ToolChoice {
+                names,
+                response_schema,
+            } => {
                 conn.execute(
-                    "INSERT INTO block_tool_choice (block_id, names) VALUES (?1, ?2)",
-                    params![new_block_id, names],
+                    "INSERT INTO block_tool_choice (block_id, names, response_schema)
+                     VALUES (?1, ?2, ?3)",
+                    params![new_block_id, names, response_schema],
                 )?;
             }
         }

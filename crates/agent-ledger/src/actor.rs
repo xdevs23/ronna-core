@@ -45,7 +45,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::agency::{AgencyCtx, RuntimeKind, ToolCall, ratchet, redispatch};
+use crate::agency::{AgencyCtx, RuntimeKind, ToolCall, ToolChoice, ratchet, redispatch};
 use crate::block::Block;
 use crate::bus::{EventBus, RuntimeEvent};
 use crate::dispatch::TurnAnchor;
@@ -1315,6 +1315,11 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             model: ModelSelector::Specific(conv.model.external_id),
             tools: tool_defs,
             reasoning,
+            // Read from the SAME snapshot as the tools, off the same record:
+            // what this turn is offered and what shape it answers in are one
+            // decision, and a later append cannot reach a turn in flight.
+            response_schema: ToolChoice::newest_in(&blocks)
+                .and_then(|choice| choice.response_schema),
         }) {
             tracing::error!(conversation_id = self.id, error = ?e, "handle_blocks_ready: provider channel closed");
             // No stream opened: the seam a failed send left set would leak
@@ -3984,6 +3989,8 @@ mod tests {
         /// tests assert WHAT the dispatch offered, and an empty offer is one
         /// of the answers they assert.
         offered: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        /// The answer schema every request carried, in arrival order.
+        schemas: Arc<std::sync::Mutex<Vec<Option<serde_json::Value>>>>,
         /// The held-window scripts' latch, shared with the probe: notifying
         /// it lets a held tool round proceed.
         release: Arc<tokio::sync::Notify>,
@@ -4093,13 +4100,17 @@ mod tests {
             let shapes = Arc::clone(&self.shapes);
             let seen = Arc::clone(&self.seen);
             let offered = Arc::clone(&self.offered);
+            let schemas = Arc::clone(&self.schemas);
             let release = Arc::clone(&self.release);
             let finish = Arc::clone(&self.finish);
             let title_requests = Arc::clone(&self.title_requests);
             tokio::spawn(async move {
                 while let Some(request) = req_rx.recv().await {
                     let ProviderRequest::Stream {
-                        messages, tools, ..
+                        messages,
+                        tools,
+                        response_schema,
+                        ..
                     } = request
                     else {
                         // The Interrupt lands here. A real provider does not
@@ -4119,6 +4130,7 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push(tools.iter().map(|tool| tool.name.clone()).collect());
+                    schemas.lock().unwrap().push(response_schema);
                     // The metadata worker shares this provider and its
                     // derivation request is the one carrying no tool
                     // definitions — answer it with a title and keep it out of
@@ -4615,6 +4627,8 @@ mod tests {
         seen: Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
         /// The tool names every request was offered, in arrival order.
         offered: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        /// The answer schema every request carried, in arrival order.
+        schemas: Arc<std::sync::Mutex<Vec<Option<serde_json::Value>>>>,
         /// The held-window scripts' latch: notify it to let a held tool round
         /// proceed. Inert for every other script.
         release: Arc<tokio::sync::Notify>,
@@ -4675,6 +4689,7 @@ mod tests {
         let shapes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let schemas = Arc::new(std::sync::Mutex::new(Vec::new()));
         let release = Arc::new(tokio::sync::Notify::new());
         let finish = Arc::new(tokio::sync::Notify::new());
         let title_requests = Arc::new(AtomicUsize::new(0));
@@ -4685,6 +4700,7 @@ mod tests {
             shapes: Arc::clone(&shapes),
             seen: Arc::clone(&seen),
             offered: Arc::clone(&offered),
+            schemas: Arc::clone(&schemas),
             release: Arc::clone(&release),
             finish: Arc::clone(&finish),
             title_requests: Arc::clone(&title_requests),
@@ -4720,6 +4736,7 @@ mod tests {
                 shapes,
                 seen,
                 offered,
+                schemas,
                 release,
                 finish,
                 title_requests,
@@ -7574,6 +7591,61 @@ mod tests {
             offered_by_one_dispatch(&ctx, conv, &probe).await.is_empty(),
             "an empty choice is a decision, and the decision is nothing"
         );
+    }
+
+    /// The answer's schema rides the same record as the tools: a temporary
+    /// fork's schema reaches the dispatch its own empty choice governs, read
+    /// off the same snapshot as the tools. (That an ordinary later append
+    /// clears it is the record's own rule, pinned where the record lives.)
+    #[tokio::test]
+    async fn the_dispatch_carries_the_newest_record_s_answer_schema() {
+        let (ctx, conv, probe) = scripted_context(Script::CountOnly).await;
+        let schema = serde_json::json!({ "type": "object", "properties": { "summary": { "type": "string" } } });
+        let history_end = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "history".into())
+            .await
+            .unwrap();
+        let temporary = ctx
+            .store
+            .fork_temporary(
+                conv,
+                history_end,
+                crate::store::TemporaryFork {
+                    records: Vec::new(),
+                    instructions: "answer in the shape".into(),
+                    response_schema: Some(schema.clone()),
+                },
+            )
+            .await
+            .unwrap()
+            .conversation_id;
+
+        let (mut actor, _recheck) = bare_actor(temporary, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert!(
+            actor.streaming,
+            "the fork's own instructions summon the turn"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let schemas = probe.schemas.lock().unwrap().clone();
+            if let [only] = schemas.as_slice() {
+                assert_eq!(
+                    only,
+                    &Some(schema),
+                    "the fork's schema went out with its turn"
+                );
+                assert!(
+                    probe.offered.lock().unwrap()[0].is_empty(),
+                    "the same record is an empty choice, so the turn is offered no tool"
+                );
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the request went out");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// AC5 — a conversation that recorded no choice is offered every

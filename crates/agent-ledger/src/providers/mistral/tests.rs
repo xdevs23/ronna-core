@@ -211,6 +211,7 @@ mod request {
             temperature: None,
             stream: true,
             reasoning: Some(ReasoningLevel::Max),
+            response_schema: None,
         };
         let body = serde_json::to_value(provider.build_request_body(&request, true, true).0)
             .expect("the request serializes");
@@ -299,6 +300,7 @@ mod replay {
             temperature: None,
             stream: true,
             reasoning: None,
+            response_schema: None,
         };
         let (body, carried) = provider.build_request_body(&request, true, include);
         (

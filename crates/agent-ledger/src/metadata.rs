@@ -626,6 +626,7 @@ async fn request_title_stream<K: RuntimeKind>(
         // Title derivation uses the provider's background model — or the
         // carried main model — with no reasoning.
         reasoning: None,
+        response_schema: None,
     })
     .is_ok()
 }

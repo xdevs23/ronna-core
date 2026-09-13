@@ -18,15 +18,14 @@ use super::http_store::{HttpProviderConfig, HttpProviderStore};
 use super::types::{
     CompletionRequest, ContentPart, LlmError, Message, MessageContent, MessageRole, ModelInfo,
     ModelSelector, OpaquePayload, ProviderRx, ProviderTx, ReasoningCapability, ReasoningLevel,
-    ToolDefinition,
 };
-use super::{BoxFuture, ProviderModule};
+use super::{BoxFuture, ProviderModule, TurnRequest};
 
 mod wire;
 
 use wire::{
-    WireCapabilities, WireContent, WireContentBlock, WireImageSource, WireMessage, WireModel,
-    WireModelsResponse, WireRequest, WireThinkingRequest, WireTool,
+    OutputConfig, WireCapabilities, WireContent, WireContentBlock, WireImageSource, WireMessage,
+    WireModel, WireModelsResponse, WireRequest, WireThinkingRequest, WireTool,
 };
 
 /// The API version header this module speaks. Pinned rather than tracked: a
@@ -99,6 +98,9 @@ impl AnthropicProvider {
             stream,
             thinking,
             effort,
+            output_config: request.response_schema.as_ref().map(|schema| OutputConfig {
+                format: serde_json::json!({ "type": "json_schema", "schema": schema }),
+            }),
         };
         (body, carried_payloads)
     }
@@ -220,23 +222,19 @@ impl AnthropicProvider {
 /// `max_tokens` is deliberately `None`: the request builder's own default is
 /// this vendor's ceiling, and a caller-supplied number above the model's limit
 /// is rejected outright with a 400 — the whole turn, for a field nobody chose.
-fn turn_request(
-    selector: ModelSelector,
-    messages: Vec<Message>,
-    tools: Vec<ToolDefinition>,
-    reasoning: Option<ReasoningLevel>,
-) -> CompletionRequest {
+fn turn_request(turn: TurnRequest) -> CompletionRequest {
     CompletionRequest {
-        model: match selector {
+        model: match turn.model {
             ModelSelector::Specific(m) => m,
             ModelSelector::Lightweight { .. } => LIGHTWEIGHT_MODEL.into(),
         },
-        messages,
-        tools,
+        messages: turn.messages,
+        tools: turn.tools,
         max_tokens: None,
         temperature: None,
         stream: true,
-        reasoning,
+        reasoning: turn.reasoning,
+        response_schema: turn.response_schema,
     }
 }
 
@@ -527,9 +525,9 @@ impl ProviderModule for AnthropicModule {
         tokio::spawn(bind::run_http_bind_loop_with_replay(
             req_rx,
             resp_tx,
-            move |messages, selector, tools, reasoning, include_reasoning_payloads| {
+            move |turn, include_reasoning_payloads| {
                 let provider = AnthropicProvider::new(api_key.clone(), base_url.clone());
-                let request = turn_request(selector, messages, tools, reasoning);
+                let request = turn_request(turn);
                 async move {
                     provider
                         .open_turn(request, include_reasoning_payloads)

@@ -241,6 +241,10 @@ impl ChatProvider {
                 include_usage: true,
             }),
             reasoning_effort: request.reasoning.and_then(self.effort),
+            response_format: request
+                .response_schema
+                .as_ref()
+                .map(wire::json_schema_response_format),
         };
         (body, carried_payloads)
     }

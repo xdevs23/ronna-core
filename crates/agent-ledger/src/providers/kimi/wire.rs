@@ -65,6 +65,9 @@ pub(super) struct WireRequest {
     pub(super) thinking: Option<KimiThinking>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reasoning_effort: Option<String>,
+    /// The answer's schema in the chat-completions envelope; absent for text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) response_format: Option<Value>,
 }
 
 #[derive(Serialize)]

@@ -290,6 +290,7 @@ async fn a_consumer_cuts_a_ledger_and_summarizes_its_first_half() {
             TemporaryFork {
                 records: Vec::<ConsumerRecord>::new(),
                 instructions: INSTRUCTIONS.into(),
+                response_schema: None,
             },
         )
         .await
@@ -314,6 +315,11 @@ async fn a_consumer_cuts_a_ledger_and_summarizes_its_first_half() {
         held[choice_at].block_type,
         ToolChoice::KINDS[0],
         "the fork records the choice itself"
+    );
+    assert_eq!(
+        ToolChoice::parse(&held[choice_at]).response_schema,
+        None,
+        "a fork handed no schema records a turn that answers in prose"
     );
     assert!(
         ToolChoice::parse(&held[choice_at]).names.is_empty(),

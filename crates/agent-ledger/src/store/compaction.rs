@@ -114,6 +114,48 @@ pub struct TemporaryConversation {
     pub instructions_block_id: i64,
 }
 
+impl TemporaryConversation {
+    /// What the turn answered, as prose: the newest non-empty assistant text
+    /// past the instructions block, or `None` when the turn wrote none.
+    ///
+    /// Past the instructions, because everything before them is the inherited
+    /// history the turn was asked ABOUT, including the source's own earlier
+    /// answers.
+    #[must_use]
+    pub fn answer_text(&self, blocks: &[Block]) -> Option<String> {
+        blocks
+            .iter()
+            .rev()
+            .take_while(|block| block.id != self.instructions_block_id)
+            .filter(|block| {
+                block.role == Some(Role::Assistant)
+                    && Text::KINDS.contains(&block.block_type.as_str())
+            })
+            .map(|block| Text::parse(block).content.trim().to_owned())
+            .find(|content| !content.is_empty())
+    }
+
+    /// What the turn answered, deserialized: the same text as
+    /// [`answer_text`](Self::answer_text), read as the JSON a fork with a
+    /// [`response_schema`](TemporaryFork::response_schema) asked for.
+    ///
+    /// `Ok(None)` is a turn that wrote nothing. A turn that wrote something
+    /// other than the requested shape is the provider failing its contract,
+    /// and that is the caller's failure to report, not a shape to repair here.
+    ///
+    /// # Errors
+    ///
+    /// If the text is not JSON of the requested type.
+    pub fn answer<T: serde::de::DeserializeOwned>(
+        &self,
+        blocks: &[Block],
+    ) -> Result<Option<T>, serde_json::Error> {
+        self.answer_text(blocks)
+            .map(|text| serde_json::from_str(&text))
+            .transpose()
+    }
+}
+
 /// What a temporary conversation is built with.
 #[derive(Debug, Clone)]
 pub struct TemporaryFork {
@@ -125,6 +167,11 @@ pub struct TemporaryFork {
     /// append that summons the turn. The words are the caller's: this
     /// library has no prompts.
     pub instructions: String,
+    /// The JSON Schema the turn's answer must satisfy, or `None` for prose.
+    /// Recorded on the empty tool choice the fork writes, so the summoned
+    /// turn is governed by it the way it is governed by having no tools; the
+    /// answer is then read back through [`TemporaryConversation::answer`].
+    pub response_schema: Option<serde_json::Value>,
 }
 
 /// What a compacted thread opens with.
@@ -216,7 +263,13 @@ impl Store {
         // so no consumer supplies it and no consumer can forget it — and
         // written after the caller's own records, so the library's word is
         // the newest one the turn reads.
-        self.append_tool_choice(conversation_id, Vec::new()).await?;
+        let response_schema = fork.response_schema;
+        self.run(move |conn| {
+            transact(conn, |tx| {
+                insert_tool_choice_block(tx, conversation_id, &[], response_schema.as_ref())
+            })
+        })
+        .await?;
         // Last, and that is the mechanism: this is the block that owes the
         // turn, so nothing the caller wanted recorded first can land behind
         // it.
@@ -281,8 +334,13 @@ impl Store {
                 // choice. A source that recorded none passes none on — the
                 // absence is a record too, and inventing one here would
                 // decide for a consumer that has not decided.
-                if let Some(names) = newest_tool_choice(tx, source_id)? {
-                    insert_tool_choice_block(tx, new_id, &names)?;
+                if let Some(choice) = newest_tool_choice(tx, source_id)? {
+                    insert_tool_choice_block(
+                        tx,
+                        new_id,
+                        &choice.names,
+                        choice.response_schema.as_ref(),
+                    )?;
                 }
                 // The thread's prompt is the one it appended above, and the
                 // source's own stays where it was written.
@@ -696,5 +754,87 @@ mod tests {
     fn a_ledger_that_is_one_group_does_not_split() {
         let blocks: Vec<Block> = (1..=6).map(user).collect();
         assert_eq!(ledger_cut(&blocks), None);
+    }
+
+    /// A text block in a voice, its fields what the text kind reads.
+    fn said(id: i64, role: Role, content: &str) -> Block {
+        let mut block = block(id, Some(role), "text");
+        block.fields.insert("content".into(), json!(content));
+        block
+    }
+
+    /// The answer is the newest non-empty assistant text PAST the
+    /// instructions: the inherited history before them is what the turn was
+    /// asked about, and an answer of whitespace is no answer.
+    #[test]
+    fn the_answer_is_the_assistant_text_past_the_instructions() {
+        let temporary = TemporaryConversation {
+            conversation_id: 1,
+            instructions_block_id: 3,
+        };
+        let history = [
+            said(1, Role::User, "what happened?"),
+            said(2, Role::Assistant, "{\"summary\": \"an earlier answer\"}"),
+            block(3, Some(Role::System), "harness_message"),
+        ];
+        assert_eq!(
+            temporary.answer_text(&history),
+            None,
+            "nothing past the instructions"
+        );
+        let mut wrote = history.to_vec();
+        wrote.push(said(
+            4,
+            Role::Assistant,
+            "  {\"summary\": \"the digest\"}  ",
+        ));
+        wrote.push(said(5, Role::Assistant, "   "));
+        assert_eq!(
+            temporary.answer_text(&wrote).as_deref(),
+            Some("{\"summary\": \"the digest\"}")
+        );
+    }
+
+    /// The typed read: the JSON the schema asked for comes back as the
+    /// caller's type, nothing written is `None`, and anything else is an
+    /// error the caller reports — never a repaired shape.
+    #[test]
+    fn the_typed_answer_is_the_json_or_the_provider_s_failure() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct Digest {
+            summary: String,
+        }
+        let temporary = TemporaryConversation {
+            conversation_id: 1,
+            instructions_block_id: 1,
+        };
+        let instructions = block(1, Some(Role::System), "harness_message");
+        assert_eq!(
+            temporary
+                .answer::<Digest>(std::slice::from_ref(&instructions))
+                .unwrap(),
+            None
+        );
+        let good = [
+            instructions.clone(),
+            said(2, Role::Assistant, "{\"summary\": \"the digest\"}"),
+        ];
+        assert_eq!(
+            temporary.answer::<Digest>(&good).unwrap(),
+            Some(Digest {
+                summary: "the digest".into()
+            })
+        );
+        for wrong in [
+            "prose instead of json",
+            "{\"other\": 1}",
+            "{\"summary\": 2}",
+        ] {
+            let bad = [instructions.clone(), said(2, Role::Assistant, wrong)];
+            assert!(
+                temporary.answer::<Digest>(&bad).is_err(),
+                "{wrong} is not the requested shape"
+            );
+        }
     }
 }

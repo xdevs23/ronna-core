@@ -27,7 +27,7 @@ async fn drive_replay(
     let loop_handle = tokio::spawn(run_http_bind_loop_with_replay(
         req_rx,
         resp_tx,
-        move |_b, _m, _t, _r, include| {
+        move |_turn, include| {
             seen.lock().unwrap().push(include);
             let turn = open(include);
             async move { turn }
@@ -42,6 +42,7 @@ async fn drive_replay(
             },
             tools: vec![],
             reasoning: None,
+            response_schema: None,
         })
         .unwrap();
 

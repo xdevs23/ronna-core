@@ -7,7 +7,7 @@ use super::wire::{AnthropicSseState, parse_sse_event};
 use super::*;
 use crate::block::{Block, Role};
 use crate::providers::render::blocks_to_messages;
-use crate::providers::types::{StopReason, StreamEvent};
+use crate::providers::types::{StopReason, StreamEvent, ToolDefinition};
 
 /// The reasoning ingest: a block start, its deltas, its signature fragments,
 /// and the stop that carries the signature out as the continuity payload.
@@ -364,6 +364,35 @@ mod replay_tests {
 mod bind_request_golden {
     use super::*;
 
+    /// A schema goes out as this dialect's `output_config.format`, the
+    /// caller's document untouched inside it; a request without one carries
+    /// no `output_config` at all.
+    #[test]
+    fn a_schema_is_sent_as_the_output_config_format() {
+        let schema = json!({ "type": "object", "properties": { "summary": { "type": "string" } } });
+        let mut request = turn_request(TurnRequest {
+            model: ModelSelector::Specific("claude-test".into()),
+            messages: vec![Message {
+                role: MessageRole::User,
+                content: MessageContent::Text("hello".into()),
+            }],
+            tools: vec![],
+            reasoning: None,
+            response_schema: None,
+        });
+        let (plain, _) = AnthropicProvider::build_request_body(&request, true, true);
+        let plain = serde_json::to_value(&plain).expect("the wire serializes");
+        assert!(plain.get("output_config").is_none());
+
+        request.response_schema = Some(schema.clone());
+        let (body, _) = AnthropicProvider::build_request_body(&request, true, true);
+        let body = serde_json::to_value(&body).expect("the wire serializes");
+        assert_eq!(
+            body["output_config"],
+            json!({ "format": { "type": "json_schema", "schema": schema } })
+        );
+    }
+
     fn user_block(id: i64, role: Role, block_type: &str, content: &str) -> Block {
         let mut fields = serde_json::Map::new();
         fields.insert("content".into(), Value::String(content.into()));
@@ -389,16 +418,17 @@ mod bind_request_golden {
             parameters: json!({ "type": "object" }),
         }];
 
-        let request = turn_request(
+        let request = turn_request(TurnRequest {
             // This vendor's background slug is its own catalog's: the
             // carried main-model fallback stays unused here.
-            ModelSelector::Lightweight {
+            model: ModelSelector::Lightweight {
                 main: "claude-mainline-test".into(),
             },
-            blocks_to_messages::<crate::agency::BlockKind>(&blocks),
+            messages: blocks_to_messages::<crate::agency::BlockKind>(&blocks),
             tools,
-            Some(ReasoningLevel::High),
-        );
+            reasoning: Some(ReasoningLevel::High),
+            response_schema: None,
+        });
         assert_eq!(
             request.max_tokens, None,
             "the bind path names no ceiling of its own"
@@ -826,12 +856,13 @@ mod empty_assistant_content {
     /// message array for the endpoint to refuse in its own words.
     #[tokio::test]
     async fn a_request_the_drop_emptied_is_refused_before_it_is_sent() {
-        let request = turn_request(
-            ModelSelector::Specific("claude-test".into()),
-            vec![text(MessageRole::Assistant, "   ")],
-            vec![],
-            None,
-        );
+        let request = turn_request(TurnRequest {
+            model: ModelSelector::Specific("claude-test".into()),
+            messages: vec![text(MessageRole::Assistant, "   ")],
+            tools: vec![],
+            reasoning: None,
+            response_schema: None,
+        });
 
         let err = AnthropicProvider::new("test-key".into(), None)
             .open_turn(request, true)
