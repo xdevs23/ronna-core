@@ -7,6 +7,7 @@ use super::*;
 use crate::block::{Block, Role};
 use crate::providers::chat::sse::parse_sse_chunk;
 use crate::providers::render::blocks_to_messages;
+use crate::providers::types::CompletionRequest;
 use crate::providers::types::ReasoningDetailEntry;
 
 /// The decoder fixtures run through the FULL base parser, so the shared

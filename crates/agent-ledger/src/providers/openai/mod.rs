@@ -583,21 +583,12 @@ impl ProviderModule for OpenAiModule {
             req_rx,
             resp_tx,
             move |turn: TurnRequest, include_reasoning_payloads| {
-                let model = match turn.model {
-                    ModelSelector::Specific(m) => m,
+                let model = match &turn.model {
+                    ModelSelector::Specific(m) => m.clone(),
                     ModelSelector::Lightweight { .. } => LIGHTWEIGHT_MODEL.into(),
                 };
                 let provider = OpenAiResponsesProvider::new(api_key.clone(), base_url.clone());
-                let request = CompletionRequest {
-                    model,
-                    messages: turn.messages,
-                    tools: turn.tools,
-                    max_tokens: None,
-                    temperature: None,
-                    stream: true,
-                    reasoning: turn.reasoning,
-                    response_schema: turn.response_schema,
-                };
+                let request = turn.into_completion(model);
                 async move {
                     provider
                         .open_turn(request, include_reasoning_payloads)

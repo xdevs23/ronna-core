@@ -8,7 +8,7 @@ use crate::block::{Block, OpaquePayload, ReasoningDetailEntry, Role};
 
 use super::block_content::parse_role;
 use super::descriptors::{ContentDescriptor, overlay_consumer_content, read_quoted_text};
-use super::tool_choice::decode_tool_names;
+use super::tool_choice::{decode_response_schema, decode_tool_names};
 use super::{DomainGate, StoreError};
 
 /// One statement joining every LIBRARY content table by name — the core kinds'
@@ -47,6 +47,9 @@ use super::{DomainGate, StoreError};
 /// `source_block_id`, the call each one answers. It was written from the
 /// beginning and selected by nothing, so the kinds could only pair on the
 /// provider's echo — which a model may reuse.
+///
+/// 2026-09-13, the same lockstep again: the tool choice's join gained its
+/// second column, the answer's schema, with the join list itself untouched.
 pub(super) const BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,
@@ -488,12 +491,11 @@ fn structural_payload(
             // held to the same rule: a column that is not JSON is a corrupt
             // row, not a turn that answers in text.
             let schema: Option<String> = row.get("btch_response_schema")?;
-            if let Some(schema) = schema {
-                let schema = serde_json::from_str(&schema).map_err(|error| {
-                    StoreError::Other(format!(
-                        "block {block_id} records a response schema that does not parse: {error}"
-                    ))
-                })?;
+            if let Some(schema) = decode_response_schema(schema.as_deref()).map_err(|error| {
+                StoreError::Other(format!(
+                    "block {block_id} records a response schema that does not parse: {error}"
+                ))
+            })? {
                 fields.insert("response_schema".into(), schema);
             }
         }

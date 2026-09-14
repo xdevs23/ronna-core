@@ -1544,6 +1544,9 @@ mod tests {
     ///
     /// Updated 2026-09-02 with the statement: both resolution joins gained the
     /// call block they answer, with the join list itself untouched.
+    ///
+    /// Updated 2026-09-13 with the statement: the tool choice's existing join
+    /// gained the answer's schema column, with the join list itself untouched.
     const PINNED_BLOCKS_QUERY: &str = "SELECT
             b.id AS b_id, b.block_type AS b_type, b.created_at AS b_created_at, b.dispatch_anchor AS b_dispatch_anchor,
             bt.role AS bt_role, bt.content AS bt_content,

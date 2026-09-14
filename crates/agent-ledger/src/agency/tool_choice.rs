@@ -26,11 +26,13 @@ pub struct ToolChoice {
     /// The tool names this conversation has, in the order they were recorded.
     /// Empty is a decision: this conversation has no tools.
     pub names: Vec<String>,
-    /// The JSON Schema the next turn's answer must satisfy, or `None` for
-    /// ordinary text. It rides the same record as the names because the two
-    /// are one decision about a turn — what it may call and what shape it
-    /// answers in — and the newest record speaks for both: an append that
-    /// records no schema clears one.
+    /// The JSON Schema every turn's answer must satisfy while this record is
+    /// the newest, or `None` for ordinary text. It has exactly the lifetime
+    /// the names have: it rides the same record because the two are one
+    /// decision about a conversation's turns — what they may call and what
+    /// shape they answer in — and the newest record speaks for both, so an
+    /// append that records no schema clears one, and a compacted thread that
+    /// copies the record copies the schema with it.
     pub response_schema: Option<Value>,
 }
 

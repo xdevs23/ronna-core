@@ -41,10 +41,14 @@ use super::StoreError;
 /// becomes `user_version` `i + 1`.
 ///
 /// Design rules the schema holds to:
-///   - No JSON blobs. Every datum has its own column. One recorded exception
-///     (2026-09-01): the tool choice's names in v7, a list that is one
-///     decision's content, where a row per name would make the block query
-///     return several rows for one block — see the v7 entry.
+///   - No JSON blobs. Every datum has its own column. Two recorded
+///     exceptions, both on the tool choice's row: its names in v7
+///     (2026-09-01), a list that is one decision's content, where a row per
+///     name would make the block query return several rows for one block —
+///     see the v7 entry; and its response schema in v10 (2026-09-13), a
+///     caller's JSON Schema document that the store passes through to a
+///     provider unread, where a column per datum would mean the store
+///     modelling JSON Schema itself — see the v10 entry.
 ///   - Blocks are the primary conversational unit, each carrying its own role.
 ///   - Content lives in typed block content tables, one per block type.
 ///   - The junction table (`conversation_blocks`) enables forking at block

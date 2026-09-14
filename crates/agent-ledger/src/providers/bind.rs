@@ -26,8 +26,8 @@ use tracing::warn;
 
 use super::http;
 use super::types::{
-    EventStream, LlmError, Message, ModelSelector, ProviderRequest, ProviderResponse,
-    ReasoningLevel, StreamEvent, ToolDefinition,
+    CompletionRequest, EventStream, LlmError, Message, ModelSelector, ProviderRequest,
+    ProviderResponse, ReasoningLevel, StreamEvent, ToolDefinition,
 };
 
 /// The application-level idle window for a streaming connection. If no event
@@ -328,6 +328,27 @@ pub struct TurnRequest {
     pub reasoning: Option<ReasoningLevel>,
     /// The JSON Schema the answer must satisfy, or `None` for text.
     pub response_schema: Option<Value>,
+}
+
+impl TurnRequest {
+    /// The neutral request a bound turn opens with, once the vendor has
+    /// resolved the model selector into a slug of its own. The defaults are
+    /// the bound path's: no ceiling, no temperature, streaming. Every vendor
+    /// on this loop converts through here, so a field added to the turn
+    /// cannot be dropped by one of them.
+    #[must_use]
+    pub fn into_completion(self, model: String) -> CompletionRequest {
+        CompletionRequest {
+            model,
+            messages: self.messages,
+            tools: self.tools,
+            max_tokens: None,
+            temperature: None,
+            stream: true,
+            reasoning: self.reasoning,
+            response_schema: self.response_schema,
+        }
+    }
 }
 
 /// Drive one turn end to end: open the stream, retrying rate limits; pump it;

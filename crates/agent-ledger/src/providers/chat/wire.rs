@@ -33,17 +33,6 @@ pub(crate) struct WireRequest {
     pub(super) response_format: Option<Value>,
 }
 
-/// The chat-completions envelope for a JSON Schema answer: the schema itself
-/// under a constant name, and `strict`, which is what makes the endpoint hold
-/// the model to the schema instead of merely suggesting it. The name is
-/// required by the dialect and means nothing to a caller, so it is fixed.
-pub(crate) fn json_schema_response_format(schema: &Value) -> Value {
-    serde_json::json!({
-        "type": "json_schema",
-        "json_schema": { "name": "response", "strict": true, "schema": schema },
-    })
-}
-
 /// Streaming opt-ins.
 ///
 /// Requesting the terminal usage chunk is sent on every streaming request. A

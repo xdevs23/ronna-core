@@ -244,7 +244,7 @@ impl ChatProvider {
             response_format: request
                 .response_schema
                 .as_ref()
-                .map(wire::json_schema_response_format),
+                .map(super::json_schema_response_format),
         };
         (body, carried_payloads)
     }

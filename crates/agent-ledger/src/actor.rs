@@ -1290,7 +1290,9 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         // the very same function on its own snapshot, so what the model is
         // shown and what a call resolves against can never disagree — and
         // this site still names no kind and branches on no type string.
-        let tool_defs = ResolvedTools::of(&blocks, self.ctx.runner.registry()).definitions();
+        let choice = ToolChoice::newest_in(&blocks);
+        let tool_defs =
+            ResolvedTools::from_choice(choice.as_ref(), self.ctx.runner.registry()).definitions();
         // The stored form is the level's canonical key; a key this build does
         // not know defers to the provider's own default rather than failing
         // the turn.
@@ -1315,11 +1317,10 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             model: ModelSelector::Specific(conv.model.external_id),
             tools: tool_defs,
             reasoning,
-            // Read from the SAME snapshot as the tools, off the same record:
-            // what this turn is offered and what shape it answers in are one
-            // decision, and a later append cannot reach a turn in flight.
-            response_schema: ToolChoice::newest_in(&blocks)
-                .and_then(|choice| choice.response_schema),
+            // Off the SAME record as the tools, folded once: what this turn is
+            // offered and what shape it answers in are one decision, and a
+            // later append cannot reach a turn in flight.
+            response_schema: choice.and_then(|choice| choice.response_schema),
         }) {
             tracing::error!(conversation_id = self.id, error = ?e, "handle_blocks_ready: provider channel closed");
             // No stream opened: the seam a failed send left set would leak
@@ -7596,7 +7597,7 @@ mod tests {
     /// The answer's schema rides the same record as the tools: a temporary
     /// fork's schema reaches the dispatch its own empty choice governs, read
     /// off the same snapshot as the tools. (That an ordinary later append
-    /// clears it is the record's own rule, pinned where the record lives.)
+    /// clears it is the record's own rule, asserted where the record lives.)
     #[tokio::test]
     async fn the_dispatch_carries_the_newest_record_s_answer_schema() {
         let (ctx, conv, probe) = scripted_context(Script::CountOnly).await;

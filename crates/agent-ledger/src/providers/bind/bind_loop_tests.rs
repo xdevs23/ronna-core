@@ -524,7 +524,7 @@ async fn every_reopen_of_a_turn_carries_the_same_schema() {
         }
     }
     drop(req_tx);
-    loop_handle.abort();
+    loop_handle.await.expect("the loop exits with the channel");
     assert_eq!(
         *seen.lock().unwrap(),
         vec![Some(schema.clone()), Some(schema)]

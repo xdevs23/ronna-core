@@ -66,7 +66,9 @@
 
 use rusqlite::params;
 
-use crate::agency::{BlockKind, FromBlock, HarnessMessage, LeafKind, SystemPrompt, Text};
+use crate::agency::{
+    BlockKind, FromBlock, HarnessMessage, LeafKind, SystemPrompt, Text, ToolChoice,
+};
 use crate::block::{Block, Role};
 
 use super::conversations::{
@@ -120,13 +122,17 @@ impl TemporaryConversation {
     ///
     /// Past the instructions, because everything before them is the inherited
     /// history the turn was asked ABOUT, including the source's own earlier
-    /// answers.
+    /// answers. A ledger that does not carry the instructions block at all is
+    /// not this conversation's ledger, and it answers `None` rather than
+    /// letting the whole slice count as the turn's product.
     #[must_use]
     pub fn answer_text(&self, blocks: &[Block]) -> Option<String> {
-        blocks
+        let instructions_at = blocks
+            .iter()
+            .position(|block| block.id == self.instructions_block_id)?;
+        blocks[instructions_at + 1..]
             .iter()
             .rev()
-            .take_while(|block| block.id != self.instructions_block_id)
             .filter(|block| {
                 block.role == Some(Role::Assistant)
                     && Text::KINDS.contains(&block.block_type.as_str())
@@ -139,13 +145,15 @@ impl TemporaryConversation {
     /// [`answer_text`](Self::answer_text), read as the JSON a fork with a
     /// [`response_schema`](TemporaryFork::response_schema) asked for.
     ///
-    /// `Ok(None)` is a turn that wrote nothing. A turn that wrote something
-    /// other than the requested shape is the provider failing its contract,
-    /// and that is the caller's failure to report, not a shape to repair here.
+    /// `Ok(None)` is a turn that wrote nothing. The text is checked against
+    /// `T` and nothing else: the schema was the provider's to enforce, and
+    /// this library validates no document against it. A text that does not
+    /// deserialize as `T` is the caller's failure to report, never a shape
+    /// repaired here.
     ///
     /// # Errors
     ///
-    /// If the text is not JSON of the requested type.
+    /// If the text is not JSON that deserializes as `T`.
     pub fn answer<T: serde::de::DeserializeOwned>(
         &self,
         blocks: &[Block],
@@ -263,10 +271,13 @@ impl Store {
         // so no consumer supplies it and no consumer can forget it — and
         // written after the caller's own records, so the library's word is
         // the newest one the turn reads.
-        let response_schema = fork.response_schema;
+        let choice = ToolChoice {
+            names: Vec::new(),
+            response_schema: fork.response_schema,
+        };
         self.run(move |conn| {
             transact(conn, |tx| {
-                insert_tool_choice_block(tx, conversation_id, &[], response_schema.as_ref())
+                insert_tool_choice_block(tx, conversation_id, &choice)
             })
         })
         .await?;
@@ -335,12 +346,7 @@ impl Store {
                 // absence is a record too, and inventing one here would
                 // decide for a consumer that has not decided.
                 if let Some(choice) = newest_tool_choice(tx, source_id)? {
-                    insert_tool_choice_block(
-                        tx,
-                        new_id,
-                        &choice.names,
-                        choice.response_schema.as_ref(),
-                    )?;
+                    insert_tool_choice_block(tx, new_id, &choice)?;
                 }
                 // The thread's prompt is the one it appended above, and the
                 // source's own stays where it was written.
@@ -781,6 +787,11 @@ mod tests {
             temporary.answer_text(&history),
             None,
             "nothing past the instructions"
+        );
+        assert_eq!(
+            temporary.answer_text(&history[..2]),
+            None,
+            "a slice without the instructions block is not this turn's ledger, whatever it holds"
         );
         let mut wrote = history.to_vec();
         wrote.push(said(

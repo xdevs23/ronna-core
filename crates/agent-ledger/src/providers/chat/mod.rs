@@ -16,6 +16,22 @@
 
 pub(crate) mod sse;
 
+/// The chat-completions envelope for a JSON Schema answer: the schema itself
+/// under a constant name, and `strict`, which is what makes the endpoint hold
+/// the model to the schema instead of merely suggesting it. The name is
+/// required by the dialect and means nothing to a caller, so it is fixed.
+///
+/// It sits beside the decoder rather than the base for the decoder's own
+/// reason: a vendor with a request builder of its own still speaks this
+/// dialect's envelope, and two spellings of one envelope is how a fix made
+/// for one vendor stops reaching the other.
+pub(crate) fn json_schema_response_format(schema: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "json_schema",
+        "json_schema": { "name": "response", "strict": true, "schema": schema },
+    })
+}
+
 #[cfg(feature = "_chat")]
 mod base;
 #[cfg(feature = "_chat")]
@@ -35,7 +51,7 @@ pub(crate) use base::{
 pub(crate) use sse::{SseState, decode_string_content};
 #[cfg(feature = "_chat")]
 #[allow(unused_imports)]
-pub(crate) use wire::{WireMessageContent, WireModel, json_schema_response_format};
+pub(crate) use wire::{WireMessageContent, WireModel};
 
 #[cfg(all(test, feature = "_chat"))]
 mod tests;

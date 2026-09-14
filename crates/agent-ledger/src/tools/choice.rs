@@ -47,7 +47,16 @@ impl<'r, E> ResolvedTools<'r, E> {
     /// Resolve a conversation's tools from the ledger snapshot the caller
     /// already holds. Both callers hold one; neither reads a second.
     pub(crate) fn of(ledger: &[Block], registry: &'r ToolRegistry<E>) -> Self {
-        let recorded = ToolChoice::newest_in(ledger);
+        Self::from_choice(ToolChoice::newest_in(ledger).as_ref(), registry)
+    }
+
+    /// Resolve from a choice the caller already folded out of its snapshot —
+    /// the dispatch's door, which reads the same record for the answer's
+    /// schema and must not fold it twice.
+    pub(crate) fn from_choice(
+        recorded: Option<&ToolChoice>,
+        registry: &'r ToolRegistry<E>,
+    ) -> Self {
         let names = registry
             .names()
             .filter(|name| {

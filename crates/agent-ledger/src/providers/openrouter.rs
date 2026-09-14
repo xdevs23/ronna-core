@@ -108,19 +108,11 @@ fn openrouter_reasoning(model: &WireModel) -> ReasoningCapability {
 /// [`background_model`] where there is one, otherwise on the request's own
 /// main model.
 fn turn_request(turn: TurnRequest, lightweight_model: Option<&str>) -> CompletionRequest {
-    CompletionRequest {
-        model: match turn.model {
-            ModelSelector::Specific(model) => model,
-            ModelSelector::Lightweight { main } => lightweight_model.map_or(main, str::to_string),
-        },
-        messages: turn.messages,
-        tools: turn.tools,
-        max_tokens: None,
-        temperature: None,
-        stream: true,
-        reasoning: turn.reasoning,
-        response_schema: turn.response_schema,
-    }
+    let model = match turn.model.clone() {
+        ModelSelector::Specific(model) => model,
+        ModelSelector::Lightweight { main } => lightweight_model.map_or(main, str::to_string),
+    };
+    turn.into_completion(model)
 }
 
 /// The gateway provider module, as the registry holds it.

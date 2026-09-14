@@ -40,9 +40,13 @@ impl Store {
         conversation_id: i64,
         names: Vec<String>,
     ) -> Result<i64, StoreError> {
+        let choice = ToolChoice {
+            names,
+            response_schema: None,
+        };
         self.run(move |conn| {
             transact(conn, |tx| {
-                insert_tool_choice_block(tx, conversation_id, &names, None)
+                insert_tool_choice_block(tx, conversation_id, &choice)
             })
         })
         .await
@@ -65,25 +69,29 @@ impl Store {
     }
 }
 
-/// Append one tool choice block. Called inside a transaction, so its header,
-/// junction and content rows land together — the fork doors reach it directly.
+/// Append one tool choice block, the whole record at once. Called inside a
+/// transaction, so its header, junction and content rows land together — the
+/// fork doors reach it directly.
 ///
 /// The names are serialized in ONE place, here, and read back in one,
-/// [`decode_tool_names`], so no second encoding and no second reading of the
-/// stored list exists. The schema beside them is the caller's JSON Schema
-/// document, serialized as given.
+/// [`decode_tool_names`]; the schema likewise, read back through
+/// [`decode_response_schema`]. No second encoding and no second reading of
+/// either stored column exists.
 pub(super) fn insert_tool_choice_block(
     conn: &Connection,
     conversation_id: i64,
-    names: &[String],
-    response_schema: Option<&Value>,
+    choice: &ToolChoice,
 ) -> Result<i64, StoreError> {
-    let encoded = serde_json::to_string(names)
+    let encoded = serde_json::to_string(&choice.names)
         .map_err(|error| StoreError::Other(format!("tool names do not serialize: {error}")))?;
     let block_id = insert_block(conn, conversation_id, ToolChoice::KINDS[0])?;
     conn.execute(
         "INSERT INTO block_tool_choice (block_id, names, response_schema) VALUES (?1, ?2, ?3)",
-        params![block_id, encoded, response_schema.map(Value::to_string)],
+        params![
+            block_id,
+            encoded,
+            choice.response_schema.as_ref().map(Value::to_string)
+        ],
     )?;
     Ok(block_id)
 }
@@ -118,12 +126,20 @@ pub(super) fn newest_tool_choice(
     };
     Ok(Some(ToolChoice {
         names: decode_tool_names(&names).map_err(|error| corrupt("names", error))?,
-        response_schema: schema
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
+        response_schema: decode_response_schema(schema.as_deref())
             .map_err(|error| corrupt("response schema", error))?,
     }))
+}
+
+/// Read the stored schema column back into the document
+/// [`insert_tool_choice_block`] wrote — the ONE decoding of that form, called
+/// by both readers of a stored row for the reason [`decode_tool_names`] is:
+/// a column that is not JSON is corrupt to both, and to neither a turn that
+/// answers in prose.
+pub(super) fn decode_response_schema(
+    stored: Option<&str>,
+) -> Result<Option<Value>, serde_json::Error> {
+    stored.map(serde_json::from_str).transpose()
 }
 
 /// Read the stored column back into the list [`insert_tool_choice_block`]
@@ -234,12 +250,11 @@ mod tests {
         let schema = serde_json::json!({ "type": "object", "required": ["summary"] });
         store
             .run({
-                let schema = schema.clone();
-                move |conn| {
-                    transact(conn, |tx| {
-                        insert_tool_choice_block(tx, conv, &[], Some(&schema))
-                    })
-                }
+                let choice = ToolChoice {
+                    names: Vec::new(),
+                    response_schema: Some(schema.clone()),
+                };
+                move |conn| transact(conn, |tx| insert_tool_choice_block(tx, conv, &choice))
             })
             .await
             .unwrap();
@@ -263,7 +278,17 @@ mod tests {
         assert_eq!(
             ToolChoice::newest_in(&blocks).unwrap().response_schema,
             None,
-            "the later record records no schema, and the newest record speaks"
+            "the later record records no schema, and the newest record speaks to the fold"
+        );
+        assert_eq!(
+            store
+                .run(move |conn| newest_tool_choice(conn, conv))
+                .await
+                .unwrap()
+                .unwrap()
+                .response_schema,
+            None,
+            "and to the statement, which reads the same newest row"
         );
     }
 

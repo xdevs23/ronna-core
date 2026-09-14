@@ -223,19 +223,11 @@ impl AnthropicProvider {
 /// this vendor's ceiling, and a caller-supplied number above the model's limit
 /// is rejected outright with a 400 — the whole turn, for a field nobody chose.
 fn turn_request(turn: TurnRequest) -> CompletionRequest {
-    CompletionRequest {
-        model: match turn.model {
-            ModelSelector::Specific(m) => m,
-            ModelSelector::Lightweight { .. } => LIGHTWEIGHT_MODEL.into(),
-        },
-        messages: turn.messages,
-        tools: turn.tools,
-        max_tokens: None,
-        temperature: None,
-        stream: true,
-        reasoning: turn.reasoning,
-        response_schema: turn.response_schema,
-    }
+    let model = match &turn.model {
+        ModelSelector::Specific(m) => m.clone(),
+        ModelSelector::Lightweight { .. } => LIGHTWEIGHT_MODEL.into(),
+    };
+    turn.into_completion(model)
 }
 
 /// Convert neutral messages into this vendor's messages.
