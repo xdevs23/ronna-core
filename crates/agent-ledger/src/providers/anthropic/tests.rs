@@ -247,6 +247,29 @@ fn a_refusal_stop_ends_the_turn_as_a_refusal() {
     );
 }
 
+/// A stop reason the wire does not know ends the turn with an error, so it
+/// never passes for a finished answer.
+#[test]
+fn an_unknown_or_missing_stop_reason_fails_the_turn() {
+    for (delta, detail) in [
+        (
+            json!({ "stop_reason": "model_context_window_exceeded" }),
+            "unknown stop reason model_context_window_exceeded",
+        ),
+        (json!({}), "message delta without a stop reason"),
+    ] {
+        let events = parse_sse_event(
+            &json!({ "type": "message_delta", "delta": delta, "usage": { "output_tokens": 0 } })
+                .to_string(),
+            &mut AnthropicSseState::default(),
+        );
+        assert!(
+            matches!(events.as_slice(), [Err(LlmError::ProviderFailure(m))] if m == detail),
+            "{events:?}"
+        );
+    }
+}
+
 /// The bind loop receives a failure that the server reports inside an opened
 /// stream as an error it can classify. The stream does not end quietly.
 mod stream_error_events {

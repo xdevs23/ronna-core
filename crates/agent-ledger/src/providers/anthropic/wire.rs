@@ -370,10 +370,20 @@ pub(super) fn parse_sse_event(
         }
         "message_delta" => {
             let stop_reason = match value["delta"]["stop_reason"].as_str() {
+                Some("end_turn") => StopReason::EndTurn,
                 Some("tool_use") => StopReason::ToolUse,
                 Some("max_tokens") => StopReason::MaxTokens,
                 Some("refusal") => StopReason::Refusal,
-                _ => StopReason::EndTurn,
+                Some(other) => {
+                    return vec![Err(LlmError::ProviderFailure(format!(
+                        "unknown stop reason {other}"
+                    )))];
+                }
+                None => {
+                    return vec![Err(LlmError::ProviderFailure(
+                        "message delta without a stop reason".into(),
+                    ))];
+                }
             };
             let usage = Usage {
                 // The end of the turn restates the input count on some
