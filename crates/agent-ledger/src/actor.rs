@@ -358,11 +358,11 @@ struct ConversationActor<K: RuntimeKind, E> {
     /// The close edges' re-check nudge: a monotonic count the scheduler's
     /// reactive loop tracks, bumped when a close finds an owed-turn signal
     /// was swallowed while the turn was open. The nudge wakes the SCHEDULER,
-    /// never the dispatch delivery directly: the scheduler's ratchet drive is
-    /// the one place the owed-turn check runs on a fresh walk — its parked
-    /// gate included — so the close re-runs the whole check, and the drive
-    /// signals [`SchedulerSignal::OwesTurn`] exactly when
-    /// the re-checked ledger really owes a turn.
+    /// never the dispatch delivery directly. The scheduler's ratchet drive is
+    /// the one place the owed-turn check runs on a fresh walk, parked calls
+    /// included, so the close re-runs the whole check, and the drive signals
+    /// [`SchedulerSignal::OwesTurn`] exactly when the re-checked ledger
+    /// really owes a turn.
     recheck: WriteSignal<u64>,
     provider_tx: Option<ProviderTx>,
     /// The dispatch state (reworked 2026-08-22): opened at delivery, closed on
@@ -855,9 +855,9 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     /// the turn owed, and the delivery stood down on the streaming flag — so
     /// the close nudges the scheduler to re-drive, deterministically. The
     /// nudge goes to the SCHEDULER, not to the dispatch delivery: the drive
-    /// re-runs the whole owed-turn check — parked calls and calls from the
-    /// cursor on without an outcome included — against the closed ledger, so
-    /// a tool round whose siblings are still resolving waits instead of
+    /// re-runs the whole owed-turn check against the closed ledger, parked
+    /// calls and calls from the cursor on without an outcome included, so a
+    /// tool round whose siblings are still resolving waits instead of
     /// dispatching a request around a dangling call. With
     /// nothing swallowed the close rests: the frontier was last answered by
     /// a gated drive, and a blind re-check here would redispatch a turn that
@@ -3710,8 +3710,8 @@ mod tests {
         /// One turn emits TWO tool calls before the closing prose — the
         /// multi-call round: while one sibling's result is recorded and the
         /// other still runs, the tail awaits the model but a call still
-        /// dangles, and only the drive's parked gate knows. A request built
-        /// in that window would carry the dangling call.
+        /// dangles, and the frontier rule owes no turn over it. A request
+        /// built in that window would carry the dangling call.
         TwoCallsInOneTurn,
         /// Every request is counted and left open — the stream never speaks.
         /// The double-turn probe: any second request is a defect, not a retry.

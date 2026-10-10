@@ -17,9 +17,10 @@ use super::{Agency, AgencyCtx, BlockKind, FromBlock, ToolError, ToolResult};
 ///
 /// A regular call owes the SYSTEM its execution: `run()` emits the wakeup and
 /// stays not-done until a result or an error naming this call's own row sits
-/// in the ledger. Parking the cursor here IS the guard against streaming a fresh turn
-/// while calls still dangle — without it a later sibling's result green-lights
-/// a turn and the earlier call is never answered.
+/// in the ledger. The cursor parks here, and the shared owed-turn rule
+/// (`ratchet::frontier_owes_turn`) owes no turn while a call from the cursor on
+/// has no outcome, so a later sibling's result cannot start a turn that
+/// leaves this call unanswered.
 ///
 /// An interactive call owes the USER the reply; the system does nothing.
 #[derive(Debug, Clone)]
