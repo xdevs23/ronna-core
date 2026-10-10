@@ -44,10 +44,16 @@ pub(super) struct OutputConfig {
     /// The effort tier for adaptive thinking.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) effort: Option<String>,
-    /// The answer's schema, in this dialect's `json_schema` envelope; absent
-    /// for text.
+    /// The response schema, absent for text.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) format: Option<Value>,
+    pub(super) format: Option<WireOutputFormat>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(super) enum WireOutputFormat {
+    /// The caller's JSON schema document, sent unchanged.
+    JsonSchema { schema: Value },
 }
 
 impl OutputConfig {
@@ -384,26 +390,42 @@ pub(super) fn parse_sse_event(
             events.extend(state.tool_buffer.drain(..).map(Ok));
             events
         }
-        "error" => vec![Err(stream_error(&value["error"]))],
+        "error" => vec![Err(stream_error(
+            WireStreamError::deserialize(&value["error"]).unwrap_or_default(),
+        ))],
         _ => vec![],
     }
+}
+
+/// The error object of an in-stream error event. A field the event leaves out
+/// is absent, and an unreadable object reads as one with neither field.
+#[derive(Deserialize, Default)]
+struct WireStreamError {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    message: Option<String>,
 }
 
 /// The neutral error for a failure the server reports inside an opened
 /// stream.
 ///
-/// An overloaded or failing server is unavailable for now, and a rate limit
-/// takes the rate-limit path. Every other type, and an error without one, is
-/// a verdict on the request and ends the turn.
-fn stream_error(error: &Value) -> LlmError {
-    let kind = error["type"].as_str().unwrap_or("unknown");
-    let message = error["message"].as_str().unwrap_or("");
-    match kind {
-        "overloaded_error" | "api_error" => LlmError::Unavailable(format!("{kind}: {message}")),
-        "rate_limit_error" => LlmError::RateLimited {
+/// An overloaded or failing server is unavailable for now. A rate limit takes
+/// the rate-limit path. Every other type, and an error without one, is a
+/// verdict on the request and ends the turn.
+fn stream_error(error: WireStreamError) -> LlmError {
+    let mut detail = error
+        .kind
+        .clone()
+        .unwrap_or_else(|| "error event without a type".into());
+    if let Some(message) = error.message {
+        detail = format!("{detail}: {message}");
+    }
+    match error.kind.as_deref() {
+        Some("overloaded_error" | "api_error") => LlmError::Unavailable(detail),
+        Some("rate_limit_error") => LlmError::RateLimited {
             retry_after_secs: None,
         },
-        _ => LlmError::ProviderFailure(format!("{kind}: {message}")),
+        _ => LlmError::ProviderFailure(detail),
     }
 }
 

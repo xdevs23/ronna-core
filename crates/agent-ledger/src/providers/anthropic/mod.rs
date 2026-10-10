@@ -25,7 +25,7 @@ mod wire;
 
 use wire::{
     OutputConfig, WireCapabilities, WireContent, WireContentBlock, WireImageSource, WireMessage,
-    WireModel, WireModelsResponse, WireRequest, WireThinkingRequest, WireTool,
+    WireModel, WireModelsResponse, WireOutputFormat, WireRequest, WireThinkingRequest, WireTool,
 };
 
 /// The API version header this module speaks. Pinned rather than tracked: a
@@ -101,8 +101,8 @@ impl AnthropicProvider {
                 effort,
                 format: request
                     .response_schema
-                    .as_ref()
-                    .map(|schema| serde_json::json!({ "type": "json_schema", "schema": schema })),
+                    .clone()
+                    .map(|schema| WireOutputFormat::JsonSchema { schema }),
             },
         };
         (body, carried_payloads)

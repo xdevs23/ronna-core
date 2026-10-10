@@ -247,13 +247,12 @@ fn a_refusal_stop_ends_the_turn_as_a_refusal() {
     );
 }
 
-/// A failure the server reports inside an opened stream reaches the bind loop
-/// as an error it can classify, never as a quiet end of the stream.
+/// The bind loop receives a failure that the server reports inside an opened
+/// stream as an error it can classify. The stream does not end quietly.
 mod stream_error_events {
     use super::*;
 
-    #[allow(clippy::needless_pass_by_value)]
-    fn parse_error(error: Value) -> LlmError {
+    fn parse_error(error: &Value) -> LlmError {
         let mut events = parse_sse_event(
             &json!({ "type": "error", "error": error }).to_string(),
             &mut AnthropicSseState::default(),
@@ -268,7 +267,7 @@ mod stream_error_events {
     #[test]
     fn an_overloaded_or_failing_server_is_unavailable_and_recoverable() {
         for kind in ["overloaded_error", "api_error"] {
-            let err = parse_error(json!({ "type": kind, "message": "try later" }));
+            let err = parse_error(&json!({ "type": kind, "message": "try later" }));
             assert!(
                 matches!(&err, LlmError::Unavailable(m) if *m == format!("{kind}: try later")),
                 "{err:?}"
@@ -279,7 +278,7 @@ mod stream_error_events {
 
     #[test]
     fn a_rate_limit_takes_the_rate_limit_path() {
-        let err = parse_error(json!({ "type": "rate_limit_error", "message": "slow down" }));
+        let err = parse_error(&json!({ "type": "rate_limit_error", "message": "slow down" }));
         assert!(
             matches!(
                 err,
@@ -293,12 +292,26 @@ mod stream_error_events {
 
     #[test]
     fn any_other_error_ends_the_turn() {
-        for error in [
-            json!({ "type": "invalid_request_error", "message": "bad request" }),
-            json!({ "message": "an error without a type" }),
+        for (error, detail) in [
+            (
+                json!({ "type": "invalid_request_error", "message": "bad request" }),
+                "invalid_request_error: bad request",
+            ),
+            (
+                json!({ "type": "invalid_request_error" }),
+                "invalid_request_error",
+            ),
+            (
+                json!({ "message": "went wrong" }),
+                "error event without a type: went wrong",
+            ),
+            (json!(null), "error event without a type"),
         ] {
-            let err = parse_error(error);
-            assert!(matches!(err, LlmError::ProviderFailure(_)), "{err:?}");
+            let err = parse_error(&error);
+            assert!(
+                matches!(&err, LlmError::ProviderFailure(m) if m == detail),
+                "{err:?}"
+            );
             assert!(!err.is_recoverable());
         }
     }
