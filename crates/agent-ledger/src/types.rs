@@ -128,6 +128,22 @@ pub enum StopReason {
     Refusal,
 }
 
+impl StopReason {
+    /// The machine key of the stream error that closes a turn ending with
+    /// this stop, from the vocabulary documented on
+    /// [`CoreEvent::StreamError`](crate::event::CoreEvent::StreamError).
+    /// `None` for a stop that ends the turn normally.
+    #[must_use]
+    pub fn error_key(self) -> Option<&'static str> {
+        match self {
+            Self::EndTurn | Self::ToolUse => None,
+            Self::MaxTokens => Some("max_tokens"),
+            Self::ContentFilter => Some("content_filter"),
+            Self::Refusal => Some("refusal"),
+        }
+    }
+}
+
 /// Token usage surfaced with a stream's completion.
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamUsage {

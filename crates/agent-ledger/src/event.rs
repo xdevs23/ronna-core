@@ -168,11 +168,12 @@ pub enum CoreEvent {
     /// A turn's stream failed, or ended abnormally.
     ///
     /// Two vocabularies share the field. A turn the RUNTIME ends abnormally
-    /// carries a stable machine key the consumer maps to its own copy —
-    /// `max_tokens` (the context window is exhausted) or `content_filter`
-    /// (the provider's filter halted the response), mirroring
-    /// [`StopReason`]. A provider or transport failure carries the error text
-    /// as the provider rendered it.
+    /// carries a stable machine key the consumer maps to its own copy:
+    /// `max_tokens` (the context window is exhausted), `content_filter`
+    /// (the provider's filter halted the response) or `refusal` (the provider
+    /// or the model declined to answer), as [`StopReason::error_key`] returns
+    /// them. A provider or transport failure carries the error text as the
+    /// provider rendered it.
     StreamError {
         /// The conversation.
         conversation_id: i64,
