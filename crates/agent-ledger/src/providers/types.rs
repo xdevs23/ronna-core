@@ -176,7 +176,7 @@ pub struct ToolDefinition {
 /// What a turn cost.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Usage {
-    /// Tokens the request consumed.
+    /// Tokens the request consumed, cached tokens included.
     pub input_tokens: u32,
     /// Tokens the response produced.
     pub output_tokens: u32,
@@ -187,6 +187,14 @@ pub struct Usage {
     /// from the provider not having said.
     #[serde(default)]
     pub reasoning_tokens: Option<u32>,
+    /// The part of the input tokens read from the provider's prompt cache,
+    /// `None` when the provider does not report it.
+    #[serde(default)]
+    pub cache_read_tokens: Option<u32>,
+    /// The part of the input tokens written to the provider's prompt cache,
+    /// `None` when the provider does not report it.
+    #[serde(default)]
+    pub cache_write_tokens: Option<u32>,
 }
 
 /// Everything a provider can say while a turn is in flight.

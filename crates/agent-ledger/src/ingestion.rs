@@ -1016,6 +1016,8 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 reasoning_tokens: usage.reasoning_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
             }),
             stop_reason: Some(stop_reason),
             generation: Some(self.generation),
@@ -3340,6 +3342,8 @@ mod tests {
                         input_tokens: 11,
                         output_tokens: 3,
                         reasoning_tokens: Some(150),
+                        cache_read_tokens: Some(7),
+                        cache_write_tokens: Some(2),
                     },
                     stop_reason: StopReason::EndTurn,
                 }),
@@ -3364,6 +3368,8 @@ mod tests {
             "the reasoning spend that justifies the empty turn rides the same \
              signal, not dropped"
         );
+        assert_eq!(usage.cache_read_tokens, Some(7));
+        assert_eq!(usage.cache_write_tokens, Some(2));
     }
 
     /// The empty block replays into the model-facing projection as the

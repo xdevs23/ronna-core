@@ -512,5 +512,7 @@ fn parse_usage(response: &Value) -> Usage {
         reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok()),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
     }
 }

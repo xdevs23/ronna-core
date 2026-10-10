@@ -302,10 +302,49 @@ pub(super) struct AnthropicSseState {
     /// that never began, and a text-only answer closed with an unmatched tool
     /// end — an event whoever writes the stream down has no call to attach to.
     tool_open: bool,
-    /// The input count from the start of the message, held until the end of the
-    /// turn carries it out. This vendor reports it once, at the start, and
-    /// nowhere else.
-    input_tokens: u32,
+    /// The input counts from the start of the message, held until the end of
+    /// the turn carries them out.
+    input: InputCounts,
+}
+
+/// The input counts this vendor reports: the tokens after the last cache
+/// breakpoint, and the tokens written to and read from the cache. Each one is
+/// `None` where the event left it out.
+#[derive(Default, Clone, Copy)]
+struct InputCounts {
+    uncached: Option<u32>,
+    cache_write: Option<u32>,
+    cache_read: Option<u32>,
+}
+
+impl InputCounts {
+    fn read(usage: &Value) -> Self {
+        Self {
+            uncached: count_opt(&usage["input_tokens"]),
+            cache_write: count_opt(&usage["cache_creation_input_tokens"]),
+            cache_read: count_opt(&usage["cache_read_input_tokens"]),
+        }
+    }
+
+    /// These counts, with each one they leave out taken from `earlier`.
+    fn or(self, earlier: Self) -> Self {
+        Self {
+            uncached: self.uncached.or(earlier.uncached),
+            cache_write: self.cache_write.or(earlier.cache_write),
+            cache_read: self.cache_read.or(earlier.cache_read),
+        }
+    }
+
+    /// The whole prompt, which is the sum of the three counts. A sum too large
+    /// for the count type reads as zero, like an oversized single count.
+    fn total(self) -> u32 {
+        let sum: u64 = [self.uncached, self.cache_write, self.cache_read]
+            .into_iter()
+            .flatten()
+            .map(u64::from)
+            .sum();
+        u32::try_from(sum).unwrap_or(0)
+    }
 }
 
 pub(super) fn parse_sse_event(
@@ -323,10 +362,8 @@ pub(super) fn parse_sse_event(
 
     match event_type {
         "content_block_delta" => content_block_delta(&value, state),
-        // The only event carrying what the request cost, so it is the one place
-        // that count can be read.
         "message_start" => {
-            state.input_tokens = count(&value["message"]["usage"]["input_tokens"]);
+            state.input = InputCounts::read(&value["message"]["usage"]);
             vec![]
         }
         "content_block_start" => {
@@ -385,14 +422,16 @@ pub(super) fn parse_sse_event(
                     ))];
                 }
             };
+            // The end of the turn restates the input counts on some versions
+            // of this wire and omits them on others; the counts from the start
+            // of the message are the fallback, never a zero.
+            let input = InputCounts::read(&value["usage"]).or(state.input);
             let usage = Usage {
-                // The end of the turn restates the input count on some
-                // versions of this wire and omits it on others; the count from
-                // the start of the message is the fallback, never a zero.
-                input_tokens: count_opt(&value["usage"]["input_tokens"])
-                    .unwrap_or(state.input_tokens),
+                input_tokens: input.total(),
                 output_tokens: count(&value["usage"]["output_tokens"]),
                 reasoning_tokens: None,
+                cache_read_tokens: input.cache_read,
+                cache_write_tokens: input.cache_write,
             };
 
             // The end of the turn first, then the buffered tool events.

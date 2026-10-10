@@ -155,7 +155,7 @@ impl StopReason {
 /// Token usage surfaced with a stream's completion.
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamUsage {
-    /// Tokens the request consumed.
+    /// Tokens the request consumed, cached tokens included.
     pub input_tokens: u32,
     /// Tokens the response produced.
     pub output_tokens: u32,
@@ -167,6 +167,12 @@ pub struct StreamUsage {
     /// `None` when the provider did not say — never a fabricated zero, which
     /// would read as a measurement that the model did not reason.
     pub reasoning_tokens: Option<u32>,
+    /// The part of the input tokens read from the provider's prompt cache,
+    /// `None` when the provider did not say.
+    pub cache_read_tokens: Option<u32>,
+    /// The part of the input tokens written to the provider's prompt cache,
+    /// `None` when the provider did not say.
+    pub cache_write_tokens: Option<u32>,
 }
 
 #[cfg(test)]

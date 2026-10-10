@@ -195,6 +195,72 @@ mod thinking_ingest_fixtures {
         assert_eq!(usage.input_tokens, 1234, "the counted request cost");
         assert_eq!(usage.output_tokens, 57);
         assert_eq!(usage.reasoning_tokens, None, "this vendor states none");
+        assert_eq!(usage.cache_read_tokens, None, "the stream stated none");
+        assert_eq!(usage.cache_write_tokens, None, "the stream stated none");
+    }
+
+    /// The input count covers the whole prompt: the uncached tail plus what
+    /// was written to and read from the cache.
+    #[test]
+    fn cache_counts_from_the_message_start_add_up_to_the_input() {
+        let mut state = AnthropicSseState::default();
+        parse(
+            &mut state,
+            json!({
+                "type": "message_start",
+                "message": { "usage": {
+                    "input_tokens": 100,
+                    "cache_creation_input_tokens": 2000,
+                    "cache_read_input_tokens": 30000,
+                    "output_tokens": 1
+                } }
+            }),
+        );
+        let end = parse(
+            &mut state,
+            json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 5 } }),
+        );
+        let [StreamEvent::MessageEnd { usage, .. }] = end.as_slice() else {
+            panic!("expected one end of turn, got {end:?}");
+        };
+        assert_eq!(usage.input_tokens, 32100);
+        assert_eq!(usage.cache_write_tokens, Some(2000));
+        assert_eq!(usage.cache_read_tokens, Some(30000));
+    }
+
+    #[test]
+    fn input_counts_the_message_delta_restates_take_precedence() {
+        let mut state = AnthropicSseState::default();
+        parse(
+            &mut state,
+            json!({
+                "type": "message_start",
+                "message": { "usage": {
+                    "input_tokens": 1,
+                    "cache_creation_input_tokens": 2,
+                    "cache_read_input_tokens": 3
+                } }
+            }),
+        );
+        let end = parse(
+            &mut state,
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_creation_input_tokens": 20,
+                    "cache_read_input_tokens": 30,
+                    "output_tokens": 5
+                }
+            }),
+        );
+        let [StreamEvent::MessageEnd { usage, .. }] = end.as_slice() else {
+            panic!("expected one end of turn, got {end:?}");
+        };
+        assert_eq!(usage.input_tokens, 60);
+        assert_eq!(usage.cache_write_tokens, Some(20));
+        assert_eq!(usage.cache_read_tokens, Some(30));
     }
 
     /// A reasoning turn followed by a tool call: the reasoning end fires live at
