@@ -1,4 +1,4 @@
-# Slice 24 — the Anthropic wire reports failures, refusals and effort correctly
+# Slice 24: the Anthropic wire reports failures, refusals and effort correctly
 
 Date: 2026-10-11.
 
@@ -32,7 +32,10 @@ failure into silence or sends a field where the API does not read it.
    safety classifier or the model declines, therefore ends the turn like a
    success, often with empty content. A `max_tokens` stop, by contrast,
    records an error status block and closes the turn with the stream
-   error `max_tokens`.
+   error `max_tokens`. A refusal can also arrive mid-stream after partial
+   output, and the API documentation asks for that partial output to be
+   discarded. Any other stop reason the wire does not know, such as
+   `model_context_window_exceeded`, also passes for a normal end of turn.
 4. **The reasoning effort is sent where the API does not read it.** A
    reasoning level sets a top-level `effort` field. The Messages API
    expects the effort inside `output_config`, as `output_config.effort`,
@@ -62,8 +65,19 @@ failure into silence or sends a field where the API does not read it.
    Anthropic wire maps `refusal` to it, and the reader treats it like the
    other abnormal stops: it records an error status block and closes the
    turn with the stream error `refusal`, so the conversation latches and a
-   retry resumes from the turn that is still owed.
-4. **Effort moves into `output_config`.** The Anthropic request contains
+   retry resumes from the turn that is still owed. Unlike the other
+   abnormal stops, a refusal discards the output of the turn that is not
+   committed yet: the streamed text tail is deleted instead of finalized,
+   and the reader ingests nothing more of the turn, so tool calls that a
+   vendor sends after the end of the turn are not recorded. Whether a stop
+   discards that output and which stream error it closes with are defined
+   on `StopReason`.
+4. **An unknown stop reason fails the turn.** The Anthropic wire maps
+   `end_turn`, `tool_use`, `max_tokens` and `refusal`. Any other stop
+   reason, and a `message_delta` without one, becomes a terminal
+   `LlmError::ProviderFailure` that names it, so an unknown stop never
+   passes for a finished answer.
+5. **Effort moves into `output_config`.** The Anthropic request contains
    `output_config` with an optional `effort` and an optional `format`.
    It is sent when either is set and omitted when neither is.
 
@@ -112,11 +126,15 @@ dialect still reports a failed or cancelled response as
 5. A `message_delta` with stop reason `refusal` parses to an end of turn
    with `StopReason::Refusal`.
 6. A turn that ends with `StopReason::Refusal` records one error status
-   block and closes with exactly one stream error, `refusal`.
-7. A request with a reasoning level sends `output_config.effort` and no
+   block and closes with exactly one stream error, `refusal`. Text
+   streamed before the refusal and tool calls sent after it leave no
+   block behind.
+7. A `message_delta` with an unknown stop reason, or without one, parses
+   to a terminal `LlmError::ProviderFailure`.
+8. A request with a reasoning level sends `output_config.effort` and no
    top-level `effort`. A request with a reasoning level and a response
    schema sends one `output_config` with both `effort` and `format`. A
    request with neither sends no `output_config`.
-8. `cargo test --workspace --all-features`, `cargo clippy --workspace
+9. `cargo test --workspace --all-features`, `cargo clippy --workspace
    --all-features --all-targets -- -D warnings` and `cargo fmt --all
    --check` are clean.
