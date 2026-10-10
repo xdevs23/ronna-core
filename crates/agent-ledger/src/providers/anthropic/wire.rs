@@ -359,6 +359,7 @@ pub(super) fn parse_sse_event(
             let stop_reason = match value["delta"]["stop_reason"].as_str() {
                 Some("tool_use") => StopReason::ToolUse,
                 Some("max_tokens") => StopReason::MaxTokens,
+                Some("refusal") => StopReason::Refusal,
                 _ => StopReason::EndTurn,
             };
             let usage = Usage {

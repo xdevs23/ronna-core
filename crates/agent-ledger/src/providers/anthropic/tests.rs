@@ -226,6 +226,27 @@ mod thinking_ingest_fixtures {
     }
 }
 
+/// A refusal is its own stop reason, so a declined turn never reads as a
+/// completed one.
+#[test]
+fn a_refusal_stop_ends_the_turn_as_a_refusal() {
+    let end = parse_sse_event(
+        &json!({ "type": "message_delta", "delta": { "stop_reason": "refusal" }, "usage": { "output_tokens": 0 } })
+            .to_string(),
+        &mut AnthropicSseState::default(),
+    );
+    assert!(
+        matches!(
+            end.as_slice(),
+            [Ok(StreamEvent::MessageEnd {
+                stop_reason: StopReason::Refusal,
+                ..
+            })]
+        ),
+        "{end:?}"
+    );
+}
+
 /// A failure the server reports inside an opened stream reaches the bind loop
 /// as an error it can classify, never as a quiet end of the stream.
 mod stream_error_events {

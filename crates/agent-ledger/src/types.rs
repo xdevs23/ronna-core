@@ -123,6 +123,9 @@ pub enum StopReason {
     /// The provider's content filter halted the response (e.g. an `OpenAI`
     /// Responses `incomplete_details.reason == "content_filter"`).
     ContentFilter,
+    /// The provider or the model declined to answer (e.g. an Anthropic
+    /// `stop_reason == "refusal"`).
+    Refusal,
 }
 
 /// Token usage surfaced with a stream's completion.

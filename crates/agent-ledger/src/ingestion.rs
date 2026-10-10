@@ -982,11 +982,11 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
         // Scoped tightly:
         //
         // - `EndTurn` only. A tool-use stop's turn continues into its calls,
-        //   and the abnormal stops (`max_tokens`, `content_filter`) ride the
-        //   error edge — they latch, and the retry resumes from the
-        //   still-owing tail; an empty block committed there would bury the
-        //   owed message for good. The stream-error and teardown paths never
-        //   reach here at all.
+        //   and the abnormal stops (`max_tokens`, `content_filter`,
+        //   `refusal`) ride the error edge — they latch, and the retry
+        //   resumes from the still-owing tail; an empty block committed there
+        //   would bury the owed message for good. The stream-error and
+        //   teardown paths never reach here at all.
         // - Not when the turn already committed text through ANY finalize
         //   path — the empty block records "no assistant text was committed",
         //   never "text committed, elsewhere".
@@ -1020,12 +1020,14 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
             });
         }
 
-        if stop_reason == StopReason::MaxTokens {
-            self.record_abnormal_stop("max_tokens").await;
-        }
-
-        if stop_reason == StopReason::ContentFilter {
-            self.record_abnormal_stop("content_filter").await;
+        let abnormal_stop = match stop_reason {
+            StopReason::MaxTokens => Some("max_tokens"),
+            StopReason::ContentFilter => Some("content_filter"),
+            StopReason::Refusal => Some("refusal"),
+            StopReason::EndTurn | StopReason::ToolUse => None,
+        };
+        if let Some(error) = abnormal_stop {
+            self.record_abnormal_stop(error).await;
         }
 
         // Reset state for the next turn's content; the open tool lifecycles a
@@ -2126,6 +2128,39 @@ mod tests {
             1,
             "one error status block"
         );
+    }
+
+    /// A refused turn ends like the other abnormal stops: an error status
+    /// block, and one stream error that reads `refusal`, so it never passes
+    /// for a completed answer.
+    #[tokio::test]
+    async fn refusal_stop_closes_the_turn_with_a_refusal_error() {
+        let (ctx, mut rx) = fixture().await;
+        drive_responses(
+            &ctx,
+            false,
+            vec![
+                ProviderResponse::Event(StreamEvent::MessageEnd {
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Refusal,
+                }),
+                ProviderResponse::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            count_type(&ctx, "status").await,
+            1,
+            "one error status block"
+        );
+        let mut errors = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let CoreEvent::StreamError { error, .. } = event {
+                errors.push(error);
+            }
+        }
+        assert_eq!(errors, vec!["refusal".to_string()]);
     }
 
     /// The aggregator's finish-reason-`stop` tool call, end to end through
