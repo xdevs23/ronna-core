@@ -142,6 +142,14 @@ impl StopReason {
             Self::Refusal => Some("refusal"),
         }
     }
+
+    /// Whether the output streamed before this stop is void. A provider sends
+    /// a refusal before any output or after partial output, and that partial
+    /// output is not an answer.
+    #[must_use]
+    pub fn discards_output(self) -> bool {
+        matches!(self, Self::Refusal)
+    }
 }
 
 /// Token usage surfaced with a stream's completion.

@@ -526,6 +526,11 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
     }
 
     async fn ingest(&mut self, event: StreamEvent) {
+        // The rest of a turn whose stop discards its output is part of that
+        // output, such as tool calls a vendor sends after the stop.
+        if self.abnormal_stop.is_some_and(StopReason::discards_output) {
+            return;
+        }
         let conv_id = self.ctx.conversation_id;
         match event {
             // Labels are the stable machine keys documented on
@@ -955,7 +960,11 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
 
     async fn message_end(&mut self, usage: crate::providers::Usage, stop_reason: StopReason) {
         let conv_id = self.ctx.conversation_id;
-        let tail = if self.trackers.content_final_received {
+        let tail = if stop_reason.discards_output() {
+            self.discard_streaming_tails("output discarded by the stop")
+                .await;
+            TailFinalization::NothingToPersist
+        } else if self.trackers.content_final_received {
             TailFinalization::NothingToPersist
         } else {
             // The atomic replace: the final text commits and the streaming
@@ -2128,28 +2137,32 @@ mod tests {
 
     /// A refused turn ends like the other abnormal stops: an error status
     /// block, and one stream error that reads `refusal`, so it never passes
-    /// for a completed answer.
+    /// for a completed answer. The text streamed before the refusal and the
+    /// tool call sent after it leave no block behind.
     #[tokio::test]
     async fn refusal_stop_closes_the_turn_with_a_refusal_error() {
         let (ctx, mut rx) = fixture().await;
-        drive_responses(
-            &ctx,
-            false,
-            vec![
-                ProviderResponse::Event(StreamEvent::MessageEnd {
-                    usage: Usage::default(),
-                    stop_reason: StopReason::Refusal,
-                }),
-                ProviderResponse::Done,
-            ],
-        )
-        .await;
+        let mut responses = vec![
+            ProviderResponse::Event(StreamEvent::TextDelta {
+                text: "partial".into(),
+            }),
+            ProviderResponse::Event(StreamEvent::MessageEnd {
+                usage: Usage::default(),
+                stop_reason: StopReason::Refusal,
+            }),
+        ];
+        responses.extend(tool_use("after-refusal").map(ProviderResponse::Event));
+        responses.push(ProviderResponse::Done);
+        drive_responses(&ctx, false, responses).await;
 
         assert_eq!(
             count_type(&ctx, "status").await,
             1,
             "one error status block"
         );
+        assert_eq!(count_type(&ctx, "text").await, 0, "no assistant text");
+        assert_eq!(count_type(&ctx, "tool_call").await, 0, "no tool call");
+        assert_eq!(streaming_count(&ctx).await, 0, "no streaming tail");
         let mut errors = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if let CoreEvent::StreamError { error, .. } = event {
