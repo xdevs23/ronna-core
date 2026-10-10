@@ -263,8 +263,9 @@ fn resume_at(ledger: &[Block], cursor: i64) -> usize {
         .unwrap_or(0)
 }
 
-/// The owed-turn decision, written once: `frontier` awaits the model, and
-/// every non-interactive call in `snapshot` from `cursor` on has its outcome
+/// The owed-turn decision, written once: the block [`frontier_block`]
+/// resolves in `snapshot` awaits the model, and every non-interactive call in
+/// `snapshot` from `cursor` on has its outcome
 /// ([`ToolCall::system_owed_call_from`], 2026-09-26). A request built while
 /// such a call has no outcome would carry the call without its result.
 ///
@@ -281,15 +282,11 @@ fn resume_at(ledger: &[Block], cursor: i64) -> usize {
 /// drive's answer to the delivery inside the signal was rejected in the
 /// slice's decision record: the ledger can move between the two reads, and a
 /// signal-borne value races the very appends the dispatch identity exists to
-/// record. Both sites hand this rule the block [`frontier_block`] resolves —
-/// the tail read through a dead turn's trailing closure run (2026-08-23),
-/// so the transparency cannot drift between them either.
-pub(crate) fn frontier_owes_turn<K: RuntimeKind>(
-    snapshot: &[Block],
-    cursor: i64,
-    frontier: &Block,
-) -> bool {
-    awaits_model::<K>(frontier)
+/// record. The rule resolves the frontier itself, as the tail read through a
+/// dead turn's trailing closure run (2026-08-23), so the transparency cannot
+/// drift between the two sites either.
+pub(crate) fn frontier_owes_turn<K: RuntimeKind>(snapshot: &[Block], cursor: i64) -> bool {
+    frontier_block::<K>(snapshot).is_some_and(awaits_model::<K>)
         && !ToolCall::system_owed_call_from(snapshot, resume_at(snapshot, cursor))
 }
 
@@ -556,17 +553,24 @@ pub async fn drive_ledger<K: RuntimeKind, E: RuntimeEvent>(
     // one-row tail cannot see behind itself, [`frontier_block`] needs the
     // listing to decide what a closure row buried, and the rule needs it to
     // find a call past the cursor that the walk's snapshot did not contain.
-    // Every tail that owes nothing keeps the one-row read.
-    let fresh = match source.tail(ctx).await? {
-        Some(tail) if K::from_block(&tail).frontier_transparent() || awaits_model::<K>(&tail) => {
-            source.list(ctx).await?
+    // Any other tail is its own frontier and owes nothing, so it keeps the
+    // one-row read and the rule only ever sees a full listing.
+    let tail = source.tail(ctx).await?;
+    let listing = match &tail {
+        Some(tail) if K::from_block(tail).frontier_transparent() || awaits_model::<K>(tail) => {
+            Some(source.list(ctx).await?)
         }
-        tail => tail.into_iter().collect(),
+        _ => None,
     };
-    let frontier = frontier_block::<K>(&fresh);
+    let frontier = match &listing {
+        Some(listing) => frontier_block::<K>(listing),
+        None => tail.as_ref(),
+    };
     let awaiting = frontier.and_then(|block| K::from_block(block).awaiting());
-    let owes_turn =
-        !parked && frontier.is_some_and(|block| frontier_owes_turn::<K>(&fresh, cursor, block));
+    let owes_turn = !parked
+        && listing
+            .as_deref()
+            .is_some_and(|listing| frontier_owes_turn::<K>(listing, cursor));
 
     Ok(Driven::Ran(Outcome {
         cursor,

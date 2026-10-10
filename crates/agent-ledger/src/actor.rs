@@ -1197,7 +1197,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             );
             return;
         };
-        if !ratchet::frontier_owes_turn::<K>(&blocks, cursor, tail) {
+        if !ratchet::frontier_owes_turn::<K>(&blocks, cursor) {
             tracing::debug!(
                 conversation_id = self.id,
                 tail_block = tail.id,
