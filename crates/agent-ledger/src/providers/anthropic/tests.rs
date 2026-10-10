@@ -564,6 +564,7 @@ mod bind_request_golden {
         let (plain, _) = AnthropicProvider::build_request_body(&request, true, true);
         let plain = serde_json::to_value(&plain).expect("the wire serializes");
         assert!(plain.get("output_config").is_none());
+        assert_eq!(plain["cache_control"], json!({ "type": "ephemeral" }));
 
         request.response_schema = Some(schema.clone());
         let (body, _) = AnthropicProvider::build_request_body(&request, true, true);
@@ -641,7 +642,74 @@ mod bind_request_golden {
                 ],
                 "stream": true,
                 "thinking": { "type": "adaptive" },
-                "output_config": { "effort": "high" }
+                "output_config": { "effort": "high" },
+                "cache_control": { "type": "ephemeral" }
+            })
+        );
+    }
+
+    /// A replayed tool round asks for caching once, at the top level, and
+    /// renders the tools, the system prompt and every message without a
+    /// marker of their own.
+    #[test]
+    fn a_tool_round_is_cached_by_the_one_top_level_marker() {
+        let request = turn_request(TurnRequest {
+            model: ModelSelector::Specific("claude-test".into()),
+            messages: vec![
+                Message {
+                    role: MessageRole::System,
+                    content: MessageContent::Text("be terse".into()),
+                },
+                Message {
+                    role: MessageRole::User,
+                    content: MessageContent::Text("what is x?".into()),
+                },
+                Message {
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Parts(vec![ContentPart::ToolUse {
+                        id: "call_1".into(),
+                        name: "search".into(),
+                        input: json!({ "q": "x" }),
+                    }]),
+                },
+                Message {
+                    role: MessageRole::User,
+                    content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "x is 1".into(),
+                    }]),
+                },
+            ],
+            tools: vec![ToolDefinition {
+                name: "search".into(),
+                description: "Search the web".into(),
+                parameters: json!({ "type": "object" }),
+            }],
+            reasoning: None,
+            response_schema: None,
+        });
+
+        let (body, _) = AnthropicProvider::build_request_body(&request, true, true);
+        assert_eq!(
+            serde_json::to_value(&body).expect("the wire serializes"),
+            json!({
+                "model": "claude-test",
+                "max_tokens": 32768,
+                "system": "be terse",
+                "messages": [
+                    { "role": "user", "content": [{ "type": "text", "text": "what is x?" }] },
+                    { "role": "assistant", "content": [
+                        { "type": "tool_use", "id": "call_1", "name": "search", "input": { "q": "x" } }
+                    ] },
+                    { "role": "user", "content": [
+                        { "type": "tool_result", "tool_use_id": "call_1", "content": "x is 1" }
+                    ] }
+                ],
+                "tools": [
+                    { "name": "search", "description": "Search the web", "input_schema": { "type": "object" } }
+                ],
+                "stream": true,
+                "cache_control": { "type": "ephemeral" }
             })
         );
     }

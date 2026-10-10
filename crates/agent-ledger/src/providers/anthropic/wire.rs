@@ -36,6 +36,17 @@ pub(super) struct WireRequest {
     pub(super) thinking: Option<WireThinkingRequest>,
     #[serde(skip_serializing_if = "OutputConfig::is_empty")]
     pub(super) output_config: OutputConfig,
+    /// Automatic prompt caching: the API puts one breakpoint on the last
+    /// cacheable block, so each request reads the prefix the previous one
+    /// wrote.
+    pub(super) cache_control: WireCacheControl,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(super) enum WireCacheControl {
+    /// A cache entry with the default lifetime of five minutes.
+    Ephemeral,
 }
 
 /// The output settings, of which this library sets the effort and the format.
