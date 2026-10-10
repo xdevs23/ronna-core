@@ -1,5 +1,7 @@
 //! A model's request for tool work.
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 use crate::block::{Block, Role};
@@ -166,10 +168,7 @@ impl ToolCall {
         of_interest: &dyn Fn(&ToolCall) -> bool,
     ) -> Option<i64> {
         let own = ledger.iter().position(|block| block.id == before.id)?;
-        let answered: std::collections::HashSet<i64> = ledger
-            .iter()
-            .filter_map(|block| answered_call(block).map(|(named, _)| named))
-            .collect();
+        let answered = answered_call_ids(ledger);
         ledger[..own]
             .iter()
             .find_map(|block| match BlockKind::from_block(block) {
@@ -178,6 +177,23 @@ impl ToolCall {
                 }
                 _ => None,
             })
+    }
+
+    /// Does `ledger`, from index `from` on, contain a non-interactive call
+    /// that no result or error anywhere in `ledger` answers?
+    ///
+    /// The outcome is looked for in the whole ledger, as
+    /// [`resolved_in`](Self::resolved_in) does. One pass collects the answered
+    /// calls, and one pass over the candidates reads that set.
+    #[must_use]
+    pub(crate) fn system_owed_call_from(ledger: &[Block], from: usize) -> bool {
+        let answered = answered_call_ids(ledger);
+        ledger[from..].iter().any(|block| {
+            matches!(
+                BlockKind::from_block(block),
+                BlockKind::ToolCall(call) if !call.interactive && !answered.contains(&call.id)
+            )
+        })
     }
 
     /// Does the ledger hold a call anchored on `anchor` whose outcome the
@@ -507,6 +523,14 @@ fn answered_call(block: &Block) -> Option<(i64, CallOutcome)> {
         }
         _ => None,
     }
+}
+
+/// The block id of every call that a result or an error in `ledger` answers.
+fn answered_call_ids(ledger: &[Block]) -> HashSet<i64> {
+    ledger
+        .iter()
+        .filter_map(|block| answered_call(block).map(|(named, _)| named))
+        .collect()
 }
 
 /// The unresolved call this id names: the id back while the row it names is a

@@ -185,13 +185,14 @@ pub struct Outcome {
     /// [`Agency::durable`](super::Agency::durable).
     pub cursor: i64,
     /// The frontier gate: the drive confirmed its whole SNAPSHOT without
-    /// parking, AND the tail — read fresh after the drive, through a dead
-    /// turn's trailing closure run (`frontier_block`, 2026-08-23) —
-    /// awaits the model. Never a backward scan beyond that scoped skip. The
-    /// fresh tail can include blocks appended after the snapshot that the
-    /// drive never ran; every kind that answers a model ask has an inert
-    /// `run()`, so nothing is skipped by firing on one, and the next drive
-    /// confirms them.
+    /// parking, AND [`frontier_owes_turn`] answers yes on a fresh full
+    /// listing: the tail, read through a dead turn's trailing closure run
+    /// (`frontier_block`, 2026-08-23), awaits the model, and every
+    /// non-interactive call from the cursor on has its outcome. The fresh
+    /// listing can include blocks appended after the snapshot that the drive
+    /// never ran; every kind that answers a model ask has an inert `run()`,
+    /// so nothing is skipped by firing on one, and the next drive confirms
+    /// them. A call among them that has no outcome yet holds the turn back.
     pub owes_turn: bool,
     /// The drive stopped before confirming the tail — a block reported
     /// not-done, or its `run()` failed. A fresh tick re-drives it.
@@ -203,6 +204,15 @@ pub struct Outcome {
     /// chat reply. Orthogonal to `owes_turn`, which additionally requires the
     /// drive to have finished unparked.
     pub awaiting: Option<Awaiting>,
+}
+
+impl Outcome {
+    /// Whether the runtime owes work on this conversation: the drive parked,
+    /// or the frontier awaits the model. The second covers a turn that is
+    /// held back until a call from the cursor on has its outcome.
+    pub(crate) fn work_due(self) -> bool {
+        self.parked || self.awaiting == Some(Awaiting::Model)
+    }
 }
 
 /// Where a drive resumes: the position in ledger order the persisted cursor
@@ -253,26 +263,38 @@ fn resume_at(ledger: &[Block], cursor: i64) -> usize {
         .unwrap_or(0)
 }
 
-/// The owed-turn decision over one tail block, written once: does the tail
-/// await the model? (Amended 2026-08-23: the anchor half this function used
-/// to carry moved to [`fresh_turn_anchor`], because the seventh break
-/// proved a fresh dispatch's anchor is a fact about the SNAPSHOT, not about
-/// the tail alone — the owed decision is the one thing the tail answers by
-/// itself.)
+/// The owed-turn decision, written once: `frontier` awaits the model, and
+/// every non-interactive call in `snapshot` from `cursor` on has its outcome
+/// ([`ToolCall::system_owed_call_from`], 2026-09-26). A request built while
+/// such a call has no outcome would carry the call without its result.
+///
+/// Only calls from the cursor on are candidates: a call behind the cursor was
+/// found resolved or interactive when the cursor passed it, or a fork
+/// inherited it that way. A fork can inherit a call behind its cursor without
+/// its result, and a whole-ledger fold would stall that fork for good.
 ///
 /// Two sites answer with this rule and they are the same rule ON DIFFERENT
-/// SNAPSHOTS by design (2026-08-22): the scheduler's drive decides it on the
-/// fresh post-drive tail to know whether to signal, and the actor's delivery
-/// re-decides it on the very snapshot the model request is built from —
-/// which is where a signal that went stale stands down. Carrying the drive's
-/// answer to the delivery inside the signal was rejected in the slice's
-/// decision record: the ledger can move between the two reads, and a
+/// SNAPSHOTS by design (2026-08-22): the scheduler's drive decides it on a
+/// fresh listing after its walk to know whether to signal, and the actor's
+/// delivery re-decides it on the very snapshot the model request is built
+/// from, which is where a signal that went stale stands down. Carrying the
+/// drive's answer to the delivery inside the signal was rejected in the
+/// slice's decision record: the ledger can move between the two reads, and a
 /// signal-borne value races the very appends the dispatch identity exists to
 /// record. Both sites hand this rule the block [`frontier_block`] resolves —
 /// the tail read through a dead turn's trailing closure run (2026-08-23),
 /// so the transparency cannot drift between them either.
-pub(crate) fn frontier_owes_turn<K: RuntimeKind>(tail: &Block) -> bool {
-    K::from_block(tail).awaiting() == Some(Awaiting::Model)
+pub(crate) fn frontier_owes_turn<K: RuntimeKind>(
+    snapshot: &[Block],
+    cursor: i64,
+    frontier: &Block,
+) -> bool {
+    awaits_model::<K>(frontier)
+        && !ToolCall::system_owed_call_from(snapshot, resume_at(snapshot, cursor))
+}
+
+fn awaits_model<K: RuntimeKind>(block: &Block) -> bool {
+    K::from_block(block).awaiting() == Some(Awaiting::Model)
 }
 
 /// The block the frontier decision reads over one snapshot: the tail, read
@@ -528,23 +550,23 @@ pub async fn drive_ledger<K: RuntimeKind, E: RuntimeEvent>(
     // loop above walked. `parked` stays the drive's own answer: it is a fact
     // about what this drive reached, not about the current tail. The owed
     // turn itself is the shared frontier rule, so this site and the actor's
-    // delivery-time re-check cannot drift. A transparent tail — a row that
-    // stores a turn's end, a marker or an ends-turn-stamped resolution —
-    // costs one extra full read here: the one-row tail cannot see behind
-    // itself, and [`frontier_block`] needs the snapshot to decide what the
-    // closure row buried. The common shapes keep the one-row read.
-    let tail = source.tail(ctx).await?;
-    let frontier = match tail {
-        Some(tail) if K::from_block(&tail).frontier_transparent() => {
-            let snapshot = source.list(ctx).await?;
-            frontier_block::<K>(&snapshot).cloned()
+    // delivery-time re-check cannot drift. A tail that awaits the model or is
+    // transparent (a row that stores a turn's end, a marker or an
+    // ends-turn-stamped resolution) costs one extra full read here: the
+    // one-row tail cannot see behind itself, [`frontier_block`] needs the
+    // listing to decide what a closure row buried, and the rule needs it to
+    // find a call past the cursor that the walk's snapshot did not contain.
+    // Every tail that owes nothing keeps the one-row read.
+    let fresh = match source.tail(ctx).await? {
+        Some(tail) if K::from_block(&tail).frontier_transparent() || awaits_model::<K>(&tail) => {
+            source.list(ctx).await?
         }
-        tail => tail,
+        tail => tail.into_iter().collect(),
     };
-    let awaiting = frontier
-        .as_ref()
-        .and_then(|block| K::from_block(block).awaiting());
-    let owes_turn = !parked && frontier.as_ref().is_some_and(frontier_owes_turn::<K>);
+    let frontier = frontier_block::<K>(&fresh);
+    let awaiting = frontier.and_then(|block| K::from_block(block).awaiting());
+    let owes_turn =
+        !parked && frontier.is_some_and(|block| frontier_owes_turn::<K>(&fresh, cursor, block));
 
     Ok(Driven::Ran(Outcome {
         cursor,

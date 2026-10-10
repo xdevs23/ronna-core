@@ -500,9 +500,10 @@ async fn interrupted_status_tail_caps_the_frontier() {
 /// The conversation ledger, with an interrupt committed the moment the drive
 /// goes back for the tail.
 ///
-/// The drive reads the ledger once to walk it and once more to decide the
-/// frontier; this appends the status cap between the two, which is the shape
-/// of a real interrupt landing while the hooks run.
+/// The drive reads the ledger once to walk it, then reads the tail, and lists
+/// the ledger once more when that tail awaits the model or is transparent.
+/// The tail read here lists the ledger and appends the status cap first,
+/// which is the shape of a real interrupt landing while the hooks run.
 struct InterruptingLedger {
     reads: AtomicUsize,
 }
@@ -565,6 +566,83 @@ async fn a_cap_committed_during_the_drive_caps_the_frontier() {
     let outcome = o.drive().await;
     assert!(!outcome.owes_turn);
     assert_eq!(outcome.cursor, *ledger.last().unwrap());
+}
+
+/// The conversation ledger, with its first listing cut off after `through`
+/// while the store already contains later rows.
+struct StaleFirstListing {
+    through: i64,
+    reads: AtomicUsize,
+}
+
+impl LedgerSource for StaleFirstListing {
+    async fn list<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<Vec<Block>, StoreError> {
+        let ledger = ConversationLedger.list(ctx).await?;
+        if self.reads.fetch_add(1, Ordering::Relaxed) == 0 {
+            return Ok(ledger
+                .into_iter()
+                .filter(|block| block.id <= self.through)
+                .collect());
+        }
+        Ok(ledger)
+    }
+
+    async fn tail<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<Option<Block>, StoreError> {
+        ConversationLedger.tail(ctx).await
+    }
+
+    async fn cursor<E: RuntimeEvent>(&self, ctx: &AgencyCtx<E>) -> Result<Option<i64>, StoreError> {
+        ConversationLedger.cursor(ctx).await
+    }
+
+    async fn persist_cursor<E: RuntimeEvent>(
+        &self,
+        ctx: &AgencyCtx<E>,
+        confirmed_id: i64,
+    ) -> Result<(), StoreError> {
+        ConversationLedger.persist_cursor(ctx, confirmed_id).await
+    }
+}
+
+/// A sibling call and an earlier call's result that land after the drive's
+/// first listing: the walk finds the earlier call resolved and parks on
+/// nothing, and the fresh tail is that result. The sibling past the cursor
+/// still has no outcome, so the drive owes no turn.
+#[tokio::test]
+async fn a_sibling_missed_by_the_first_listing_holds_the_turn_back() {
+    let mut o = Oracle::new().await;
+    o.user_text("two calls").await;
+    let call_a = o.call("call-a").await;
+    let call_b = o.call("call-b").await;
+    let result_a = o.result("call-a").await;
+
+    let source = StaleFirstListing {
+        through: call_a,
+        reads: AtomicUsize::new(0),
+    };
+    let outcome = ratchet::drive_ledger::<BlockKind, _>(&o.ctx, &source)
+        .await
+        .unwrap()
+        .outcome()
+        .expect("the conversation exists");
+    assert_eq!(o.ledger_ids().await.last(), Some(&result_a));
+    assert!(!outcome.owes_turn, "call-b has no outcome yet");
+    assert!(!outcome.parked, "the walk found call-a resolved");
+    assert!(outcome.work_due(), "the held-back turn is work due");
+    assert_eq!(outcome.cursor, call_a);
+    o.expect_silence();
+
+    let outcome = o.drive().await;
+    assert!(outcome.parked, "the next drive parks on call-b");
+    assert!(!outcome.owes_turn);
+    o.expect_wakeup(call_b);
+    o.expect_silence();
+
+    let result_b = o.result("call-b").await;
+    let outcome = o.drive().await;
+    assert!(outcome.owes_turn, "one turn against both results");
+    assert_eq!(outcome.cursor, result_b);
+    o.expect_silence();
 }
 
 /// After an interrupt's status cap, a following user message re-opens the
@@ -1273,6 +1351,44 @@ async fn fork_cursor_never_passes_what_the_source_confirmed() {
     // The source is undisturbed: same ledger, same cursor, still dangling.
     assert_eq!(o.ledger_ids().await, source_ledger);
     assert_eq!(o.cursor().await, user);
+}
+
+/// A fork taken after a healed interrupt: the call's result landed in the
+/// source after the interrupt's status, so a fork at that status inherits the
+/// call without its result behind its cursor. Only calls from the cursor on
+/// hold a turn back, so the fork still owes the turn its next message
+/// summons. That request carries the call without a result, a separate
+/// defect this test documents and does not fix.
+#[tokio::test]
+async fn a_fork_over_an_inherited_unanswered_call_behind_its_cursor_still_owes_its_turn() {
+    let mut o = Oracle::new().await;
+    o.user_text("run it").await;
+    let call = o.call("c1").await;
+    assert!(o.drive().await.parked);
+    o.expect_wakeup(call);
+    let interrupted = o.status("interrupted").await;
+    let result = o.result("c1").await;
+    assert_eq!(o.drive().await.cursor, result, "the source healed");
+
+    let fork_id = o
+        .ctx
+        .store
+        .fork_conversation(o.ctx.conversation_id, interrupted, ModelOverride::default())
+        .await
+        .unwrap();
+    let mut fork = o.scoped_to(fork_id);
+    assert_eq!(fork.cursor().await, interrupted);
+    assert!(
+        !fork.ledger_ids().await.contains(&result),
+        "the fork inherits the call without its result"
+    );
+
+    let summons = fork.user_text("continue").await;
+    let outcome = fork.drive().await;
+    assert!(outcome.owes_turn, "the fork does not stall");
+    assert!(!outcome.parked);
+    assert_eq!(outcome.cursor, summons);
+    fork.expect_silence();
 }
 
 /// Editing the very first group inherits nothing — the cursor stays 0 and the
