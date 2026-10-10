@@ -376,7 +376,26 @@ pub(super) fn parse_sse_event(
             events.extend(state.tool_buffer.drain(..).map(Ok));
             events
         }
+        "error" => vec![Err(stream_error(&value["error"]))],
         _ => vec![],
+    }
+}
+
+/// The neutral error for a failure the server reports inside an opened
+/// stream.
+///
+/// An overloaded or failing server is unavailable for now, and a rate limit
+/// takes the rate-limit path. Every other type, and an error without one, is
+/// a verdict on the request and ends the turn.
+fn stream_error(error: &Value) -> LlmError {
+    let kind = error["type"].as_str().unwrap_or("unknown");
+    let message = error["message"].as_str().unwrap_or("");
+    match kind {
+        "overloaded_error" | "api_error" => LlmError::Unavailable(format!("{kind}: {message}")),
+        "rate_limit_error" => LlmError::RateLimited {
+            retry_after_secs: None,
+        },
+        _ => LlmError::ProviderFailure(format!("{kind}: {message}")),
     }
 }
 

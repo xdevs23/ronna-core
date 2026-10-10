@@ -226,6 +226,63 @@ mod thinking_ingest_fixtures {
     }
 }
 
+/// A failure the server reports inside an opened stream reaches the bind loop
+/// as an error it can classify, never as a quiet end of the stream.
+mod stream_error_events {
+    use super::*;
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn parse_error(error: Value) -> LlmError {
+        let mut events = parse_sse_event(
+            &json!({ "type": "error", "error": error }).to_string(),
+            &mut AnthropicSseState::default(),
+        );
+        assert_eq!(events.len(), 1, "one error, got {events:?}");
+        events
+            .pop()
+            .unwrap()
+            .expect_err("an error event is an error")
+    }
+
+    #[test]
+    fn an_overloaded_or_failing_server_is_unavailable_and_recoverable() {
+        for kind in ["overloaded_error", "api_error"] {
+            let err = parse_error(json!({ "type": kind, "message": "try later" }));
+            assert!(
+                matches!(&err, LlmError::Unavailable(m) if *m == format!("{kind}: try later")),
+                "{err:?}"
+            );
+            assert!(err.is_recoverable());
+        }
+    }
+
+    #[test]
+    fn a_rate_limit_takes_the_rate_limit_path() {
+        let err = parse_error(json!({ "type": "rate_limit_error", "message": "slow down" }));
+        assert!(
+            matches!(
+                err,
+                LlmError::RateLimited {
+                    retry_after_secs: None
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn any_other_error_ends_the_turn() {
+        for error in [
+            json!({ "type": "invalid_request_error", "message": "bad request" }),
+            json!({ "message": "an error without a type" }),
+        ] {
+            let err = parse_error(error);
+            assert!(matches!(err, LlmError::ProviderFailure(_)), "{err:?}");
+            assert!(!err.is_recoverable());
+        }
+    }
+}
+
 /// The replay side: a stored payload of THIS vendor's variant renders as the
 /// native thinking block, and anything else is omitted.
 mod replay_tests {
