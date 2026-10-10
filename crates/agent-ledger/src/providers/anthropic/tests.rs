@@ -443,8 +443,9 @@ mod bind_request_golden {
     use super::*;
 
     /// A schema goes out as this dialect's `output_config.format`, the
-    /// caller's document untouched inside it; a request without one carries
-    /// no `output_config` at all.
+    /// caller's document untouched inside it, and an effort goes into the
+    /// same `output_config`; a request with neither has no `output_config`
+    /// at all.
     #[test]
     fn a_schema_is_sent_as_the_output_config_format() {
         let schema = json!({ "type": "object", "properties": { "summary": { "type": "string" } } });
@@ -469,6 +470,16 @@ mod bind_request_golden {
             body["output_config"],
             json!({ "format": { "type": "json_schema", "schema": schema } })
         );
+
+        request.reasoning = Some(ReasoningLevel::Medium);
+        let (body, _) = AnthropicProvider::build_request_body(&request, true, true);
+        let body = serde_json::to_value(&body).expect("the wire serializes");
+        assert_eq!(
+            body["output_config"],
+            json!({ "effort": "medium", "format": { "type": "json_schema", "schema": schema } }),
+            "the effort and the schema share one output_config"
+        );
+        assert!(body.get("effort").is_none(), "no top-level effort");
     }
 
     fn user_block(id: i64, role: Role, block_type: &str, content: &str) -> Block {
@@ -528,7 +539,7 @@ mod bind_request_golden {
                 ],
                 "stream": true,
                 "thinking": { "type": "adaptive" },
-                "effort": "high"
+                "output_config": { "effort": "high" }
             })
         );
     }

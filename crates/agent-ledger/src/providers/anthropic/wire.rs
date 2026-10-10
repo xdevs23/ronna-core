@@ -34,19 +34,26 @@ pub(super) struct WireRequest {
     /// Adaptive thinking, set when the conversation selects a reasoning level.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) thinking: Option<WireThinkingRequest>,
+    #[serde(skip_serializing_if = "OutputConfig::is_empty")]
+    pub(super) output_config: OutputConfig,
+}
+
+/// The output settings, of which this library sets the effort and the format.
+#[derive(Serialize)]
+pub(super) struct OutputConfig {
     /// The effort tier for adaptive thinking.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) effort: Option<String>,
-    /// The answer's schema, in this dialect's `output_config.format`
-    /// envelope; absent for text.
+    /// The answer's schema, in this dialect's `json_schema` envelope; absent
+    /// for text.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) output_config: Option<OutputConfig>,
+    pub(super) format: Option<Value>,
 }
 
-/// The output settings, of which this library sets only the format.
-#[derive(Serialize)]
-pub(super) struct OutputConfig {
-    pub(super) format: Value,
+impl OutputConfig {
+    fn is_empty(&self) -> bool {
+        self.effort.is_none() && self.format.is_none()
+    }
 }
 
 #[derive(Serialize)]

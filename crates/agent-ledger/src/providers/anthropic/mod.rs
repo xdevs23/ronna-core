@@ -97,10 +97,13 @@ impl AnthropicProvider {
             temperature: request.temperature,
             stream,
             thinking,
-            effort,
-            output_config: request.response_schema.as_ref().map(|schema| OutputConfig {
-                format: serde_json::json!({ "type": "json_schema", "schema": schema }),
-            }),
+            output_config: OutputConfig {
+                effort,
+                format: request
+                    .response_schema
+                    .as_ref()
+                    .map(|schema| serde_json::json!({ "type": "json_schema", "schema": schema })),
+            },
         };
         (body, carried_payloads)
     }
