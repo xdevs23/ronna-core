@@ -179,21 +179,11 @@ impl ToolCall {
             })
     }
 
-    /// Does `ledger`, from index `from` on, contain a non-interactive call
-    /// that no result or error anywhere in `ledger` answers?
-    ///
-    /// The outcome is looked for in the whole ledger, as
-    /// [`resolved_in`](Self::resolved_in) does. One pass collects the answered
-    /// calls, and one pass over the candidates reads that set.
+    /// Does `ledger`, from index `from` on, contain a call whose outcome the
+    /// SYSTEM itself still owes ([`system_owed_calls`])?
     #[must_use]
     pub(crate) fn system_owed_call_from(ledger: &[Block], from: usize) -> bool {
-        let answered = answered_call_ids(ledger);
-        ledger[from..].iter().any(|block| {
-            matches!(
-                BlockKind::from_block(block),
-                BlockKind::ToolCall(call) if !call.interactive && !answered.contains(&call.id)
-            )
-        })
+        system_owed_calls(ledger, &ledger[from..]).next().is_some()
     }
 
     /// Does the ledger hold a call anchored on `anchor` whose outcome the
@@ -218,22 +208,12 @@ impl ToolCall {
     /// answers it like any other call, and a system-owed call is exactly what
     /// it is.
     ///
-    /// Resolution is answered through [`Self::resolved_in`], THE resolution
-    /// predicate, so this cannot drift from what the runner and the
-    /// approval kinds consider answered. The call rows are read through
-    /// [`BlockKind`] for the same reason the runner reads them there: they
-    /// are the library's own kinds, and a composed consumer kind delegates
-    /// the core type strings inward to the same parse.
+    /// [`system_owed_calls`] finds the calls the system owes, and
+    /// [`system_owed_call_from`](Self::system_owed_call_from) uses it too, so
+    /// the two differ only in the calls they take as candidates.
     #[must_use]
     pub(crate) fn system_owed_call_anchored_in(ledger: &[Block], anchor: i64) -> bool {
-        ledger.iter().any(|block| {
-            block.dispatch_anchor == Some(anchor)
-                && matches!(
-                    BlockKind::from_block(block),
-                    BlockKind::ToolCall(call)
-                        if !call.interactive && !call.resolved_in(ledger)
-                )
-        })
+        system_owed_calls(ledger, ledger).any(|block| block.dispatch_anchor == Some(anchor))
     }
 
     /// How many tool outcomes anchored on `anchor` ASK FOR A CONTINUATION —
@@ -531,6 +511,28 @@ fn answered_call_ids(ledger: &[Block]) -> HashSet<i64> {
         .iter()
         .filter_map(|block| answered_call(block).map(|(named, _)| named))
         .collect()
+}
+
+/// Every block in `candidates` that is a non-interactive call no result or
+/// error in `ledger` answers: a call whose outcome the system still owes.
+///
+/// The outcome is looked for in the whole `ledger`, through [`answered_call`],
+/// so this pairs a call with its outcome exactly as
+/// [`ToolCall::resolved_in`] does. The call rows are read through
+/// [`BlockKind`] for the same reason the runner reads them there: they are the
+/// library's own kinds, and a composed consumer kind delegates the core type
+/// strings inward to the same parse.
+fn system_owed_calls<'a>(
+    ledger: &[Block],
+    candidates: &'a [Block],
+) -> impl Iterator<Item = &'a Block> + use<'a> {
+    let answered = answered_call_ids(ledger);
+    candidates.iter().filter(move |block| {
+        matches!(
+            BlockKind::from_block(block),
+            BlockKind::ToolCall(call) if !call.interactive && !answered.contains(&call.id)
+        )
+    })
 }
 
 /// The unresolved call this id names: the id back while the row it names is a
