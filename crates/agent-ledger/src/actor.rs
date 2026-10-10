@@ -1350,6 +1350,31 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         tracing::info!(conversation_id = self.id, "sent stream request to provider");
     }
 
+    /// The cursor and then the ledger, or `None` when a read fails or the
+    /// conversation is gone. The cursor is read first because a call behind
+    /// it had its outcome committed before the cursor moved past it, so a
+    /// ledger read afterwards contains that outcome.
+    async fn read_cursor_and_ledger(&self) -> Option<(i64, Vec<Block>)> {
+        let cursor = match self.ctx.store.cursor(self.id).await {
+            Ok(Some(cursor)) => cursor,
+            Ok(None) => {
+                tracing::debug!(conversation_id = self.id, "the conversation is gone");
+                return None;
+            }
+            Err(e) => {
+                tracing::error!(conversation_id = self.id, error = %e, "reading the cursor failed");
+                return None;
+            }
+        };
+        match self.ctx.store.list_blocks(self.id).await {
+            Ok(blocks) => Some((cursor, blocks)),
+            Err(e) => {
+                tracing::error!(conversation_id = self.id, error = %e, "list_blocks failed");
+                None
+            }
+        }
+    }
+
     /// Does this ledger open with a block whose kind says a conversation
     /// opens with it (2026-09-02)?
     ///
@@ -1360,34 +1385,6 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     /// [`Store::insert_system_prompt`] for the whole of it — and this is its
     /// second reading, at the one place a wrong shape costs a paid turn. An
     /// empty ledger answers `false`, like any other ledger with no head.
-    /// The cursor and the ledger a delivery decides on, or `None` when a read
-    /// fails or the conversation is gone. The cursor is read first, so every
-    /// call between it and a newer cursor was walked and has its outcome in
-    /// the ledger.
-    async fn read_cursor_and_ledger(&self) -> Option<(i64, Vec<Block>)> {
-        let cursor = match self.ctx.store.cursor(self.id).await {
-            Ok(Some(cursor)) => cursor,
-            Ok(None) => {
-                tracing::debug!(
-                    conversation_id = self.id,
-                    "handle_blocks_ready: the conversation is gone — standing down"
-                );
-                return None;
-            }
-            Err(e) => {
-                tracing::error!(conversation_id = self.id, error = %e, "handle_blocks_ready: reading the cursor failed");
-                return None;
-            }
-        };
-        match self.ctx.store.list_blocks(self.id).await {
-            Ok(blocks) => Some((cursor, blocks)),
-            Err(e) => {
-                tracing::error!(conversation_id = self.id, error = %e, "handle_blocks_ready: list_blocks failed");
-                None
-            }
-        }
-    }
-
     fn does_the_ledger_open_with_its_head_kind(blocks: &[Block]) -> bool {
         blocks
             .first()
