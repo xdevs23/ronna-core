@@ -4022,6 +4022,8 @@ mod tests {
         /// Every definition-free derivation request that reached the wire —
         /// what the title-switch pins count: on, at least one; off, zero.
         title_requests: Arc<AtomicUsize>,
+        /// Notified after each turn request is counted in `requests`.
+        request_arrived: Arc<tokio::sync::Notify>,
     }
 
     /// How many answered calls the request's messages already carry — the
@@ -4126,6 +4128,7 @@ mod tests {
             let release = Arc::clone(&self.release);
             let finish = Arc::clone(&self.finish);
             let title_requests = Arc::clone(&self.title_requests);
+            let request_arrived = Arc::clone(&self.request_arrived);
             tokio::spawn(async move {
                 while let Some(request) = req_rx.recv().await {
                     let ProviderRequest::Stream {
@@ -4172,6 +4175,7 @@ mod tests {
                         .push(messages.iter().map(message_shape).collect());
                     seen.lock().unwrap().push(messages.clone());
                     let turn = requests.fetch_add(1, Ordering::SeqCst) + 1;
+                    request_arrived.notify_one();
                     // Scripted by ledger content, not arrival order: a turn
                     // whose messages already carry the answered call gets the
                     // closing prose, the opening turn gets the call.
@@ -4660,6 +4664,8 @@ mod tests {
         /// How many definition-free title derivation requests reached the
         /// provider — the title-switch pins' counter.
         title_requests: Arc<AtomicUsize>,
+        /// Notified after each turn request is counted in `requests`.
+        request_arrived: Arc<tokio::sync::Notify>,
     }
 
     /// The scripted context WITHOUT the reactor: for tests that construct or
@@ -4715,6 +4721,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let finish = Arc::new(tokio::sync::Notify::new());
         let title_requests = Arc::new(AtomicUsize::new(0));
+        let request_arrived = Arc::new(tokio::sync::Notify::new());
         let mut providers = ProviderRegistry::new();
         providers.register(Box::new(ScriptedProvider {
             script,
@@ -4726,6 +4733,7 @@ mod tests {
             release: Arc::clone(&release),
             finish: Arc::clone(&finish),
             title_requests: Arc::clone(&title_requests),
+            request_arrived: Arc::clone(&request_arrived),
         }));
         let mut tools = ToolRegistry::new();
         tools.register("echo", EchoTool);
@@ -4762,6 +4770,7 @@ mod tests {
                 release,
                 finish,
                 title_requests,
+                request_arrived,
             },
         )
     }
@@ -7106,14 +7115,7 @@ mod tests {
 
         complete(calls[1]).await;
         actor.handle_blocks_ready().await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while probe.requests.load(Ordering::SeqCst) == 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the delivery after the second result never sent a request"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        probe.request_arrived.notified().await;
         assert_eq!(probe.requests.load(Ordering::SeqCst), 1);
         assert_eq!(
             tool_result_count(&probe.seen.lock().unwrap()[0]),
