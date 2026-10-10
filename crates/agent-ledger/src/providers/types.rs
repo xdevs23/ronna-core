@@ -15,6 +15,7 @@
 use std::pin::Pin;
 
 use futures::Stream;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -514,8 +515,8 @@ pub enum LlmError {
 
     /// The provider reported from inside an opened stream that it is
     /// overloaded or failed on its side. Recoverable: the request was not at
-    /// fault, so a reconnect re-opens the same turn. It carries no status for
-    /// the same reason [`ProviderFailure`](Self::ProviderFailure) does not.
+    /// fault, so a reconnect re-opens the same turn. It has no status field,
+    /// for the same reason [`ProviderFailure`](Self::ProviderFailure) has none.
     #[error("provider unavailable: {0}")]
     Unavailable(String),
 
@@ -563,11 +564,11 @@ impl LlmError {
     /// retrying would only repeat the same failure.
     ///
     /// Recoverable: dropped and half-open connections, an idle stall,
-    /// transport-level failures — a connect or read timeout, a reset, an early
-    /// EOF — that carry no HTTP status, and a server error response (5xx),
-    /// which reports a failure on the server's side rather than in the
-    /// request, as does an in-stream report that the provider is unavailable.
-    /// Terminal: any other server response, any other verdict the provider
+    /// transport-level failures without an HTTP status (a connect or read
+    /// timeout, a reset, an early EOF), a response with a server error status
+    /// (5xx) and an in-stream report that the provider is unavailable. The
+    /// last two report a failure on the server side, so the request was not
+    /// at fault. Terminal: any other server response, any other verdict the provider
     /// delivered inside a stream, a parse failure, a missing credential, a
     /// config error, a request with nothing to send.
     ///
@@ -584,10 +585,12 @@ impl LlmError {
     pub fn is_recoverable(&self) -> bool {
         match self {
             Self::Stream(_) | Self::StreamIdle(_) | Self::Unavailable(_) => true,
-            // An error carrying an HTTP status is a server-side response, not a
-            // transport drop — terminal. Anything else is the transport.
-            Self::Http(e) => e.status().is_none(),
-            Self::Api { status, .. } => *status >= 500,
+            // Both shapes that can carry an HTTP status are recoverable for a
+            // server error status. An `Http` error without one is the transport.
+            Self::Http(e) => e.status().is_none_or(|status| status.is_server_error()),
+            Self::Api { status, .. } => {
+                StatusCode::from_u16(*status).is_ok_and(|status| status.is_server_error())
+            }
             Self::ProviderFailure(_)
             | Self::RateLimited { .. }
             | Self::Json(_)
@@ -602,8 +605,8 @@ impl LlmError {
 mod recoverable_tests {
     use super::*;
 
-    /// Transport drops, idle stalls and server errors are recoverable — a
-    /// reconnect can fix them. Every other server response, bad input, or
+    /// Transport drops, idle stalls and server errors are recoverable, because
+    /// a reconnect can fix them. Every other server response, bad input, or
     /// missing configuration is terminal.
     #[test]
     fn classifies_recoverable_vs_terminal() {
