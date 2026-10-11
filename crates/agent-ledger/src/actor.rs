@@ -358,11 +358,11 @@ struct ConversationActor<K: RuntimeKind, E> {
     /// The close edges' re-check nudge: a monotonic count the scheduler's
     /// reactive loop tracks, bumped when a close finds an owed-turn signal
     /// was swallowed while the turn was open. The nudge wakes the SCHEDULER,
-    /// never the dispatch delivery directly: the scheduler's ratchet drive is
-    /// the one place the owed-turn check lives — its parked gate included —
-    /// so the close re-runs the whole check instead of a tail-only half of
-    /// it, and the drive signals [`SchedulerSignal::OwesTurn`] exactly when
-    /// the re-checked ledger really owes a turn.
+    /// never the dispatch delivery directly. The scheduler's ratchet drive is
+    /// the one place the owed-turn check runs on a fresh walk, parked calls
+    /// included, so the close re-runs the whole check, and the drive signals
+    /// [`SchedulerSignal::OwesTurn`] exactly when the re-checked ledger
+    /// really owes a turn.
     recheck: WriteSignal<u64>,
     provider_tx: Option<ProviderTx>,
     /// The dispatch state (reworked 2026-08-22): opened at delivery, closed on
@@ -382,8 +382,8 @@ struct ConversationActor<K: RuntimeKind, E> {
     /// turn that wrote nothing left the frontier unchanged and the blind
     /// signal redispatched the same turn forever, and a multi-call tool
     /// round could meet the blind signal with a resolved sibling as the
-    /// tail — a request carrying a still-dangling call, a shape the drive's
-    /// own parked gate can never signal.
+    /// tail — a request carrying a still-dangling call, a shape the shared
+    /// frontier rule never owes a turn over.
     owed_turn_deferred: bool,
     /// The binding identity of the CURRENT provider channel, incremented at
     /// every bind and stamped by that binding's ingestion reader on the
@@ -855,9 +855,10 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
     /// the turn owed, and the delivery stood down on the streaming flag — so
     /// the close nudges the scheduler to re-drive, deterministically. The
     /// nudge goes to the SCHEDULER, not to the dispatch delivery: the drive
-    /// re-runs the whole owed-turn check — parked calls included — against
-    /// the closed ledger, so a tool round whose siblings are still resolving
-    /// parks instead of dispatching a request around a dangling call. With
+    /// re-runs the whole owed-turn check against the closed ledger, parked
+    /// calls and calls from the cursor on without an outcome included, so a
+    /// tool round whose siblings are still resolving waits instead of
+    /// dispatching a request around a dangling call. With
     /// nothing swallowed the close rests: the frontier was last answered by
     /// a gated drive, and a blind re-check here would redispatch a turn that
     /// wrote nothing forever.
@@ -1161,18 +1162,13 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             return;
         }
 
-        // No pending-call guard here: a dangling call parks the cursor, so
-        // the frontier gate never fires over one — and every signal reaching
-        // this point originates at a gated drive; the close edge re-checks
-        // through that same drive rather than signalling here. The ledger can
-        // still move between a drive and its delivery; the tail re-check
-        // below is what stands a signal that went stale down.
-        let blocks = match self.ctx.store.list_blocks(self.id).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(conversation_id = self.id, error = %e, "handle_blocks_ready: list_blocks failed");
-                return;
-            }
+        // The frontier rule below decides on this snapshot and cursor, so a
+        // signal that went stale stands down here: the ledger moved after its
+        // drive, or a call from the cursor on has no outcome yet. The store
+        // write that resolves the call wakes the scheduler, and that drive
+        // signals again.
+        let Some((cursor, blocks)) = self.read_cursor_and_ledger().await else {
+            return;
         };
         // The dispatch-snapshot anchor resolution (2026-08-22): the frontier
         // rule — [`ratchet::frontier_owes_turn`], the same one decision the
@@ -1201,7 +1197,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             );
             return;
         };
-        if !ratchet::frontier_owes_turn::<K>(tail) {
+        if !ratchet::frontier_owes_turn::<K>(&blocks, cursor) {
             tracing::debug!(
                 conversation_id = self.id,
                 tail_block = tail.id,
@@ -1352,6 +1348,31 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         self.open_turn = Some(anchor);
 
         tracing::info!(conversation_id = self.id, "sent stream request to provider");
+    }
+
+    /// The cursor and then the ledger, or `None` when a read fails or the
+    /// conversation is gone. The cursor is read first because a call behind
+    /// it had its outcome committed before the cursor moved past it, so a
+    /// ledger read afterwards contains that outcome.
+    async fn read_cursor_and_ledger(&self) -> Option<(i64, Vec<Block>)> {
+        let cursor = match self.ctx.store.cursor(self.id).await {
+            Ok(Some(cursor)) => cursor,
+            Ok(None) => {
+                tracing::debug!(conversation_id = self.id, "the conversation is gone");
+                return None;
+            }
+            Err(e) => {
+                tracing::error!(conversation_id = self.id, error = %e, "reading the cursor failed");
+                return None;
+            }
+        };
+        match self.ctx.store.list_blocks(self.id).await {
+            Ok(blocks) => Some((cursor, blocks)),
+            Err(e) => {
+                tracing::error!(conversation_id = self.id, error = %e, "list_blocks failed");
+                None
+            }
+        }
     }
 
     /// Does this ledger open with a block whose kind says a conversation
@@ -1708,9 +1729,9 @@ async fn run_scheduler<K: RuntimeKind, E: RuntimeEvent>(
 /// State broadcaster — emits [`CoreEvent::ConversationState`] whenever the
 /// latch or the scheduler's published drive Outcome changes. Read-only by
 /// design: it never drives the ratchet (the scheduler is the single driver).
-/// `work_due` = the frontier owes a turn or the cursor is parked; a latched
-/// conversation is not driven, so `work_due` holds the last unlatched
-/// derivation — false until the first drive.
+/// `work_due` is [`ratchet::Outcome::work_due`]; a latched conversation is
+/// not driven, so `work_due` holds the last unlatched derivation — false
+/// until the first drive.
 async fn run_state_broadcaster<K: RuntimeKind, E: RuntimeEvent>(
     conv_id: i64,
     ctx: RuntimeContext<K, E>,
@@ -1722,7 +1743,7 @@ async fn run_state_broadcaster<K: RuntimeKind, E: RuntimeEvent>(
     reactive! {
         let latched = read_latched.get();
         let outcome = read_outcome.get();
-        let work_due = outcome.is_some_and(|o| o.owes_turn || o.parked);
+        let work_due = outcome.is_some_and(ratchet::Outcome::work_due);
         let awaiting = outcome.and_then(|o| o.awaiting);
 
         bus.emit(CoreEvent::ConversationState {
@@ -3689,8 +3710,8 @@ mod tests {
         /// One turn emits TWO tool calls before the closing prose — the
         /// multi-call round: while one sibling's result is recorded and the
         /// other still runs, the tail awaits the model but a call still
-        /// dangles, and only the drive's parked gate knows. A request built
-        /// in that window would carry the dangling call.
+        /// dangles, and the frontier rule owes no turn over it. A request
+        /// built in that window would carry the dangling call.
         TwoCallsInOneTurn,
         /// Every request is counted and left open — the stream never speaks.
         /// The double-turn probe: any second request is a defect, not a retry.
@@ -4001,6 +4022,8 @@ mod tests {
         /// Every definition-free derivation request that reached the wire —
         /// what the title-switch pins count: on, at least one; off, zero.
         title_requests: Arc<AtomicUsize>,
+        /// Notified after each turn request is counted in `requests`.
+        request_arrived: Arc<tokio::sync::Notify>,
     }
 
     /// How many answered calls the request's messages already carry — the
@@ -4105,6 +4128,7 @@ mod tests {
             let release = Arc::clone(&self.release);
             let finish = Arc::clone(&self.finish);
             let title_requests = Arc::clone(&self.title_requests);
+            let request_arrived = Arc::clone(&self.request_arrived);
             tokio::spawn(async move {
                 while let Some(request) = req_rx.recv().await {
                     let ProviderRequest::Stream {
@@ -4151,6 +4175,7 @@ mod tests {
                         .push(messages.iter().map(message_shape).collect());
                     seen.lock().unwrap().push(messages.clone());
                     let turn = requests.fetch_add(1, Ordering::SeqCst) + 1;
+                    request_arrived.notify_one();
                     // Scripted by ledger content, not arrival order: a turn
                     // whose messages already carry the answered call gets the
                     // closing prose, the opening turn gets the call.
@@ -4639,6 +4664,8 @@ mod tests {
         /// How many definition-free title derivation requests reached the
         /// provider — the title-switch pins' counter.
         title_requests: Arc<AtomicUsize>,
+        /// Notified after each turn request is counted in `requests`.
+        request_arrived: Arc<tokio::sync::Notify>,
     }
 
     /// The scripted context WITHOUT the reactor: for tests that construct or
@@ -4694,6 +4721,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let finish = Arc::new(tokio::sync::Notify::new());
         let title_requests = Arc::new(AtomicUsize::new(0));
+        let request_arrived = Arc::new(tokio::sync::Notify::new());
         let mut providers = ProviderRegistry::new();
         providers.register(Box::new(ScriptedProvider {
             script,
@@ -4705,6 +4733,7 @@ mod tests {
             release: Arc::clone(&release),
             finish: Arc::clone(&finish),
             title_requests: Arc::clone(&title_requests),
+            request_arrived: Arc::clone(&request_arrived),
         }));
         let mut tools = ToolRegistry::new();
         tools.register("echo", EchoTool);
@@ -4741,6 +4770,7 @@ mod tests {
                 release,
                 finish,
                 title_requests,
+                request_arrived,
             },
         )
     }
@@ -6961,8 +6991,8 @@ mod tests {
 
     /// A turn that emits TWO tool calls: while the first sibling's result is
     /// recorded and the second still runs, the tail awaits the model but a
-    /// call still dangles — a shape only the drive's parked gate can see.
-    /// Because the close re-checks THROUGH that drive, no request is ever
+    /// call still dangles, and the frontier rule owes no turn over it.
+    /// Because the close re-checks THROUGH the drive, no request is ever
     /// built around the dangling sibling: every dispatched request carries a
     /// result for every call it shows, and the continuation fires exactly
     /// once, off the second result.
@@ -7032,6 +7062,66 @@ mod tests {
             2
         );
         assert_anchors(&blocks, user_block(&blocks).id);
+    }
+
+    /// A delivery whose snapshot shows a call without an outcome sends no
+    /// request, even though the tail, the first call's result, awaits the
+    /// model. The signal it answers can be older than the round. Once the
+    /// second result is recorded, the next delivery sends one request that
+    /// carries both results.
+    #[tokio::test]
+    async fn a_delivery_stands_down_while_a_sibling_call_has_no_outcome() {
+        let (ctx, conv, probe) = scripted_context(Script::CountOnly).await;
+        let summons = ctx
+            .store
+            .insert_text_block(conv, crate::block::Role::User, "summons".into())
+            .await
+            .unwrap();
+        let mut calls = Vec::new();
+        for tool_call_id in ["call-1", "call-2"] {
+            let call = ctx
+                .store
+                .insert_tool_call_block(
+                    crate::store::BlockDestination::anchored(conv, Some(summons)),
+                    crate::block::Role::Assistant,
+                    ToolCallInsert {
+                        tool_call_id: tool_call_id.into(),
+                        name: "echo".into(),
+                        input: "{}".into(),
+                        interactive: false,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            calls.push((tool_call_id, call));
+        }
+        let complete = async |(tool_call_id, call): (&str, i64)| {
+            ctx.store
+                .complete_tool_call_block(conv, tool_call_id.into(), "ok".into(), call)
+                .await
+                .unwrap()
+                .expect("the call is unresolved");
+        };
+        complete(calls[0]).await;
+
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_blocks_ready().await;
+        assert!(
+            actor.provider_tx.is_none() && !actor.streaming,
+            "the delivery stood down before binding a provider"
+        );
+        assert_eq!(probe.requests.load(Ordering::SeqCst), 0);
+
+        complete(calls[1]).await;
+        actor.handle_blocks_ready().await;
+        probe.request_arrived.notified().await;
+        assert_eq!(probe.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tool_result_count(&probe.seen.lock().unwrap()[0]),
+            2,
+            "the request carries both results"
+        );
     }
 
     /// Aborting the executor aborts the in-flight bodies too: they join a set
