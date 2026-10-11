@@ -43,6 +43,7 @@ async fn drive_replay(
             tools: vec![],
             reasoning: None,
             response_schema: None,
+            cache_prompt: false,
         })
         .unwrap();
 

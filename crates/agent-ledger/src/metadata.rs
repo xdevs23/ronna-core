@@ -627,6 +627,8 @@ async fn request_title_stream<K: RuntimeKind>(
         // carried main model — with no reasoning.
         reasoning: None,
         response_schema: None,
+        // No later request repeats a prompt that ends in this instruction.
+        cache_prompt: false,
     })
     .is_ok()
 }

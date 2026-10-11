@@ -24,8 +24,9 @@ use super::{BoxFuture, ProviderModule, TurnRequest};
 mod wire;
 
 use wire::{
-    OutputConfig, WireCapabilities, WireContent, WireContentBlock, WireImageSource, WireMessage,
-    WireModel, WireModelsResponse, WireOutputFormat, WireRequest, WireThinkingRequest, WireTool,
+    OutputConfig, WireCacheControl, WireCapabilities, WireContent, WireContentBlock,
+    WireImageSource, WireMessage, WireModel, WireModelsResponse, WireOutputFormat, WireRequest,
+    WireThinkingRequest, WireTool,
 };
 
 /// The API version header this module speaks. Pinned rather than tracked: a
@@ -104,6 +105,7 @@ impl AnthropicProvider {
                     .clone()
                     .map(|schema| WireOutputFormat::JsonSchema { schema }),
             },
+            cache_control: request.cache_prompt.then_some(WireCacheControl::Ephemeral),
         };
         (body, carried_payloads)
     }

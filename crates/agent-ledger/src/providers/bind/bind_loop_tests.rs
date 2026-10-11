@@ -34,6 +34,7 @@ async fn drive(
             tools: vec![],
             reasoning: None,
             response_schema: None,
+            cache_prompt: false,
         })
         .unwrap();
 
@@ -365,6 +366,7 @@ async fn dropping_the_sender_stops_the_cycle() {
             tools: vec![],
             reasoning: None,
             response_schema: None,
+            cache_prompt: false,
         })
         .unwrap();
 
@@ -445,6 +447,7 @@ async fn a_superseded_turn_sends_no_close() {
         tools: vec![],
         reasoning: None,
         response_schema: None,
+        cache_prompt: false,
     };
     req_tx.send(request()).unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -516,6 +519,7 @@ async fn every_reopen_of_a_turn_carries_the_same_schema() {
             tools: vec![],
             reasoning: None,
             response_schema: Some(schema.clone()),
+            cache_prompt: false,
         })
         .unwrap();
     while let Some(resp) = resp_rx.recv().await {
