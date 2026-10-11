@@ -497,7 +497,8 @@ fn finish(
 
 /// Counts from the terminal event, read defensively: they are null on a failure
 /// and may be absent or partial on an incomplete response. The reasoning count
-/// is present only when reasoning occurred, and absent means absent.
+/// is present only when reasoning occurred, the cached count only where the
+/// response reports one, and absent means absent.
 fn parse_usage(response: &Value) -> Usage {
     let usage = &response["usage"];
     let count = |value: &Value| {
@@ -512,7 +513,9 @@ fn parse_usage(response: &Value) -> Usage {
         reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok()),
-        cache_read_tokens: None,
+        cache_read_tokens: usage["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok()),
         cache_write_tokens: None,
     }
 }

@@ -255,6 +255,7 @@ mod parser_fixtures {
             json!({ "type": "response.output_text.done", "item_id": "msg_1", "text": "Hello world" }),
             completed(&json!({
                 "input_tokens": 12,
+                "input_tokens_details": { "cached_tokens": 8 },
                 "output_tokens": 40,
                 "output_tokens_details": { "reasoning_tokens": 25 },
                 "total_tokens": 52
@@ -270,6 +271,8 @@ mod parser_fixtures {
                 assert_eq!(usage.input_tokens, 12);
                 assert_eq!(usage.output_tokens, 40);
                 assert_eq!(usage.reasoning_tokens, Some(25));
+                assert_eq!(usage.cache_read_tokens, Some(8));
+                assert_eq!(usage.cache_write_tokens, None);
             }
             other => panic!("expected the end of turn, got {other:?}"),
         }
@@ -295,6 +298,7 @@ mod parser_fixtures {
                 assert_eq!(usage.input_tokens, 9);
                 assert_eq!(usage.output_tokens, 100);
                 assert_eq!(usage.reasoning_tokens, None);
+                assert_eq!(usage.cache_read_tokens, None);
             }
             other => panic!("expected the end of turn, got {other:?}"),
         }

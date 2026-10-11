@@ -730,6 +730,7 @@ mod usage_tests {
             json!({ "choices": [], "usage": {
                 "prompt_tokens": 12,
                 "completion_tokens": 34,
+                "prompt_tokens_details": { "cached_tokens": 8 },
                 "completion_tokens_details": { "reasoning_tokens": 7 }
             } }),
             &mut state,
@@ -740,6 +741,8 @@ mod usage_tests {
                 if usage.input_tokens == 12
                     && usage.output_tokens == 34
                     && usage.reasoning_tokens == Some(7)
+                    && usage.cache_read_tokens == Some(8)
+                    && usage.cache_write_tokens.is_none()
         ));
 
         assert!(
@@ -789,6 +792,7 @@ mod usage_tests {
                 StreamEvent::ToolUseEnd,
             ] if usage.input_tokens == 1
                 && usage.reasoning_tokens.is_none()
+                && usage.cache_read_tokens.is_none()
                 && id == "call_1"
                 && name == "search"
                 && json == "{\"q\":1}"

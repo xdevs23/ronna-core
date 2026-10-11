@@ -300,8 +300,8 @@ fn ingest_tool_call_fragment(state: &mut SseState, fragment: &Value) {
 }
 
 /// Read a terminal usage object defensively: an absent or null object is no
-/// counts at all, absent fields are zero, and reasoning tokens stay optional —
-/// absent means absent, never a fabricated zero.
+/// counts at all, absent fields are zero, and the reasoning and cached counts
+/// stay optional — absent means absent, never a fabricated zero.
 fn parse_usage(value: &Value) -> Option<Usage> {
     let usage = value.as_object()?;
     let count = |field: &str| {
@@ -318,7 +318,10 @@ fn parse_usage(value: &Value) -> Option<Usage> {
             .get("completion_tokens_details")
             .and_then(|details| details["reasoning_tokens"].as_u64())
             .and_then(|n| u32::try_from(n).ok()),
-        cache_read_tokens: None,
+        cache_read_tokens: usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details["cached_tokens"].as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
         cache_write_tokens: None,
     })
 }
