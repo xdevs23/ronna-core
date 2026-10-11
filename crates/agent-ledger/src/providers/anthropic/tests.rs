@@ -7,7 +7,7 @@ use super::wire::{AnthropicSseState, parse_sse_event};
 use super::*;
 use crate::block::{Block, Role};
 use crate::providers::render::blocks_to_messages;
-use crate::providers::types::{StopReason, StreamEvent, ToolDefinition};
+use crate::providers::types::{StopReason, StreamEvent, ToolDefinition, Usage};
 
 /// The reasoning ingest: a block start, its deltas, its signature fragments,
 /// and the stop that carries the signature out as the continuity payload.
@@ -172,57 +172,55 @@ mod thinking_ingest_fixtures {
         );
     }
 
+    /// Every result of a `message_start` with `start` as its usage, followed
+    /// by an ending `message_delta` with `end` as its usage.
+    fn turn_end(start: &Value, end: &Value) -> Vec<Result<StreamEvent, LlmError>> {
+        let mut state = AnthropicSseState::default();
+        let start = json!({ "type": "message_start", "message": { "usage": start } });
+        let end = json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": end });
+        let mut results = parse_sse_event(&start.to_string(), &mut state);
+        results.extend(parse_sse_event(&end.to_string(), &mut state));
+        results
+    }
+
+    /// The usage that ends such a turn.
+    #[allow(clippy::needless_pass_by_value)]
+    fn turn_usage(start: Value, end: Value) -> Usage {
+        match turn_end(&start, &end).as_slice() {
+            [Ok(StreamEvent::MessageEnd { usage, .. })] => *usage,
+            other => panic!("expected one end of turn, got {other:?}"),
+        }
+    }
+
     /// The input count comes from the start of the message, which is the only
     /// event that carries it. A hardcoded zero would be a fabricated
     /// measurement — a claim that the request cost nothing.
     #[test]
     fn input_tokens_come_from_the_message_start() {
-        let mut state = AnthropicSseState::default();
-        parse(
-            &mut state,
-            json!({
-                "type": "message_start",
-                "message": { "usage": { "input_tokens": 1234, "output_tokens": 1 } }
-            }),
+        let usage = turn_usage(
+            json!({ "input_tokens": 1234, "output_tokens": 1 }),
+            json!({ "output_tokens": 57 }),
         );
-        let end = parse(
-            &mut state,
-            json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 57 } }),
-        );
-        let [StreamEvent::MessageEnd { usage, .. }] = end.as_slice() else {
-            panic!("expected one end of turn, got {end:?}");
-        };
         assert_eq!(usage.input_tokens, 1234, "the counted request cost");
         assert_eq!(usage.output_tokens, 57);
         assert_eq!(usage.reasoning_tokens, None, "this vendor states none");
-        assert_eq!(usage.cache_read_tokens, None, "the stream stated none");
-        assert_eq!(usage.cache_write_tokens, None, "the stream stated none");
+        assert_eq!(usage.cache_read_tokens, None, "the stream reported none");
+        assert_eq!(usage.cache_write_tokens, None, "the stream reported none");
     }
 
     /// The input count covers the whole prompt: the uncached tail plus what
     /// was written to and read from the cache.
     #[test]
     fn cache_counts_from_the_message_start_add_up_to_the_input() {
-        let mut state = AnthropicSseState::default();
-        parse(
-            &mut state,
+        let usage = turn_usage(
             json!({
-                "type": "message_start",
-                "message": { "usage": {
-                    "input_tokens": 100,
-                    "cache_creation_input_tokens": 2000,
-                    "cache_read_input_tokens": 30000,
-                    "output_tokens": 1
-                } }
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 2000,
+                "cache_read_input_tokens": 30000,
+                "output_tokens": 1
             }),
+            json!({ "output_tokens": 5 }),
         );
-        let end = parse(
-            &mut state,
-            json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 5 } }),
-        );
-        let [StreamEvent::MessageEnd { usage, .. }] = end.as_slice() else {
-            panic!("expected one end of turn, got {end:?}");
-        };
         assert_eq!(usage.input_tokens, 32100);
         assert_eq!(usage.cache_write_tokens, Some(2000));
         assert_eq!(usage.cache_read_tokens, Some(30000));
@@ -230,37 +228,61 @@ mod thinking_ingest_fixtures {
 
     #[test]
     fn input_counts_the_message_delta_restates_take_precedence() {
-        let mut state = AnthropicSseState::default();
-        parse(
-            &mut state,
+        let usage = turn_usage(
             json!({
-                "type": "message_start",
-                "message": { "usage": {
-                    "input_tokens": 1,
-                    "cache_creation_input_tokens": 2,
-                    "cache_read_input_tokens": 3
-                } }
+                "input_tokens": 1,
+                "cache_creation_input_tokens": 2,
+                "cache_read_input_tokens": 3
+            }),
+            json!({
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 30,
+                "output_tokens": 5
             }),
         );
-        let end = parse(
-            &mut state,
-            json!({
-                "type": "message_delta",
-                "delta": { "stop_reason": "end_turn" },
-                "usage": {
-                    "input_tokens": 10,
-                    "cache_creation_input_tokens": 20,
-                    "cache_read_input_tokens": 30,
-                    "output_tokens": 5
-                }
-            }),
-        );
-        let [StreamEvent::MessageEnd { usage, .. }] = end.as_slice() else {
-            panic!("expected one end of turn, got {end:?}");
-        };
         assert_eq!(usage.input_tokens, 60);
         assert_eq!(usage.cache_write_tokens, Some(20));
         assert_eq!(usage.cache_read_tokens, Some(30));
+    }
+
+    /// Each count the delta leaves out comes from the start of the message.
+    #[test]
+    fn a_delta_that_restates_only_the_uncached_count_keeps_the_cache_counts() {
+        let usage = turn_usage(
+            json!({
+                "input_tokens": 1,
+                "cache_creation_input_tokens": 2,
+                "cache_read_input_tokens": 3
+            }),
+            json!({ "input_tokens": 10, "output_tokens": 5 }),
+        );
+        assert_eq!(usage.input_tokens, 15);
+        assert_eq!(usage.cache_write_tokens, Some(2));
+        assert_eq!(usage.cache_read_tokens, Some(3));
+    }
+
+    /// The input count is the sum of all three counts, so a count that does
+    /// not fit, or a sum that does not, fails the turn instead of reporting a
+    /// smaller prompt than was sent.
+    #[test]
+    fn an_input_count_out_of_range_fails_the_turn() {
+        let over = u64::from(u32::MAX) + 1;
+        for (start, end) in [
+            (json!({ "input_tokens": over }), json!({})),
+            (json!({ "input_tokens": -1 }), json!({})),
+            (json!({}), json!({ "cache_read_input_tokens": over })),
+            (
+                json!({ "input_tokens": u32::MAX, "cache_read_input_tokens": 1 }),
+                json!({}),
+            ),
+        ] {
+            let results = turn_end(&start, &end);
+            assert!(
+                matches!(results.first(), Some(Err(LlmError::Json(_)))),
+                "{start} then {end} fails with a parse error first, got {results:?}"
+            );
+        }
     }
 
     /// A reasoning turn followed by a tool call: the reasoning end fires live at

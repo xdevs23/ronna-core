@@ -313,48 +313,46 @@ pub(super) struct AnthropicSseState {
     /// that never began, and a text-only answer closed with an unmatched tool
     /// end — an event whoever writes the stream down has no call to attach to.
     tool_open: bool,
-    /// The input counts from the start of the message, held until the end of
-    /// the turn carries them out.
+    /// The input counts from the start of the message, used when the end of
+    /// the turn is built.
     input: InputCounts,
 }
 
 /// The input counts this vendor reports: the tokens after the last cache
 /// breakpoint, and the tokens written to and read from the cache. Each one is
 /// `None` where the event left it out.
-#[derive(Default, Clone, Copy)]
+#[derive(Deserialize, Default, Clone, Copy)]
 struct InputCounts {
+    #[serde(rename = "input_tokens")]
     uncached: Option<u32>,
+    #[serde(rename = "cache_creation_input_tokens")]
     cache_write: Option<u32>,
+    #[serde(rename = "cache_read_input_tokens")]
     cache_read: Option<u32>,
 }
 
 impl InputCounts {
-    fn read(usage: &Value) -> Self {
+    /// The counts in a usage object, all `None` when the event has none.
+    fn read(usage: &Value) -> Result<Self, serde_json::Error> {
+        Option::<Self>::deserialize(usage).map(Option::unwrap_or_default)
+    }
+
+    /// These counts, with each one they leave out taken from `fallback`.
+    fn with_fallback(self, fallback: Self) -> Self {
         Self {
-            uncached: count_opt(&usage["input_tokens"]),
-            cache_write: count_opt(&usage["cache_creation_input_tokens"]),
-            cache_read: count_opt(&usage["cache_read_input_tokens"]),
+            uncached: self.uncached.or(fallback.uncached),
+            cache_write: self.cache_write.or(fallback.cache_write),
+            cache_read: self.cache_read.or(fallback.cache_read),
         }
     }
 
-    /// These counts, with each one they leave out taken from `earlier`.
-    fn or(self, earlier: Self) -> Self {
-        Self {
-            uncached: self.uncached.or(earlier.uncached),
-            cache_write: self.cache_write.or(earlier.cache_write),
-            cache_read: self.cache_read.or(earlier.cache_read),
-        }
-    }
-
-    /// The whole prompt, which is the sum of the three counts. A sum too large
-    /// for the count type reads as zero, like an oversized single count.
-    fn total(self) -> u32 {
-        let sum: u64 = [self.uncached, self.cache_write, self.cache_read]
+    /// The whole prompt, which is the sum of the three counts.
+    fn total(self) -> Result<u32, serde_json::Error> {
+        [self.uncached, self.cache_write, self.cache_read]
             .into_iter()
             .flatten()
-            .map(u64::from)
-            .sum();
-        u32::try_from(sum).unwrap_or(0)
+            .try_fold(0, u32::checked_add)
+            .ok_or_else(|| serde::de::Error::custom("the input token counts overflow u32"))
     }
 }
 
@@ -373,10 +371,13 @@ pub(super) fn parse_sse_event(
 
     match event_type {
         "content_block_delta" => content_block_delta(&value, state),
-        "message_start" => {
-            state.input = InputCounts::read(&value["message"]["usage"]);
-            vec![]
-        }
+        "message_start" => match InputCounts::read(&value["message"]["usage"]) {
+            Ok(input) => {
+                state.input = input;
+                vec![]
+            }
+            Err(e) => vec![Err(LlmError::Json(e))],
+        },
         "content_block_start" => {
             match value["content_block"]["type"].as_str().unwrap_or("") {
                 "tool_use" => {
@@ -436,9 +437,16 @@ pub(super) fn parse_sse_event(
             // The end of the turn restates the input counts on some versions
             // of this wire and omits them on others; the counts from the start
             // of the message are the fallback, never a zero.
-            let input = InputCounts::read(&value["usage"]).or(state.input);
+            let input = match InputCounts::read(&value["usage"]) {
+                Ok(input) => input.with_fallback(state.input),
+                Err(e) => return vec![Err(LlmError::Json(e))],
+            };
+            let input_tokens = match input.total() {
+                Ok(total) => total,
+                Err(e) => return vec![Err(LlmError::Json(e))],
+            };
             let usage = Usage {
-                input_tokens: input.total(),
+                input_tokens,
                 output_tokens: count(&value["usage"]["output_tokens"]),
                 reasoning_tokens: None,
                 cache_read_tokens: input.cache_read,
