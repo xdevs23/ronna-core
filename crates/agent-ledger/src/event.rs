@@ -180,6 +180,15 @@ pub enum CoreEvent {
         /// A machine key for a runtime-ended turn, or the provider's own
         /// rendering of its failure.
         error: String,
+        /// Whether a later resend of the same turn can succeed. True for a
+        /// provider or connection failure that outlasted the retries of the
+        /// bind loop, such as an overload, a lost connection or a spent rate
+        /// limit, as
+        /// [`LlmError::is_retryable`](crate::providers::LlmError::is_retryable)
+        /// returns it. False for a failure that a resend repeats: every other
+        /// provider error, every abnormal stop and every failure of the actor
+        /// itself.
+        retryable: bool,
         /// The provider binding that produced this signal — the same contract
         /// as on [`StreamDone`](Self::StreamDone). `None` for a failure that
         /// is not scoped to any binding (the actor's own append and bind

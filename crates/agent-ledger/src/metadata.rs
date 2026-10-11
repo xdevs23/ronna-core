@@ -741,7 +741,7 @@ pub(crate) async fn run_fulfillment_ingestion<K: RuntimeKind, E: RuntimeEvent>(
                 title.clear();
                 seam.close();
             }
-            ProviderResponse::Error(e) => {
+            ProviderResponse::Error { message: e, .. } => {
                 // The streaming flag clears and the still-parked request
                 // re-emits on the next tick — the ratchet retries, spaced by
                 // the throttle at delivery.
@@ -1310,8 +1310,11 @@ mod tests {
             Arc::clone(&throttle),
         ));
 
-        tx.send(ProviderResponse::Error("404 No endpoints found".into()))
-            .unwrap();
+        tx.send(ProviderResponse::Error {
+            message: "404 No endpoints found".into(),
+            retryable: false,
+        })
+        .unwrap();
         drop(tx);
         reader.await.unwrap();
 

@@ -430,7 +430,7 @@ async fn run_stream_cycle<F, Fut>(
         } = match opened {
             Ok(opened) => opened,
             Err(e) => {
-                close_turn(&resp_tx, &token, Some(e.to_string()));
+                close_turn(&resp_tx, &token, Some((e.to_string(), &e)));
                 return;
             }
         };
@@ -471,7 +471,7 @@ async fn run_stream_cycle<F, Fut>(
                     let _ = resp_tx.send(ProviderResponse::Restart);
                     continue;
                 }
-                close_turn(&resp_tx, &token, Some(err.to_string()));
+                close_turn(&resp_tx, &token, Some((err.to_string(), &err)));
                 return;
             }
             PumpOutcome::Recoverable(err) => {
@@ -486,8 +486,9 @@ async fn run_stream_cycle<F, Fut>(
                     close_turn(
                         &resp_tx,
                         &token,
-                        Some(format!(
-                            "Connection interrupted after {MAX_RETRIES} attempts: {err}"
+                        Some((
+                            format!("Connection interrupted after {MAX_RETRIES} attempts: {err}"),
+                            &err,
                         )),
                     );
                     return;
@@ -527,11 +528,8 @@ async fn wait_out_rate_limit(
             attempts = MAX_RETRIES,
             "rate limited on the stream, giving up after the retry budget"
         );
-        close_turn(
-            resp_tx,
-            token,
-            Some(LlmError::RateLimited { retry_after_secs }.to_string()),
-        );
+        let rate_limit = LlmError::RateLimited { retry_after_secs };
+        close_turn(resp_tx, token, Some((rate_limit.to_string(), &rate_limit)));
         return false;
     };
 
@@ -545,7 +543,8 @@ async fn wait_out_rate_limit(
 }
 
 /// Close a turn that is really over: the error, when there is one, then exactly
-/// one `Done`.
+/// one `Done`. An error comes as its message and the `LlmError` the cycle gave
+/// up on, and `retryable` is set from that error.
 ///
 /// A CANCELLED turn closes nothing. Cancellation means a newer request on this
 /// binding has taken over — or the binding is being torn down — and a `Done`
@@ -556,13 +555,16 @@ async fn wait_out_rate_limit(
 fn close_turn(
     resp_tx: &UnboundedSender<ProviderResponse>,
     token: &CancellationToken,
-    error: Option<String>,
+    error: Option<(String, &LlmError)>,
 ) {
     if token.is_cancelled() {
         return;
     }
-    if let Some(message) = error {
-        let _ = resp_tx.send(ProviderResponse::Error(message));
+    if let Some((message, cause)) = error {
+        let _ = resp_tx.send(ProviderResponse::Error {
+            message,
+            retryable: cause.is_retryable(),
+        });
     }
     let _ = resp_tx.send(ProviderResponse::Done);
 }

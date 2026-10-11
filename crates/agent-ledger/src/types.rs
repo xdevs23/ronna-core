@@ -132,7 +132,9 @@ impl StopReason {
     /// The machine key of the stream error that closes a turn ending with
     /// this stop, from the vocabulary documented on
     /// [`CoreEvent::StreamError`](crate::event::CoreEvent::StreamError).
-    /// `None` for a stop that ends the turn normally.
+    /// `None` for a stop that ends the turn normally. A resend of the turn
+    /// meets each of these stops again, so that stream error is never
+    /// retryable.
     #[must_use]
     pub fn error_key(self) -> Option<&'static str> {
         match self {

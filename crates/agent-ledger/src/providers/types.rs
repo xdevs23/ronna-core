@@ -473,7 +473,13 @@ pub enum ProviderResponse {
     /// a stream close: no [`Done`](Self::Done) accompanies it.
     Restart,
     /// The turn failed.
-    Error(String),
+    Error {
+        /// The failure, rendered for display.
+        message: String,
+        /// Whether a later resend of the same turn can succeed. The bind loop
+        /// sets it from [`LlmError::is_retryable`].
+        retryable: bool,
+    },
     /// The stream is fully closed and the provider has nothing more to say.
     Done,
 }
@@ -599,6 +605,16 @@ impl LlmError {
             | Self::NoMessage => false,
         }
     }
+
+    /// Whether a later resend of the same turn can succeed, once the bind loop
+    /// has stopped retrying it: every error that
+    /// [`is_recoverable`](Self::is_recoverable) accepts, and a rate limit,
+    /// which only asks to wait. Every other error is a verdict on the request
+    /// or the configuration, and a resend repeats it.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        self.is_recoverable() || matches!(self, Self::RateLimited { .. })
+    }
 }
 
 #[cfg(test)]
@@ -649,6 +665,40 @@ mod recoverable_tests {
         assert!(!LlmError::Json(json_err).is_recoverable());
     }
 
+    /// A failure on the side of the provider or the connection, and a rate
+    /// limit, can pass on a later resend. A verdict on the request or the
+    /// configuration fails the same way again.
+    #[test]
+    fn classifies_retryable_vs_final() {
+        let api = |status| LlmError::Api {
+            status,
+            message: "refused".into(),
+        };
+
+        assert!(LlmError::Stream("error decoding response body".into()).is_retryable());
+        assert!(LlmError::StreamIdle(90).is_retryable());
+        assert!(LlmError::Unavailable("overloaded_error: Overloaded".into()).is_retryable());
+        assert!(
+            LlmError::RateLimited {
+                retry_after_secs: Some(5)
+            }
+            .is_retryable()
+        );
+        for status in [500, 503, 529] {
+            assert!(api(status).is_retryable(), "status {status}");
+        }
+
+        for status in [400, 401, 404] {
+            assert!(!api(status).is_retryable(), "status {status}");
+        }
+        assert!(!LlmError::ProviderFailure("unknown stop reason pause".into()).is_retryable());
+        let json_err = serde_json::from_str::<Value>("{ not json").unwrap_err();
+        assert!(!LlmError::Json(json_err).is_retryable());
+        assert!(!LlmError::MissingKey("a-provider".into()).is_retryable());
+        assert!(!LlmError::Config("nope".into()).is_retryable());
+        assert!(!LlmError::NoMessage.is_retryable());
+    }
+
     /// A real transport failure (connect refused) carries no HTTP status, so the
     /// transport arm classifies it as recoverable. The status-bearing case — a
     /// server response — cannot be constructed without a live HTTP exchange, as
@@ -669,6 +719,8 @@ mod recoverable_tests {
             .await
             .unwrap_err();
         assert!(err.status().is_none());
-        assert!(LlmError::Http(err).is_recoverable());
+        let err = LlmError::Http(err);
+        assert!(err.is_recoverable());
+        assert!(err.is_retryable());
     }
 }
