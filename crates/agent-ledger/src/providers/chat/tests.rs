@@ -663,6 +663,7 @@ mod usage_tests {
             stream: true,
             reasoning,
             response_schema: None,
+            cache_prompt: false,
         }
     }
 
@@ -1385,6 +1386,7 @@ mod empty_assistant_content {
             stream: true,
             reasoning: None,
             response_schema: None,
+            cache_prompt: false,
         };
 
         let err = refusing_provider()

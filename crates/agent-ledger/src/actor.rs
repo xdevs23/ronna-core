@@ -1317,6 +1317,8 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             // offered and what shape it answers in are one decision, and a
             // later append cannot reach a turn in flight.
             response_schema: choice.and_then(|choice| choice.response_schema),
+            // The next round of this conversation repeats this prompt.
+            cache_prompt: true,
         }) {
             tracing::error!(conversation_id = self.id, error = ?e, "handle_blocks_ready: provider channel closed");
             // No stream opened: the seam a failed send left set would leak

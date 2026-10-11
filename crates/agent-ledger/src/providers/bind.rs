@@ -266,6 +266,7 @@ pub async fn run_http_bind_loop_with_replay<F, Fut>(
                 tools,
                 reasoning,
                 response_schema,
+                cache_prompt,
             } => {
                 if let Some(token) = active.take() {
                     token.cancel();
@@ -287,6 +288,7 @@ pub async fn run_http_bind_loop_with_replay<F, Fut>(
                         tools,
                         reasoning,
                         response_schema,
+                        cache_prompt,
                     },
                 ));
             }
@@ -328,6 +330,8 @@ pub struct TurnRequest {
     pub reasoning: Option<ReasoningLevel>,
     /// The JSON Schema the answer must satisfy, or `None` for text.
     pub response_schema: Option<Value>,
+    /// Whether a later request extends this prompt.
+    pub cache_prompt: bool,
 }
 
 impl TurnRequest {
@@ -347,6 +351,7 @@ impl TurnRequest {
             stream: true,
             reasoning: self.reasoning,
             response_schema: self.response_schema,
+            cache_prompt: self.cache_prompt,
         }
     }
 }

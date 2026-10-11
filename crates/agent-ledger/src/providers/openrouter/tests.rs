@@ -35,6 +35,7 @@ mod background_model_on_the_wire {
                 tools: vec![],
                 reasoning: None,
                 response_schema: None,
+                cache_prompt: false,
             },
             configured,
         );

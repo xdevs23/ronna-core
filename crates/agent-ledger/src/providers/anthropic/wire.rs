@@ -36,10 +36,11 @@ pub(super) struct WireRequest {
     pub(super) thinking: Option<WireThinkingRequest>,
     #[serde(skip_serializing_if = "OutputConfig::is_empty")]
     pub(super) output_config: OutputConfig,
-    /// Automatic prompt caching: the API puts one breakpoint on the last
-    /// cacheable block, so each request reads the prefix the previous one
-    /// wrote.
-    pub(super) cache_control: WireCacheControl,
+    /// Automatic prompt caching, set when a later request extends the prompt:
+    /// the API puts one breakpoint on the last cacheable block, so each
+    /// request reads the prefix the previous one wrote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cache_control: Option<WireCacheControl>,
 }
 
 #[derive(Serialize)]

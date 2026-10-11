@@ -64,6 +64,10 @@ pub struct CompletionRequest {
     /// API expects a schema.
     #[serde(default)]
     pub response_schema: Option<Value>,
+    /// Whether a later request extends this prompt, so a provider that caches
+    /// a prompt only on request is asked to cache it.
+    #[serde(default)]
+    pub cache_prompt: bool,
 }
 
 /// One message as the model reads it: a voice and its content.
@@ -462,6 +466,8 @@ pub enum ProviderRequest {
         reasoning: Option<ReasoningLevel>,
         /// The JSON Schema the answer must satisfy, or `None` for text.
         response_schema: Option<Value>,
+        /// Whether a later request extends this prompt.
+        cache_prompt: bool,
     },
     /// Abandon the active stream.
     Interrupt,

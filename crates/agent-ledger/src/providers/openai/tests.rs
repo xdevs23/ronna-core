@@ -31,6 +31,7 @@ mod request_goldens {
             stream: true,
             reasoning: None,
             response_schema: None,
+            cache_prompt: false,
         };
         let plain = serde_json::to_value(
             OpenAiResponsesProvider::build_request_body(&request, true, true).0,
@@ -118,6 +119,7 @@ mod request_goldens {
             stream: true,
             reasoning,
             response_schema: None,
+            cache_prompt: false,
         };
         serde_json::to_value(OpenAiResponsesProvider::build_request_body(&request, true, true).0)
             .expect("the body serializes")
@@ -1268,6 +1270,7 @@ mod empty_assistant_content {
             stream: true,
             reasoning: None,
             response_schema: None,
+            cache_prompt: false,
         };
 
         let err = OpenAiResponsesProvider::new("test-key".into(), None)

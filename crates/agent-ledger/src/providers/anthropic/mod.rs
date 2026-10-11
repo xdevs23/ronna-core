@@ -105,7 +105,7 @@ impl AnthropicProvider {
                     .clone()
                     .map(|schema| WireOutputFormat::JsonSchema { schema }),
             },
-            cache_control: WireCacheControl::Ephemeral,
+            cache_control: request.cache_prompt.then_some(WireCacheControl::Ephemeral),
         };
         (body, carried_payloads)
     }

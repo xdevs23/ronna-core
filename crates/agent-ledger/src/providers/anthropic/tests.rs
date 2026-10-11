@@ -582,11 +582,11 @@ mod bind_request_golden {
             tools: vec![],
             reasoning: None,
             response_schema: None,
+            cache_prompt: false,
         });
         let (plain, _) = AnthropicProvider::build_request_body(&request, true, true);
         let plain = serde_json::to_value(&plain).expect("the wire serializes");
         assert!(plain.get("output_config").is_none());
-        assert_eq!(plain["cache_control"], json!({ "type": "ephemeral" }));
 
         request.response_schema = Some(schema.clone());
         let (body, _) = AnthropicProvider::build_request_body(&request, true, true);
@@ -642,6 +642,7 @@ mod bind_request_golden {
             tools,
             reasoning: Some(ReasoningLevel::High),
             response_schema: None,
+            cache_prompt: true,
         });
         assert_eq!(
             request.max_tokens, None,
@@ -709,6 +710,7 @@ mod bind_request_golden {
             }],
             reasoning: None,
             response_schema: None,
+            cache_prompt: true,
         });
 
         let (body, _) = AnthropicProvider::build_request_body(&request, true, true);
@@ -734,6 +736,27 @@ mod bind_request_golden {
                 "cache_control": { "type": "ephemeral" }
             })
         );
+    }
+
+    /// A request whose prompt no later request extends asks for no cache
+    /// entry, which would be written at the write price and never read.
+    #[test]
+    fn a_request_without_cache_prompt_sends_no_cache_control() {
+        let request = turn_request(TurnRequest {
+            model: ModelSelector::Specific("claude-test".into()),
+            messages: vec![Message {
+                role: MessageRole::User,
+                content: MessageContent::Text("title this".into()),
+            }],
+            tools: vec![],
+            reasoning: None,
+            response_schema: None,
+            cache_prompt: false,
+        });
+
+        let (body, _) = AnthropicProvider::build_request_body(&request, true, true);
+        let body = serde_json::to_value(&body).expect("the wire serializes");
+        assert!(body.get("cache_control").is_none(), "got {body}");
     }
 }
 
@@ -1143,6 +1166,7 @@ mod empty_assistant_content {
             tools: vec![],
             reasoning: None,
             response_schema: None,
+            cache_prompt: false,
         });
 
         let err = AnthropicProvider::new("test-key".into(), None)
