@@ -125,7 +125,8 @@ async fn reconnects_then_completes() {
     assert!(status_idx < restart_idx, "the status precedes the restart");
 
     assert!(
-        !out.iter().any(|r| matches!(r, ProviderResponse::Error(_))),
+        !out.iter()
+            .any(|r| matches!(r, ProviderResponse::Error { .. })),
         "no error on eventual success"
     );
     let done_positions: Vec<usize> = out
@@ -146,7 +147,8 @@ async fn reconnects_then_completes() {
 }
 
 /// A stream that always drops recoverably exhausts the reconnect cap, then
-/// terminates with a transport error followed by a single close.
+/// terminates with a transport error followed by a single close. The error is
+/// retryable: a connection lost past the reconnects can pass on a later resend.
 #[tokio::test(start_paused = true)]
 async fn exhausts_retries_then_errors() {
     let out = drive(|_| {
@@ -169,10 +171,14 @@ async fn exhausts_retries_then_errors() {
 
     let error_idx = out
         .iter()
-        .position(
-            |r| matches!(r, ProviderResponse::Error(e) if e.contains("Connection interrupted")),
-        )
-        .expect("a terminal connection error is emitted");
+        .position(|r| {
+            matches!(
+                r,
+                ProviderResponse::Error { message, retryable: true }
+                    if message.contains("Connection interrupted")
+            )
+        })
+        .expect("a retryable terminal connection error is emitted");
     assert!(
         !out[..error_idx]
             .iter()
@@ -238,7 +244,8 @@ async fn rate_limited_stream_retries_then_succeeds() {
         "the wait is announced to whoever is watching"
     );
     assert!(
-        !out.iter().any(|r| matches!(r, ProviderResponse::Error(_))),
+        !out.iter()
+            .any(|r| matches!(r, ProviderResponse::Error { .. })),
         "a waited-out rate limit is not an error"
     );
     assert!(
@@ -256,7 +263,8 @@ async fn rate_limited_stream_retries_then_succeeds() {
 
 /// A rate limit AFTER content has flowed is terminal. The turn is already half
 /// delivered, and a silent replay would write it down twice — once as the
-/// partial answer the reader already has, once as the regenerated one.
+/// partial answer the reader already has, once as the regenerated one. The
+/// error is retryable: a later resend starts the turn over.
 #[tokio::test(start_paused = true)]
 async fn rate_limit_after_content_is_terminal() {
     let attempts = Arc::new(AtomicU32::new(0));
@@ -282,12 +290,48 @@ async fn rate_limit_after_content_is_terminal() {
     );
     let error_idx = out
         .iter()
-        .position(|r| matches!(r, ProviderResponse::Error(e) if e.contains("rate limited")))
-        .expect("the rate limit surfaces as the turn's error");
+        .position(|r| {
+            matches!(
+                r,
+                ProviderResponse::Error { message, retryable: true } if message.contains("rate limited")
+            )
+        })
+        .expect("the rate limit surfaces as the turn's retryable error");
     assert_eq!(
         error_idx,
         out.len() - 2,
         "the error immediately precedes the single close"
+    );
+    assert!(matches!(out.last(), Some(ProviderResponse::Done)));
+}
+
+/// A stream that keeps refusing with a rate limit spends the budget of the
+/// turn, and the turn then closes with a retryable error: the limit only asks
+/// to wait longer than one turn may.
+#[tokio::test(start_paused = true)]
+async fn spent_rate_limit_budget_closes_with_a_retryable_error() {
+    let out = drive(|_| {
+        Box::pin(stream::iter(vec![
+            Ok(StreamEvent::Connected),
+            Err(LlmError::RateLimited {
+                retry_after_secs: None,
+            }),
+        ])) as EventStream
+    })
+    .await;
+
+    let errors: Vec<_> = out
+        .iter()
+        .filter_map(|r| match r {
+            ProviderResponse::Error { message, retryable } => Some((message.as_str(), *retryable)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors, vec![("rate limited", true)]);
+    assert_eq!(
+        out.iter().filter(|r| is_status(r, "Rate limited")).count(),
+        usize::try_from(MAX_RETRIES).unwrap(),
+        "every wait of the budget was taken first"
     );
     assert!(matches!(out.last(), Some(ProviderResponse::Done)));
 }
@@ -464,7 +508,7 @@ async fn a_superseded_turn_sends_no_close() {
     assert_eq!(attempts.load(Ordering::SeqCst), 2, "both turns were opened");
     assert!(
         !out.iter().any(
-            |r| matches!(r, ProviderResponse::Error(e) if e.contains("the first turn failed"))
+            |r| matches!(r, ProviderResponse::Error { message, .. } if message.contains("the first turn failed"))
         ),
         "the superseded turn's error is not surfaced onto the new turn: {out:?}"
     );

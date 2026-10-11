@@ -616,13 +616,22 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
         generation.is_none_or(|g| g == self.stream_generation)
     }
 
+    /// Emit a failure of this actor: unstamped, as documented on
+    /// [`Self::owns_stream_signal`], and not retryable, because a resend of
+    /// the turn meets the same store, configuration and ledger.
+    fn emit_own_failure(&self, error: String) {
+        self.ctx.bus.emit(CoreEvent::StreamError {
+            conversation_id: self.id,
+            error,
+            retryable: false,
+            generation: None,
+        });
+    }
+
     // ── Event handlers ──────────────────────────────────────────────────
 
     async fn handle_draft_promoted(&mut self) {
-        let store = &self.ctx.store;
-        let bus = &self.ctx.bus;
-
-        match store.promote_draft(self.id).await {
+        match self.ctx.store.promote_draft(self.id).await {
             Ok(ids) => {
                 tracing::info!(
                     conversation_id = self.id,
@@ -632,11 +641,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             }
             Err(e) => {
                 tracing::error!(conversation_id = self.id, error = %e, "draft promotion failed");
-                bus.emit(CoreEvent::StreamError {
-                    conversation_id: self.id,
-                    error: e.to_string(),
-                    generation: None,
-                });
+                self.emit_own_failure(e.to_string());
                 return;
             }
         }
@@ -669,11 +674,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             }
             Err(e) => {
                 tracing::error!(conversation_id = self.id, error = %e, "block insert failed");
-                bus.emit(CoreEvent::StreamError {
-                    conversation_id: self.id,
-                    error: e.to_string(),
-                    generation: None,
-                });
+                self.emit_own_failure(e.to_string());
                 return;
             }
         }
@@ -1411,13 +1412,11 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             "handle_blocks_ready: the ledger does not open with its head kind — \
              refusing the turn"
         );
-        self.ctx.bus.emit(CoreEvent::StreamError {
-            conversation_id: self.id,
-            error: "the ledger does not open with its head kind, so no turn is \
-                    dispatched for it"
+        self.emit_own_failure(
+            "the ledger does not open with its head kind, so no turn is \
+             dispatched for it"
                 .to_owned(),
-            generation: None,
-        });
+        );
     }
 
     /// End the turn that is looping on a spent tool-call window — the
@@ -1523,12 +1522,7 @@ impl<K: RuntimeKind, E: RuntimeEvent + AsCoreEvent> ConversationActor<K, E> {
             Ok(tx) => Some(tx),
             Err(e) => {
                 tracing::error!(conversation_id = self.id, error = %e, "provider bind failed");
-                let bus = &self.ctx.bus;
-                bus.emit(CoreEvent::StreamError {
-                    conversation_id: self.id,
-                    error: e,
-                    generation: None,
-                });
+                self.emit_own_failure(e);
                 None
             }
         }
@@ -5034,6 +5028,7 @@ mod tests {
         ctx.bus.emit(CoreEvent::StreamError {
             conversation_id: conv,
             error: "scripted failure".into(),
+            retryable: false,
             generation: None,
         });
 
@@ -7604,16 +7599,17 @@ mod tests {
         // The event names the conversation in its own typed field, which is
         // where every reader of the bus reads it; the prose says what went
         // wrong and repeats nothing the event already carries.
-        let error = tokio::time::timeout(Duration::from_secs(10), async {
+        let (error, retryable, generation) = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Ok(CoreEvent::StreamError {
                     conversation_id,
                     error,
-                    ..
+                    retryable,
+                    generation,
                 }) = events.recv().await
                     && conversation_id == conv
                 {
-                    return error;
+                    return (error, retryable, generation);
                 }
             }
         })
@@ -7622,6 +7618,35 @@ mod tests {
         assert!(
             error.contains("does not open with its head kind"),
             "the error says what the ledger's shape is: {error}"
+        );
+        assert!(!retryable, "a resend meets the same ledger");
+        assert_eq!(generation, None, "a failure of the actor is unstamped");
+    }
+
+    /// A failed draft promotion is a failure of the actor: unstamped, and not
+    /// retryable, because the turn a consumer would resend does not contain
+    /// the input that failed to append.
+    #[tokio::test]
+    async fn a_failed_draft_promotion_emits_a_final_unstamped_error() {
+        let (ctx, conv, _probe) = scripted_context(Script::CountOnly).await;
+        let mut events = ctx.bus.subscribe();
+
+        let (mut actor, _recheck) = bare_actor(conv, ctx.clone(), false);
+        actor.handle_draft_promoted().await;
+
+        let failure = std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| match event {
+            CoreEvent::StreamError {
+                conversation_id,
+                retryable,
+                generation,
+                ..
+            } if conversation_id == conv => Some((retryable, generation)),
+            _ => None,
+        });
+        assert_eq!(
+            failure,
+            Some((false, None)),
+            "promoting a draft that does not exist fails"
         );
     }
 

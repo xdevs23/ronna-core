@@ -126,7 +126,8 @@ async fn api_error_on_payload_attempt_retries_once_without_payloads() {
         "the failed attempt's uncommitted blocks are discarded before the re-open"
     );
     assert!(
-        !out.iter().any(|r| matches!(r, ProviderResponse::Error(_))),
+        !out.iter()
+            .any(|r| matches!(r, ProviderResponse::Error { .. })),
         "no error on success"
     );
     assert!(matches!(out.last(), Some(ProviderResponse::Done)));
@@ -148,7 +149,7 @@ async fn second_failure_surfaces_error_after_single_fallback() {
     let error_idx = out
         .iter()
         .position(
-            |r| matches!(r, ProviderResponse::Error(e) if e.contains("reasoning item invalid")),
+            |r| matches!(r, ProviderResponse::Error { message, .. } if message.contains("reasoning item invalid")),
         )
         .expect("the terminal error surfaces after the failed fallback");
     assert_eq!(
@@ -160,7 +161,8 @@ async fn second_failure_surfaces_error_after_single_fallback() {
 }
 
 /// An attempt whose build reported NO payloads gets no fallback — the terminal
-/// API error surfaces directly, after a single attempt.
+/// API error surfaces directly, after a single attempt. A 4xx is a verdict on
+/// the request, so a later resend cannot pass either.
 #[tokio::test(start_paused = true)]
 async fn no_payload_attempt_surfaces_error_without_retry() {
     let (out, knobs) = drive_replay(|_include| {
@@ -172,7 +174,17 @@ async fn no_payload_attempt_surfaces_error_without_retry() {
     .await;
 
     assert_eq!(knobs, vec![true], "no payloads means no fallback attempt");
-    assert!(out.iter().any(|r| matches!(r, ProviderResponse::Error(_))));
+    let errors: Vec<_> = out
+        .iter()
+        .filter_map(|r| match r {
+            ProviderResponse::Error { message, retryable } => Some((message.as_str(), *retryable)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        errors,
+        vec![("api error 400: reasoning item invalid", false)]
+    );
     assert!(!out.iter().any(|r| matches!(r, ProviderResponse::Restart)));
     assert!(matches!(out.last(), Some(ProviderResponse::Done)));
 }

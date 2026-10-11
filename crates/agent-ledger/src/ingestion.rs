@@ -332,6 +332,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 self.ctx.bus.emit(CoreEvent::StreamError {
                     conversation_id: conv_id,
                     error: error.into(),
+                    retryable: false,
                     generation: Some(self.generation),
                 });
             }
@@ -363,11 +364,12 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 self.abandon_owed_empty_commit();
                 self.draining = false;
             }
-            ProviderResponse::Error(error) => {
-                tracing::warn!(conversation_id = conv_id, error = %error, "provider error");
+            ProviderResponse::Error { message, retryable } => {
+                tracing::warn!(conversation_id = conv_id, error = %message, "provider error");
                 self.ctx.bus.emit(CoreEvent::StreamError {
                     conversation_id: conv_id,
-                    error,
+                    error: message,
+                    retryable,
                     generation: Some(self.generation),
                 });
                 // A terminal error ends the turn without a MessageEnd, so its
@@ -2172,6 +2174,73 @@ mod tests {
         assert_eq!(errors, vec!["refusal".to_string()]);
     }
 
+    /// The stream errors the bus received, as their text and whether a later
+    /// resend can succeed.
+    fn stream_errors(rx: &mut tokio::sync::broadcast::Receiver<CoreEvent>) -> Vec<(String, bool)> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                CoreEvent::StreamError {
+                    error, retryable, ..
+                } => Some((error, retryable)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A provider error reaches the bus as one stream error with the text and
+    /// the retry answer that the bind loop sent.
+    #[tokio::test]
+    async fn provider_error_reaches_the_bus_with_its_retry_answer() {
+        for retryable in [true, false] {
+            let (ctx, mut rx) = fixture().await;
+            drive_responses(
+                &ctx,
+                false,
+                vec![ProviderResponse::Error {
+                    message: "provider unavailable: overloaded_error".into(),
+                    retryable,
+                }],
+            )
+            .await;
+
+            assert_eq!(
+                stream_errors(&mut rx),
+                vec![(
+                    "provider unavailable: overloaded_error".to_string(),
+                    retryable
+                )]
+            );
+        }
+    }
+
+    /// Every abnormal stop closes its turn with one stream error that names
+    /// the stop and is not retryable: a resend meets the same stop.
+    #[tokio::test]
+    async fn abnormal_stops_close_with_a_final_error() {
+        for stop_reason in [
+            StopReason::MaxTokens,
+            StopReason::ContentFilter,
+            StopReason::Refusal,
+        ] {
+            let (ctx, mut rx) = fixture().await;
+            drive_responses(
+                &ctx,
+                false,
+                vec![
+                    ProviderResponse::Event(StreamEvent::MessageEnd {
+                        usage: Usage::default(),
+                        stop_reason,
+                    }),
+                    ProviderResponse::Done,
+                ],
+            )
+            .await;
+
+            let key = stop_reason.error_key().expect("an abnormal stop has a key");
+            assert_eq!(stream_errors(&mut rx), vec![(key.to_string(), false)]);
+        }
+    }
+
     /// The aggregator's finish-reason-`stop` tool call, end to end through
     /// ingestion — joined at the REAL seam: the raw wire chunks go through
     /// the shared chat-stream decoder and whatever IT emits is what feeds the
@@ -2772,7 +2841,11 @@ mod tests {
             text: "partial".into(),
         }))
         .unwrap();
-        tx.send(ProviderResponse::Error("boom".into())).unwrap();
+        tx.send(ProviderResponse::Error {
+            message: "boom".into(),
+            retryable: true,
+        })
+        .unwrap();
         drop(tx);
         handle.await.unwrap();
 
@@ -3524,7 +3597,10 @@ mod tests {
             false,
             vec![
                 ProviderResponse::Event(StreamEvent::TextBlockStart),
-                ProviderResponse::Error("boom".into()),
+                ProviderResponse::Error {
+                    message: "boom".into(),
+                    retryable: true,
+                },
             ],
         )
         .await;
