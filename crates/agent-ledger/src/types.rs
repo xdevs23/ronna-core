@@ -123,6 +123,33 @@ pub enum StopReason {
     /// The provider's content filter halted the response (e.g. an `OpenAI`
     /// Responses `incomplete_details.reason == "content_filter"`).
     ContentFilter,
+    /// The provider or the model declined to answer (e.g. an Anthropic
+    /// `stop_reason == "refusal"`).
+    Refusal,
+}
+
+impl StopReason {
+    /// The machine key of the stream error that closes a turn ending with
+    /// this stop, from the vocabulary documented on
+    /// [`CoreEvent::StreamError`](crate::event::CoreEvent::StreamError).
+    /// `None` for a stop that ends the turn normally.
+    #[must_use]
+    pub fn error_key(self) -> Option<&'static str> {
+        match self {
+            Self::EndTurn | Self::ToolUse => None,
+            Self::MaxTokens => Some("max_tokens"),
+            Self::ContentFilter => Some("content_filter"),
+            Self::Refusal => Some("refusal"),
+        }
+    }
+
+    /// Whether the output streamed before this stop is void. A provider sends
+    /// a refusal before any output or after partial output, and that partial
+    /// output is not an answer.
+    #[must_use]
+    pub fn discards_output(self) -> bool {
+        matches!(self, Self::Refusal)
+    }
 }
 
 /// Token usage surfaced with a stream's completion.

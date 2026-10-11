@@ -34,19 +34,32 @@ pub(super) struct WireRequest {
     /// Adaptive thinking, set when the conversation selects a reasoning level.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) thinking: Option<WireThinkingRequest>,
+    #[serde(skip_serializing_if = "OutputConfig::is_empty")]
+    pub(super) output_config: OutputConfig,
+}
+
+/// The output settings, of which this library sets the effort and the format.
+#[derive(Serialize)]
+pub(super) struct OutputConfig {
     /// The effort tier for adaptive thinking.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) effort: Option<String>,
-    /// The answer's schema, in this dialect's `output_config.format`
-    /// envelope; absent for text.
+    /// The response schema, absent for text.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) output_config: Option<OutputConfig>,
+    pub(super) format: Option<WireOutputFormat>,
 }
 
-/// The output settings, of which this library sets only the format.
 #[derive(Serialize)]
-pub(super) struct OutputConfig {
-    pub(super) format: Value,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(super) enum WireOutputFormat {
+    /// The caller's JSON schema document, sent unchanged.
+    JsonSchema { schema: Value },
+}
+
+impl OutputConfig {
+    fn is_empty(&self) -> bool {
+        self.effort.is_none() && self.format.is_none()
+    }
 }
 
 #[derive(Serialize)]
@@ -357,9 +370,20 @@ pub(super) fn parse_sse_event(
         }
         "message_delta" => {
             let stop_reason = match value["delta"]["stop_reason"].as_str() {
+                Some("end_turn") => StopReason::EndTurn,
                 Some("tool_use") => StopReason::ToolUse,
                 Some("max_tokens") => StopReason::MaxTokens,
-                _ => StopReason::EndTurn,
+                Some("refusal") => StopReason::Refusal,
+                Some(other) => {
+                    return vec![Err(LlmError::ProviderFailure(format!(
+                        "unknown stop reason {other}"
+                    )))];
+                }
+                None => {
+                    return vec![Err(LlmError::ProviderFailure(
+                        "message delta without a stop reason".into(),
+                    ))];
+                }
             };
             let usage = Usage {
                 // The end of the turn restates the input count on some
@@ -376,7 +400,42 @@ pub(super) fn parse_sse_event(
             events.extend(state.tool_buffer.drain(..).map(Ok));
             events
         }
+        "error" => vec![Err(stream_error(
+            WireStreamError::deserialize(&value["error"]).unwrap_or_default(),
+        ))],
         _ => vec![],
+    }
+}
+
+/// The error object of an in-stream error event. A field the event leaves out
+/// is absent, and an unreadable object reads as one with neither field.
+#[derive(Deserialize, Default)]
+struct WireStreamError {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    message: Option<String>,
+}
+
+/// The neutral error for a failure the server reports inside an opened
+/// stream.
+///
+/// An overloaded or failing server is unavailable for now. A rate limit takes
+/// the rate-limit path. Every other type, and an error without one, is a
+/// verdict on the request and ends the turn.
+fn stream_error(error: WireStreamError) -> LlmError {
+    let mut detail = error
+        .kind
+        .clone()
+        .unwrap_or_else(|| "error event without a type".into());
+    if let Some(message) = error.message {
+        detail = format!("{detail}: {message}");
+    }
+    match error.kind.as_deref() {
+        Some("overloaded_error" | "api_error") => LlmError::Unavailable(detail),
+        Some("rate_limit_error") => LlmError::RateLimited {
+            retry_after_secs: None,
+        },
+        _ => LlmError::ProviderFailure(detail),
     }
 }
 

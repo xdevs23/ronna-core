@@ -226,6 +226,120 @@ mod thinking_ingest_fixtures {
     }
 }
 
+/// A refusal is its own stop reason, so a declined turn never reads as a
+/// completed one.
+#[test]
+fn a_refusal_stop_ends_the_turn_as_a_refusal() {
+    let end = parse_sse_event(
+        &json!({ "type": "message_delta", "delta": { "stop_reason": "refusal" }, "usage": { "output_tokens": 0 } })
+            .to_string(),
+        &mut AnthropicSseState::default(),
+    );
+    assert!(
+        matches!(
+            end.as_slice(),
+            [Ok(StreamEvent::MessageEnd {
+                stop_reason: StopReason::Refusal,
+                ..
+            })]
+        ),
+        "{end:?}"
+    );
+}
+
+/// A stop reason the wire does not know ends the turn with an error, so it
+/// never passes for a finished answer.
+#[test]
+fn an_unknown_or_missing_stop_reason_fails_the_turn() {
+    for (delta, detail) in [
+        (
+            json!({ "stop_reason": "model_context_window_exceeded" }),
+            "unknown stop reason model_context_window_exceeded",
+        ),
+        (json!({}), "message delta without a stop reason"),
+    ] {
+        let events = parse_sse_event(
+            &json!({ "type": "message_delta", "delta": delta, "usage": { "output_tokens": 0 } })
+                .to_string(),
+            &mut AnthropicSseState::default(),
+        );
+        assert!(
+            matches!(events.as_slice(), [Err(LlmError::ProviderFailure(m))] if m == detail),
+            "{events:?}"
+        );
+    }
+}
+
+/// The bind loop receives a failure that the server reports inside an opened
+/// stream as an error it can classify. The stream does not end quietly.
+mod stream_error_events {
+    use super::*;
+
+    fn parse_error(error: &Value) -> LlmError {
+        let mut events = parse_sse_event(
+            &json!({ "type": "error", "error": error }).to_string(),
+            &mut AnthropicSseState::default(),
+        );
+        assert_eq!(events.len(), 1, "one error, got {events:?}");
+        events
+            .pop()
+            .unwrap()
+            .expect_err("an error event is an error")
+    }
+
+    #[test]
+    fn an_overloaded_or_failing_server_is_unavailable_and_recoverable() {
+        for kind in ["overloaded_error", "api_error"] {
+            let err = parse_error(&json!({ "type": kind, "message": "try later" }));
+            assert!(
+                matches!(&err, LlmError::Unavailable(m) if *m == format!("{kind}: try later")),
+                "{err:?}"
+            );
+            assert!(err.is_recoverable());
+        }
+    }
+
+    #[test]
+    fn a_rate_limit_takes_the_rate_limit_path() {
+        let err = parse_error(&json!({ "type": "rate_limit_error", "message": "slow down" }));
+        assert!(
+            matches!(
+                err,
+                LlmError::RateLimited {
+                    retry_after_secs: None
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn any_other_error_ends_the_turn() {
+        for (error, detail) in [
+            (
+                json!({ "type": "invalid_request_error", "message": "bad request" }),
+                "invalid_request_error: bad request",
+            ),
+            (
+                json!({ "type": "invalid_request_error" }),
+                "invalid_request_error",
+            ),
+            (
+                json!({ "message": "went wrong" }),
+                "error event without a type: went wrong",
+            ),
+            (json!(null), "error event without a type"),
+        ] {
+            let err = parse_error(&error);
+            assert!(
+                matches!(&err, LlmError::ProviderFailure(m) if m == detail),
+                "{err:?}"
+            );
+            assert!(!err.is_recoverable());
+        }
+    }
+}
+
 /// The replay side: a stored payload of THIS vendor's variant renders as the
 /// native thinking block, and anything else is omitted.
 mod replay_tests {
@@ -365,8 +479,9 @@ mod bind_request_golden {
     use super::*;
 
     /// A schema goes out as this dialect's `output_config.format`, the
-    /// caller's document untouched inside it; a request without one carries
-    /// no `output_config` at all.
+    /// caller's document untouched inside it, and an effort goes into the
+    /// same `output_config`; a request with neither has no `output_config`
+    /// at all.
     #[test]
     fn a_schema_is_sent_as_the_output_config_format() {
         let schema = json!({ "type": "object", "properties": { "summary": { "type": "string" } } });
@@ -391,6 +506,16 @@ mod bind_request_golden {
             body["output_config"],
             json!({ "format": { "type": "json_schema", "schema": schema } })
         );
+
+        request.reasoning = Some(ReasoningLevel::Medium);
+        let (body, _) = AnthropicProvider::build_request_body(&request, true, true);
+        let body = serde_json::to_value(&body).expect("the wire serializes");
+        assert_eq!(
+            body["output_config"],
+            json!({ "effort": "medium", "format": { "type": "json_schema", "schema": schema } }),
+            "the effort and the schema share one output_config"
+        );
+        assert!(body.get("effort").is_none(), "no top-level effort");
     }
 
     fn user_block(id: i64, role: Role, block_type: &str, content: &str) -> Block {
@@ -450,7 +575,7 @@ mod bind_request_golden {
                 ],
                 "stream": true,
                 "thinking": { "type": "adaptive" },
-                "effort": "high"
+                "output_config": { "effort": "high" }
             })
         );
     }

@@ -171,7 +171,7 @@ struct ChannelReader<K: RuntimeKind, E> {
     /// captured per turn: the seam IS the turn state, owned by the one
     /// dispatcher, and a copy here would be a second record of it.
     anchor: TurnAnchor,
-    /// An abnormal stop (`max_tokens`, `content_filter`) recorded at
+    /// An abnormal stop (one with a [`StopReason::error_key`]) recorded at
     /// `MessageEnd`, surfaced as the turn's terminal when the drain finishes.
     /// Emitting the error AT the stop closed the dispatch under a reader
     /// still ingesting the same turn: the seam cleared mid-drain, the turn's
@@ -180,7 +180,7 @@ struct ChannelReader<K: RuntimeKind, E> {
     /// its latch semantics — the actor latches when it arrives — and the
     /// close happens where every close happens: when the reader is done with
     /// the turn.
-    pending_error: Option<String>,
+    abnormal_stop: Option<StopReason>,
     /// The drained turn completed (`EndTurn`) with NO text block committed,
     /// and owes the ledger its empty assistant text block (2026-08-24). Set
     /// at `message_end`, consumed at the turn's real boundary — the trailing
@@ -219,7 +219,7 @@ async fn run_channel<K: RuntimeKind, E: RuntimeEvent>(
         mid_turn: false,
         generation,
         anchor,
-        pending_error: None,
+        abnormal_stop: None,
         owes_empty_commit: false,
         draining: false,
         drained_epoch: 0,
@@ -327,11 +327,11 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
         let conv_id = self.ctx.conversation_id;
         self.mid_turn = false;
         self.draining = false;
-        match self.pending_error.take() {
+        match self.abnormal_stop.take().and_then(StopReason::error_key) {
             Some(error) => {
                 self.ctx.bus.emit(CoreEvent::StreamError {
                     conversation_id: conv_id,
-                    error,
+                    error: error.into(),
                     generation: Some(self.generation),
                 });
             }
@@ -359,7 +359,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 // start, so the drain phase and a recorded abnormal stop are
                 // both superseded.
                 self.discard_streaming_tails("restart-clean").await;
-                self.pending_error = None;
+                self.abnormal_stop = None;
                 self.abandon_owed_empty_commit();
                 self.draining = false;
             }
@@ -386,7 +386,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
                 // turn as still open and emit a second stream-end signal — and
                 // a recorded abnormal stop is superseded by it.
                 self.mid_turn = false;
-                self.pending_error = None;
+                self.abnormal_stop = None;
                 self.abandon_owed_empty_commit();
                 self.draining = false;
             }
@@ -526,6 +526,11 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
     }
 
     async fn ingest(&mut self, event: StreamEvent) {
+        // The rest of a turn whose stop discards its output is part of that
+        // output, such as tool calls a vendor sends after the stop.
+        if self.abnormal_stop.is_some_and(StopReason::discards_output) {
+            return;
+        }
         let conv_id = self.ctx.conversation_id;
         match event {
             // Labels are the stable machine keys documented on
@@ -955,7 +960,11 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
 
     async fn message_end(&mut self, usage: crate::providers::Usage, stop_reason: StopReason) {
         let conv_id = self.ctx.conversation_id;
-        let tail = if self.trackers.content_final_received {
+        let tail = if stop_reason.discards_output() {
+            self.discard_streaming_tails("output discarded by the stop")
+                .await;
+            TailFinalization::NothingToPersist
+        } else if self.trackers.content_final_received {
             TailFinalization::NothingToPersist
         } else {
             // The atomic replace: the final text commits and the streaming
@@ -982,11 +991,11 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
         // Scoped tightly:
         //
         // - `EndTurn` only. A tool-use stop's turn continues into its calls,
-        //   and the abnormal stops (`max_tokens`, `content_filter`) ride the
-        //   error edge — they latch, and the retry resumes from the
-        //   still-owing tail; an empty block committed there would bury the
-        //   owed message for good. The stream-error and teardown paths never
-        //   reach here at all.
+        //   and the abnormal stops (`max_tokens`, `content_filter`,
+        //   `refusal`) ride the error edge — they latch, and the retry
+        //   resumes from the still-owing tail; an empty block committed there
+        //   would bury the owed message for good. The stream-error and
+        //   teardown paths never reach here at all.
         // - Not when the turn already committed text through ANY finalize
         //   path — the empty block records "no assistant text was committed",
         //   never "text committed, elsewhere".
@@ -1020,13 +1029,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
             });
         }
 
-        if stop_reason == StopReason::MaxTokens {
-            self.record_abnormal_stop("max_tokens").await;
-        }
-
-        if stop_reason == StopReason::ContentFilter {
-            self.record_abnormal_stop("content_filter").await;
-        }
+        self.record_abnormal_stop(stop_reason).await;
 
         // Reset state for the next turn's content; the open tool lifecycles a
         // provider emits AFTER this event live in fresh trackers, and `Done` —
@@ -1064,7 +1067,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
     /// in the snapshot that re-check reads — the empty block resting the
     /// frontier is the whole point.
     async fn commit_owed_empty_turn(&mut self) {
-        if !std::mem::take(&mut self.owes_empty_commit) || self.pending_error.is_some() {
+        if !std::mem::take(&mut self.owes_empty_commit) || self.abnormal_stop.is_some() {
             return;
         }
         if let Err(e) = self
@@ -1082,17 +1085,21 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
         }
     }
 
-    /// A stop that ends the turn abnormally: record a visible error status
-    /// block — anchored, like every product of the turn — and hold the same
-    /// machine key for the terminal the drain's end emits, so the turn ends
-    /// with an explanation, not silence. The key is from the vocabulary
+    /// A stop that ends the turn abnormally, one with an error key: record a
+    /// visible error status block — anchored, like every product of the turn
+    /// — and hold the stop for the terminal the drain's end emits, so the turn
+    /// ends with an explanation, not silence. A normal stop records nothing.
+    /// The key is from the vocabulary
     /// documented on [`CoreEvent::StreamError`] — the consumer maps it to its
     /// own copy. Deferred to the terminal on purpose: the reader is still
     /// ingesting this turn (a truncated tool lifecycle can trail the stop),
     /// and an error signal emitted here closed the dispatch mid-drain — the
     /// cleared seam stamped NULL anchors on the trailing writes, and the
     /// released streaming flag was the duplicate-turn window again.
-    async fn record_abnormal_stop(&mut self, error: &str) {
+    async fn record_abnormal_stop(&mut self, stop_reason: StopReason) {
+        let Some(error) = stop_reason.error_key() else {
+            return;
+        };
         let conv_id = self.ctx.conversation_id;
         if let Err(e) = self
             .ctx
@@ -1102,7 +1109,7 @@ impl<K: RuntimeKind, E: RuntimeEvent> ChannelReader<K, E> {
         {
             tracing::error!(conversation_id = conv_id, error = %e, status = error, "insert error status block failed");
         }
-        self.pending_error = Some(error.into());
+        self.abnormal_stop = Some(stop_reason);
     }
 
     // ── Tool use blocks ──────────────────────────────────────
@@ -1294,7 +1301,7 @@ mod tests {
             mid_turn: false,
             generation: 1,
             anchor: TurnAnchor::new(),
-            pending_error: None,
+            abnormal_stop: None,
             owes_empty_commit: false,
             draining: false,
             drained_epoch: 0,
@@ -2128,6 +2135,43 @@ mod tests {
         );
     }
 
+    /// A refused turn ends like the other abnormal stops: an error status
+    /// block, and one stream error that reads `refusal`, so it never passes
+    /// for a completed answer. The text streamed before the refusal and the
+    /// tool call sent after it leave no block behind.
+    #[tokio::test]
+    async fn refusal_stop_closes_the_turn_with_a_refusal_error() {
+        let (ctx, mut rx) = fixture().await;
+        let mut responses = vec![
+            ProviderResponse::Event(StreamEvent::TextDelta {
+                text: "partial".into(),
+            }),
+            ProviderResponse::Event(StreamEvent::MessageEnd {
+                usage: Usage::default(),
+                stop_reason: StopReason::Refusal,
+            }),
+        ];
+        responses.extend(tool_use("after-refusal").map(ProviderResponse::Event));
+        responses.push(ProviderResponse::Done);
+        drive_responses(&ctx, false, responses).await;
+
+        assert_eq!(
+            count_type(&ctx, "status").await,
+            1,
+            "one error status block"
+        );
+        assert_eq!(count_type(&ctx, "text").await, 0, "no assistant text");
+        assert_eq!(count_type(&ctx, "tool_call").await, 0, "no tool call");
+        assert_eq!(streaming_count(&ctx).await, 0, "no streaming tail");
+        let mut errors = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let CoreEvent::StreamError { error, .. } = event {
+                errors.push(error);
+            }
+        }
+        assert_eq!(errors, vec!["refusal".to_string()]);
+    }
+
     /// The aggregator's finish-reason-`stop` tool call, end to end through
     /// ingestion — joined at the REAL seam: the raw wire chunks go through
     /// the shared chat-stream decoder and whatever IT emits is what feeds the
@@ -2267,7 +2311,7 @@ mod tests {
                 mid_turn: false,
                 generation: 1,
                 anchor: TurnAnchor::new(),
-                pending_error: None,
+                abnormal_stop: None,
                 owes_empty_commit: false,
                 draining: false,
                 drained_epoch: 0,
